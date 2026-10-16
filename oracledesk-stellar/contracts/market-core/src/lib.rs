@@ -6,7 +6,7 @@ pub mod ttl;
 use math::{MathError, Settlement, BPS, MAX_SETS};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
-    Address, BytesN, Env, String,
+    Address, BytesN, Env, String, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -32,6 +32,51 @@ const MAX_REDEEM_HORIZON_SECS: u64 = 1_825 * ttl::DAY_SECS;
 /// for a time older than the oldest surviving observation gets
 /// `ObservationTooOld` instead of a wrong answer.
 const ORACLE_RING: u32 = 16;
+
+/// Markets one `redeem_many` / `claim_pool_remainders` call may settle.
+///
+/// Measured with `measure_redeem_many_resources` (see the tests; run it
+/// explicitly with `--ignored --nocapture` to regenerate) and checked
+/// against the network per-transaction limits below, keeping every figure
+/// under 75% of its limit for headroom. Each market adds 3 read entries
+/// (Market, Position, Settle) and 2 write entries (Position removed, Settle
+/// updated); the aggregated transfer and the instance entries are shared
+/// across the batch.
+///
+/// LIMITS (mainnet snapshot 2026-07-10, enforced by the test env — see
+/// `InvocationResourceLimits::mainnet()` in the SDK):
+///   instructions 400,000,000 | memory 41,943,040 B | disk read entries 200
+///   | write entries 200 | ledger entries 400 (footprint total) | read bytes
+///   200,000 | write bytes 132,096 | contract events 16,384 B
+/// MEASURED, batch of N (direct market-core call, one holder, every
+/// position redeemable; live entries, so `footprint` = reads + writes):
+///    N |    insns |    mem B | reads | writes | footprint | write B | events B
+///    1 |  409,515 |   55,861 |    10 |      5 |        15 |     840 |      404
+///    5 |1,258,619 |  163,347 |    22 |     13 |        35 |   2,120 |    1,076
+///   10 |2,586,602 |  355,282 |    37 |     23 |        60 |   3,720 |    1,916
+///   20 |6,133,201 |  931,077 |    67 |     43 |       110 |   6,920 |    3,596
+///   30 |10,687,968|1,762,772 |    97 |     63 |       160 |  10,120 |    5,276
+///   40 |16,308,578|2,850,367 |   127 |     83 |       210 |  13,320 |    6,956
+///   45 |19,448,071|3,490,127 |   142 |     93 |       235 |  14,920 |    7,796
+///   46 |20,093,044|3,625,756 |   145 |     95 |       240 |  15,240 |    7,964
+/// Rows are the direct market-core call; the treasury wrappers add a
+/// constant two read entries (their own config and instance entries) and no
+/// extra writes — measured at this cap by
+/// `measure_treasury_redeem_many_resources` in `contracts/treasury`:
+/// N=46 treasury path = 147 reads, 95 writes, 242 footprint, 33.1M insns,
+/// 15,240 write B, 7,964 event B.
+/// At N=46 the live-state binding axis (footprint, 5N+10) sits at 240/400 =
+/// 60% of the ledger-entry limit; the other entry axes are write entries
+/// 95/200 = 47.5% and events 7,964/16,384 = 49%, while instructions (5-8%),
+/// memory (9-13%) and write bytes (12%) stay far below.
+/// Worst case, if the touched entries had to be restored from disk (archived
+/// state), the 3N+7 reads would hit the 200-entry disk-read limit at
+/// 147/200 = 73.5% on the treasury path (145/200 = 72.5% direct) — under
+/// the 75% headroom line with room left for the transaction overhead this
+/// harness cannot see (auth entries, source account). N=47 would measure
+/// exactly 150/200 = 75.0% with zero margin, so 46 is the largest
+/// defensible cap.
+const MAX_BATCH: u32 = 46;
 
 // ---------------------------------------------------------------------------
 // Types shared with the frontend/backend
@@ -171,6 +216,60 @@ pub struct Observation {
     pub cumulative: i128,
 }
 
+/// Why a market in a batch call did not settle. `Duplicate` is reserved:
+/// ids are validated strictly ascending first, so a duplicate is rejected
+/// as `InvalidAmount` before the batch runs and never reaches a skip.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SkipReason {
+    NotFound,
+    NotFinal,
+    NothingToRedeem,
+    AlreadyClaimed,
+    NotCreator,
+    Duplicate,
+}
+
+/// Per-market result of a batch settlement.
+///
+/// This union stands in for the `Option<SkipReason>` sketched in the issue:
+/// a `#[contracttype]` struct field of type `Option<CustomType>` does not
+/// compile under the `testutils` feature (on for every `cargo test` build).
+/// The derive emits an xdr conversion gated on `CustomType: Into<ScVal>`,
+/// but `#[contracttype]` enums only derive `TryFrom`, and the missing impls
+/// cannot be supplied from this crate: `From<Enum> for ScVal` collides with
+/// the derive's own `TryFrom` through core's blanket impl (E0119), and
+/// `TryFrom<&Option<Enum>> for ScVal` violates the orphan rule (E0117).
+/// The union carries the same information and surfaces as a discriminated
+/// union in the generated TS bindings.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BatchStatus {
+    /// The market settled and paid `BatchItem::payout`.
+    Settled,
+    /// The market was skipped; `BatchItem::payout` is 0.
+    Skipped(SkipReason),
+}
+
+/// One market's outcome inside a `BatchResult`, in request order.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchItem {
+    pub market_id: u64,
+    pub payout: i128,
+    pub status: BatchStatus,
+}
+
+/// Result of `redeem_many` / `claim_pool_remainders`: `total` is the single
+/// aggregated transfer, `items` has one entry per requested market in the
+/// same order.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchResult {
+    pub total: i128,
+    pub items: Vec<BatchItem>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -231,17 +330,21 @@ pub enum Error {
     NothingToRedeem = 16,
     AlreadyClaimed = 17,
     Overflow = 18,
+    // 19-22 are allocated on a sibling wave branch (fee split, breakers,
+    // trade bounds); this wave numbers from 23 so both merge cleanly.
     /// `observe` / `twap` asked for a time older than every surviving
     /// observation of the market (the ring keeps the most recent 16).
-    ObservationTooOld = 19,
+    ObservationTooOld = 23,
     /// `finalize_market` called before the redemption deadline.
-    RedemptionWindowOpen = 20,
+    RedemptionWindowOpen = 24,
     /// Market already closed by `finalize_market`; redemption is over.
-    RedemptionClosed = 21,
+    RedemptionClosed = 25,
     /// Legacy market created before `SettleState` existed: outstanding shares
     /// cannot be reconstructed on-chain, so it has no deadline and cannot be
     /// finalized (still fully redeemable).
-    NotSupported = 22,
+    NotSupported = 26,
+    /// A batch call carried no ids or more than `MAX_BATCH` of them.
+    BatchTooLarge = 27,
 }
 
 impl From<MathError> for Error {
@@ -299,6 +402,15 @@ pub struct Redeemed {
     pub market_id: u64,
     #[topic]
     pub holder: Address,
+    pub payout: i128,
+}
+
+#[contractevent]
+pub struct PoolRemainderClaimed {
+    #[topic]
+    pub market_id: u64,
+    #[topic]
+    pub creator: Address,
     pub payout: i128,
 }
 
@@ -813,7 +925,165 @@ impl MarketCore {
         if payout > 0 {
             Self::token(&env)?.transfer(&env.current_contract_address(), &creator, &payout);
         }
+        PoolRemainderClaimed {
+            market_id,
+            creator,
+            payout,
+        }
+        .publish(&env);
         Ok(payout)
+    }
+
+    /// Redeems `holder`'s positions across up to `MAX_BATCH` final markets
+    /// with one collateral transfer. `market_ids` must be strictly ascending
+    /// (`InvalidAmount` otherwise; empty or over-cap is `BatchTooLarge`) so
+    /// the footprint is deterministic and duplicates are impossible.
+    ///
+    /// Markets that cannot pay do not abort the batch; they come back in
+    /// `items` with a `SkipReason`. In particular an archived `Market` entry
+    /// is NOT `NotFound` — the transaction fails at footprint time and the
+    /// market must be restored first (simulation shows this before
+    /// submission). `holder.require_auth()` covers the whole batch: the
+    /// signed payload is the `market_ids` vector itself.
+    pub fn redeem_many(
+        env: Env,
+        holder: Address,
+        market_ids: Vec<u64>,
+    ) -> Result<BatchResult, Error> {
+        holder.require_auth();
+        Self::validate_batch(&market_ids)?;
+        let mut total: i128 = 0;
+        let mut items: Vec<BatchItem> = Vec::new(&env);
+        for id in market_ids.iter() {
+            let key = DataKey::Market(id);
+            // Raw read: a market that ends up skipped must not pay a TTL
+            // bump, and a missing entry must skip rather than revert.
+            let m = match env.storage().persistent().get::<_, Market>(&key) {
+                Some(m) => m,
+                None => {
+                    items.push_back(Self::batch_skip(id, SkipReason::NotFound));
+                    continue;
+                }
+            };
+            let kind = match Self::settlement(&m) {
+                Ok(kind) => kind,
+                Err(_) => {
+                    items.push_back(Self::batch_skip(id, SkipReason::NotFinal));
+                    continue;
+                }
+            };
+            if Self::settle_closed(&env, id) {
+                // `finalize_market` swept this market: redemption is over.
+                items.push_back(Self::batch_skip(id, SkipReason::NothingToRedeem));
+                continue;
+            }
+            let pos = Self::load_position(&env, id, &holder, m.close_time);
+            if pos.yes == 0 && pos.no == 0 {
+                items.push_back(Self::batch_skip(id, SkipReason::NothingToRedeem));
+                continue;
+            }
+            ttl::bump_persistent(&env, &key, ttl::market_target(&env, m.close_time));
+            let payout = math::settle_value(kind, pos.yes, pos.no);
+            Self::save_position(&env, id, &holder, &Position { yes: 0, no: 0 }, m.close_time);
+            // Both sides decrement even when only one pays (same as the
+            // single-market path).
+            if let Some(mut settle) = Self::load_settle_opt(&env, id) {
+                settle.outstanding_yes = settle
+                    .outstanding_yes
+                    .checked_sub(pos.yes)
+                    .ok_or(Error::Overflow)?;
+                settle.outstanding_no = settle
+                    .outstanding_no
+                    .checked_sub(pos.no)
+                    .ok_or(Error::Overflow)?;
+                settle.paid_out = settle.paid_out.checked_add(payout).ok_or(Error::Overflow)?;
+                Self::save_settle(&env, id, &settle);
+            }
+            total = total.checked_add(payout).ok_or(Error::Overflow)?;
+            Redeemed {
+                market_id: id,
+                holder: holder.clone(),
+                payout,
+            }
+            .publish(&env);
+            items.push_back(BatchItem {
+                market_id: id,
+                payout,
+                status: BatchStatus::Settled,
+            });
+        }
+        if total > 0 {
+            Self::token(&env)?.transfer(&env.current_contract_address(), &holder, &total);
+        }
+        Ok(BatchResult { total, items })
+    }
+
+    /// Claims the LP pool remainder for up to `MAX_BATCH` markets the
+    /// `creator` owns, with one collateral transfer. Same ordering and skip
+    /// semantics as `redeem_many`. A market closed by `finalize_market`
+    /// reports `AlreadyClaimed` — the sweep already took the remainder.
+    pub fn claim_pool_remainders(
+        env: Env,
+        creator: Address,
+        market_ids: Vec<u64>,
+    ) -> Result<BatchResult, Error> {
+        creator.require_auth();
+        Self::validate_batch(&market_ids)?;
+        let mut total: i128 = 0;
+        let mut items: Vec<BatchItem> = Vec::new(&env);
+        for id in market_ids.iter() {
+            let mut m = match env
+                .storage()
+                .persistent()
+                .get::<_, Market>(&DataKey::Market(id))
+            {
+                Some(m) => m,
+                None => {
+                    items.push_back(Self::batch_skip(id, SkipReason::NotFound));
+                    continue;
+                }
+            };
+            if m.creator != creator {
+                items.push_back(Self::batch_skip(id, SkipReason::NotCreator));
+                continue;
+            }
+            let kind = match Self::settlement(&m) {
+                Ok(kind) => kind,
+                Err(_) => {
+                    items.push_back(Self::batch_skip(id, SkipReason::NotFinal));
+                    continue;
+                }
+            };
+            if m.lp_claimed || Self::settle_closed(&env, id) {
+                items.push_back(Self::batch_skip(id, SkipReason::AlreadyClaimed));
+                continue;
+            }
+            let payout = math::settle_value(kind, m.reserve_yes, m.reserve_no);
+            m.reserve_yes = 0;
+            m.reserve_no = 0;
+            m.lp_claimed = true;
+            Self::save_market(&env, id, &m);
+            if let Some(mut settle) = Self::load_settle_opt(&env, id) {
+                settle.paid_out = settle.paid_out.checked_add(payout).ok_or(Error::Overflow)?;
+                Self::save_settle(&env, id, &settle);
+            }
+            total = total.checked_add(payout).ok_or(Error::Overflow)?;
+            PoolRemainderClaimed {
+                market_id: id,
+                creator: creator.clone(),
+                payout,
+            }
+            .publish(&env);
+            items.push_back(BatchItem {
+                market_id: id,
+                payout,
+                status: BatchStatus::Settled,
+            });
+        }
+        if total > 0 {
+            Self::token(&env)?.transfer(&env.current_contract_address(), &creator, &total);
+        }
+        Ok(BatchResult { total, items })
     }
 
     /// Permissionless close-out of a final market after its redemption
@@ -953,6 +1223,14 @@ impl MarketCore {
             Some(s) if s.finalized_at > 0 => Some(s.finalized_at.saturating_add(s.horizon_secs)),
             _ => None,
         }
+    }
+
+    /// Largest accepted `market_ids` length for `redeem_many` /
+    /// `claim_pool_remainders`. Frontends should chunk work into strictly
+    /// ascending batches of at most this size (see
+    /// `docs/frontend-integration.md`).
+    pub fn max_batch(_env: Env) -> u32 {
+        MAX_BATCH
     }
 
     /// Spot price of `outcome` in bps (0..=10_000). YES + NO ~ 10_000.
@@ -1190,6 +1468,39 @@ impl MarketCore {
         ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
     }
 
+    /// `true` once `finalize_market` closed the market. Raw read on purpose:
+    /// batch loops must not pay a TTL bump for a market they only skip.
+    fn settle_closed(env: &Env, id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, SettleState>(&DataKey::Settle(id))
+            .is_some_and(|s| s.closed)
+    }
+
+    fn batch_skip(id: u64, why: SkipReason) -> BatchItem {
+        BatchItem {
+            market_id: id,
+            payout: 0,
+            status: BatchStatus::Skipped(why),
+        }
+    }
+
+    /// Batch input validation: at least one id, at most `MAX_BATCH`, and
+    /// strictly ascending so the footprint is deterministic and duplicates
+    /// cannot appear.
+    fn validate_batch(market_ids: &Vec<u64>) -> Result<(), Error> {
+        let n = market_ids.len();
+        if n == 0 || n > MAX_BATCH {
+            return Err(Error::BatchTooLarge);
+        }
+        for i in 1..n {
+            if market_ids.get(i).unwrap() <= market_ids.get(i - 1).unwrap() {
+                return Err(Error::InvalidAmount);
+            }
+        }
+        Ok(())
+    }
+
     /// `None` for markets created before the accumulator existed; unlike a
     /// missing `Settle` entry this cannot be reconstructed on-chain, so the
     /// oracle views refuse them (`NotSupported`) while trading keeps working
@@ -1340,11 +1651,15 @@ impl MarketCore {
 
 #[cfg(test)]
 mod test {
+    extern crate std;
+
     use super::*;
     use soroban_sdk::{
-        testutils::{storage::Persistent as _, Address as _, Ledger, MockAuth, MockAuthInvoke},
-        token::StellarAssetClient,
-        IntoVal,
+        testutils::{
+            storage::Persistent as _, Address as _, Events as _, Ledger, MockAuth, MockAuthInvoke,
+        },
+        token::{Client as TokenClient, StellarAssetClient},
+        Event as _, IntoVal,
     };
 
     fn setup_market() -> (
@@ -1962,7 +2277,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #20)")]
+    #[should_panic(expected = "Error(Contract, #24)")]
     fn finalize_before_deadline_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -2085,7 +2400,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #21)")]
+    #[should_panic(expected = "Error(Contract, #25)")]
     fn redeem_after_close_rejected() {
         let (env, client, creator, trader, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 6800, 60_000);
@@ -2106,7 +2421,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #21)")]
+    #[should_panic(expected = "Error(Contract, #25)")]
     fn claim_after_close_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -2120,7 +2435,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #21)")]
+    #[should_panic(expected = "Error(Contract, #25)")]
     fn finalize_twice_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -2134,7 +2449,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #22)")]
+    #[should_panic(expected = "Error(Contract, #26)")]
     fn legacy_market_cannot_finalize() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -2585,5 +2900,455 @@ mod test {
             "buy (new timestamp, with accumulator): {:?}",
             env.cost_estimate().resources()
         );
+    }
+
+    // ----- issue #15: batch redemption across many markets -----------------
+
+    fn open_market_with_position(
+        env: &Env,
+        client: &MarketCoreClient,
+        creator: &Address,
+        trader: &Address,
+        outcome: Outcome,
+        collateral_in: i128,
+    ) -> u64 {
+        let market_id = create_market_with(env, client, creator, 5_000, 60_000);
+        client.buy(trader, &market_id, &outcome, &collateral_in, &0_i128);
+        market_id
+    }
+
+    /// Advance past every close used by the batch tests, then resolve `ids`.
+    fn advance_and_resolve(env: &Env, client: &MarketCoreClient, ids: &[u64], outcome: Outcome) {
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        for id in ids {
+            client.resolve(id, &outcome);
+        }
+    }
+
+    fn ids_vec(env: &Env, ids: &[u64]) -> Vec<u64> {
+        let mut v = Vec::new(env);
+        for id in ids {
+            v.push_back(*id);
+        }
+        v
+    }
+
+    /// XDR events published by the market-core contract itself, oldest first.
+    fn core_events(
+        env: &Env,
+        client: &MarketCoreClient,
+    ) -> std::vec::Vec<soroban_sdk::xdr::ContractEvent> {
+        let filtered = env.events().all().filter_by_contract(&client.address);
+        let mut out = std::vec::Vec::new();
+        for event in filtered.events() {
+            out.push(event.clone());
+        }
+        out
+    }
+
+    #[test]
+    fn redeem_many_pays_single_aggregated_transfer() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        let m0 = open_market_with_position(
+            &env,
+            &client,
+            &creator,
+            &trader,
+            Outcome::Yes,
+            10 * 10_000_000,
+        );
+        let m1 = open_market_with_position(
+            &env,
+            &client,
+            &creator,
+            &trader,
+            Outcome::Yes,
+            7 * 10_000_000,
+        );
+        let m2 = open_market_with_position(
+            &env,
+            &client,
+            &creator,
+            &trader,
+            Outcome::Yes,
+            5 * 10_000_000,
+        );
+        advance_and_resolve(&env, &client, &[m0, m1, m2], Outcome::Yes);
+
+        let token = TokenClient::new(&env, &collateral);
+        let core_before = token.balance(&client.address);
+        let trader_before = token.balance(&trader);
+
+        let res = client.redeem_many(&trader, &ids_vec(&env, &[m0, m1, m2]));
+
+        // `Events::all()` reports only the last contract invocation's events,
+        // so capture them before any balance/state reads (which are
+        // themselves invocations).
+        let emitted = core_events(&env, &client);
+        assert_eq!(emitted.len(), 3);
+
+        assert_eq!(res.items.len(), 3);
+        let mut sum = 0i128;
+        for (i, item) in res.items.iter().enumerate() {
+            assert_eq!(item.market_id, [m0, m1, m2][i]);
+            assert_eq!(item.status, BatchStatus::Settled);
+            assert!(item.payout > 0);
+            sum += item.payout;
+        }
+        assert_eq!(sum, res.total);
+        // One aggregated transfer: the contract pays exactly `total`, the
+        // holder receives exactly `total`, and nothing else moved.
+        assert_eq!(token.balance(&client.address), core_before - res.total);
+        assert_eq!(token.balance(&trader), trader_before + res.total);
+        // Positions are cleared and `SettleState::paid_out` tracks each payout.
+        for (i, m) in [m0, m1, m2].iter().enumerate() {
+            let pos = client.get_position(m, &trader);
+            assert_eq!(pos.yes, 0);
+            assert_eq!(pos.no, 0);
+            let settle = client.settle_state(m);
+            assert_eq!(settle.paid_out, res.items.get(i as u32).unwrap().payout);
+        }
+        // One Redeemed event per market, in request order.
+        for (i, m) in [m0, m1, m2].iter().enumerate() {
+            let expected = Redeemed {
+                market_id: *m,
+                holder: trader.clone(),
+                payout: res.items.get(i as u32).unwrap().payout,
+            }
+            .to_xdr(&env, &client.address);
+            assert_eq!(emitted[i], expected);
+        }
+    }
+
+    #[test]
+    fn redeem_many_skips_open_and_empty_markets() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        let m_open = open_market_with_position(
+            &env,
+            &client,
+            &creator,
+            &trader,
+            Outcome::Yes,
+            10 * 10_000_000,
+        );
+        // No position for `trader` — the batch must skip, not revert.
+        let m_flat = create_market_with(&env, &client, &creator, 5_000, 60_000);
+        let m_paid = open_market_with_position(
+            &env,
+            &client,
+            &creator,
+            &trader,
+            Outcome::Yes,
+            5 * 10_000_000,
+        );
+        advance_and_resolve(&env, &client, &[m_flat, m_paid], Outcome::Yes);
+
+        let token = TokenClient::new(&env, &collateral);
+        let before = token.balance(&trader);
+        let res = client.redeem_many(&trader, &ids_vec(&env, &[m_open, m_flat, m_paid]));
+
+        assert_eq!(
+            res.items.get(0).unwrap().status,
+            BatchStatus::Skipped(SkipReason::NotFinal)
+        );
+        assert_eq!(res.items.get(0).unwrap().payout, 0);
+        assert_eq!(
+            res.items.get(1).unwrap().status,
+            BatchStatus::Skipped(SkipReason::NothingToRedeem)
+        );
+        assert_eq!(res.items.get(2).unwrap().status, BatchStatus::Settled);
+        assert_eq!(res.total, res.items.get(2).unwrap().payout);
+        assert_eq!(token.balance(&trader), before + res.total);
+        // The open market's position is untouched.
+        assert!(client.get_position(&m_open, &trader).yes > 0);
+    }
+
+    #[test]
+    fn redeem_many_rejects_unsorted_or_duplicate_ids() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let m0 = open_market_with_position(
+            &env,
+            &client,
+            &creator,
+            &trader,
+            Outcome::Yes,
+            10 * 10_000_000,
+        );
+        let m1 = open_market_with_position(
+            &env,
+            &client,
+            &creator,
+            &trader,
+            Outcome::Yes,
+            10 * 10_000_000,
+        );
+        advance_and_resolve(&env, &client, &[m0, m1], Outcome::Yes);
+
+        assert_eq!(
+            client.try_redeem_many(&trader, &ids_vec(&env, &[m1, m0])),
+            Err(Ok(Error::InvalidAmount))
+        );
+        assert_eq!(
+            client.try_redeem_many(&trader, &ids_vec(&env, &[m0, m0])),
+            Err(Ok(Error::InvalidAmount))
+        );
+        // Validation runs before any state change: positions are intact.
+        assert!(client.get_position(&m0, &trader).yes > 0);
+        assert!(client.get_position(&m1, &trader).yes > 0);
+    }
+
+    #[test]
+    fn redeem_many_rejects_over_cap() {
+        let (env, client, _, trader, _, _) = setup_market();
+        let mut over = Vec::new(&env);
+        for i in 0..=(MAX_BATCH as u64) {
+            over.push_back(i);
+        }
+        assert_eq!(
+            client.try_redeem_many(&trader, &over),
+            Err(Ok(Error::BatchTooLarge))
+        );
+        assert_eq!(
+            client.try_redeem_many(&trader, &Vec::new(&env)),
+            Err(Ok(Error::BatchTooLarge))
+        );
+        // The LP batch validates identically.
+        assert_eq!(
+            client.try_claim_pool_remainders(&trader, &over),
+            Err(Ok(Error::BatchTooLarge))
+        );
+        assert_eq!(
+            client.try_claim_pool_remainders(&trader, &Vec::new(&env)),
+            Err(Ok(Error::BatchTooLarge))
+        );
+    }
+
+    #[test]
+    fn redeem_many_mixed_yes_no_void() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        let m_yes = open_market_with_position(
+            &env,
+            &client,
+            &creator,
+            &trader,
+            Outcome::Yes,
+            10 * 10_000_000,
+        );
+        let m_no = open_market_with_position(
+            &env,
+            &client,
+            &creator,
+            &trader,
+            Outcome::No,
+            7 * 10_000_000,
+        );
+        let m_void = create_market_with(&env, &client, &creator, 5_000, 60_000);
+        client.buy(
+            &trader,
+            &m_void,
+            &Outcome::Yes,
+            &(4 * 10_000_000_i128),
+            &0_i128,
+        );
+        client.buy(
+            &trader,
+            &m_void,
+            &Outcome::No,
+            &(3 * 10_000_000_i128),
+            &0_i128,
+        );
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&m_yes, &Outcome::Yes);
+        client.resolve(&m_no, &Outcome::No);
+        client.void_market(&m_void);
+
+        let pos_yes = client.get_position(&m_yes, &trader);
+        let pos_no = client.get_position(&m_no, &trader);
+        let pos_void = client.get_position(&m_void, &trader);
+        assert!(pos_yes.yes > 0 && pos_no.no > 0 && pos_void.no > 0);
+
+        let token = TokenClient::new(&env, &collateral);
+        let before = token.balance(&trader);
+        let res = client.redeem_many(&trader, &ids_vec(&env, &[m_yes, m_no, m_void]));
+
+        assert_eq!(res.items.get(0).unwrap().payout, pos_yes.yes);
+        assert_eq!(res.items.get(1).unwrap().payout, pos_no.no);
+        assert_eq!(
+            res.items.get(2).unwrap().payout,
+            (pos_void.yes + pos_void.no) / 2
+        );
+        assert_eq!(
+            res.total,
+            pos_yes.yes + pos_no.no + (pos_void.yes + pos_void.no) / 2
+        );
+        assert_eq!(token.balance(&trader), before + res.total);
+    }
+
+    #[test]
+    fn claim_pool_remainders_skips_not_creator() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        let m_mine = open_market_with_position(
+            &env,
+            &client,
+            &creator,
+            &trader,
+            Outcome::Yes,
+            10 * 10_000_000,
+        );
+        let stranger = Address::generate(&env);
+        StellarAssetClient::new(&env, &collateral).mint(&stranger, &(1_000 * 10_000_000_i128));
+        let m_other = open_market_with_position(
+            &env,
+            &client,
+            &stranger,
+            &trader,
+            Outcome::Yes,
+            5 * 10_000_000,
+        );
+        advance_and_resolve(&env, &client, &[m_mine, m_other], Outcome::Yes);
+
+        let expected_payout = client.get_market(&m_mine).reserve_yes;
+        let token = TokenClient::new(&env, &collateral);
+        let before = token.balance(&creator);
+        let res = client.claim_pool_remainders(&creator, &ids_vec(&env, &[m_mine, m_other]));
+
+        assert_eq!(res.items.get(0).unwrap().status, BatchStatus::Settled);
+        assert_eq!(res.items.get(0).unwrap().payout, expected_payout);
+        assert_eq!(
+            res.items.get(1).unwrap().status,
+            BatchStatus::Skipped(SkipReason::NotCreator)
+        );
+        assert_eq!(res.items.get(1).unwrap().payout, 0);
+        assert_eq!(res.total, expected_payout);
+        assert_eq!(token.balance(&creator), before + res.total);
+        assert!(client.get_market(&m_mine).lp_claimed);
+        assert!(!client.get_market(&m_other).lp_claimed);
+    }
+
+    #[test]
+    fn claim_pool_remainder_emits_event() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = open_market_with_position(
+            &env,
+            &client,
+            &creator,
+            &trader,
+            Outcome::Yes,
+            10 * 10_000_000,
+        );
+        advance_and_resolve(&env, &client, &[market_id], Outcome::Yes);
+
+        let payout = client.claim_pool_remainder(&market_id);
+
+        // Exactly one market-core event: the claim itself (the token transfer
+        // event belongs to the collateral contract and is filtered out).
+        let emitted = core_events(&env, &client);
+        assert_eq!(emitted.len(), 1);
+        let expected = PoolRemainderClaimed {
+            market_id,
+            creator: creator.clone(),
+            payout,
+        }
+        .to_xdr(&env, &client.address);
+        assert_eq!(emitted[0], expected);
+    }
+
+    #[test]
+    fn wrong_caller_cannot_redeem_many_for_other_holder() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = open_market_with_position(
+            &env,
+            &client,
+            &creator,
+            &trader,
+            Outcome::Yes,
+            10 * 10_000_000,
+        );
+        advance_and_resolve(&env, &client, &[market_id], Outcome::Yes);
+
+        let not_holder = Address::generate(&env);
+        env.set_auths(&[]);
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &not_holder,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "redeem_many",
+                    args: (trader.clone(), ids_vec(&env, &[market_id])).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_redeem_many(&trader, &ids_vec(&env, &[market_id]))
+            .is_err());
+        // The position was not touched by the failed call.
+        assert!(client.get_position(&market_id, &trader).yes > 0);
+
+        // The signed payload is exactly `(holder, market_ids)`: a mock signed
+        // by the holder over that invocation succeeds and pays.
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &trader,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "redeem_many",
+                    args: (trader.clone(), ids_vec(&env, &[market_id])).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .redeem_many(&trader, &ids_vec(&env, &[market_id]));
+        assert!(res.total > 0);
+    }
+
+    /// Measurement harness behind the `MAX_BATCH` doc table (issue #15):
+    /// run explicitly with
+    /// `cargo test -p market-core measure_redeem_many_resources -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement harness; run explicitly with --ignored --nocapture"]
+    fn measure_redeem_many_resources() {
+        for n in [1u64, 5, 10, 20, 30, 40, 45, 46] {
+            let (env, client, creator, trader, _, collateral) = setup_market();
+            // Each market needs a 100 USDC seed from the creator, and each
+            // position 10 USDC from the trader; top both up so the harness
+            // measures redemption, not the faucet.
+            let sac = StellarAssetClient::new(&env, &collateral);
+            sac.mint(&creator, &((n as i128 + 10) * 100 * 10_000_000));
+            sac.mint(&trader, &((n as i128 + 10) * 10 * 10_000_000));
+            let mut ids = Vec::new(&env);
+            for _ in 0..n {
+                ids.push_back(open_market_with_position(
+                    &env,
+                    &client,
+                    &creator,
+                    &trader,
+                    Outcome::Yes,
+                    10 * 10_000_000,
+                ));
+            }
+            env.ledger()
+                .set_timestamp(env.ledger().timestamp() + 60_001);
+            for id in ids.iter() {
+                client.resolve(&id, &Outcome::Yes);
+            }
+            let res = client.redeem_many(&trader, &ids);
+            let r = env.cost_estimate().resources();
+            std::println!(
+                "redeem_many n={} total={} items={} | insns={} mem={} disk_read_entries={} mem_read_entries={} write_entries={} footprint={} disk_read_bytes={} write_bytes={} events_bytes={}",
+                n,
+                res.total,
+                res.items.len(),
+                r.instructions,
+                r.mem_bytes,
+                r.disk_read_entries,
+                r.memory_read_entries,
+                r.write_entries,
+                r.disk_read_entries + r.memory_read_entries + r.write_entries,
+                r.disk_read_bytes,
+                r.write_bytes,
+                r.contract_events_size_bytes
+            );
+        }
     }
 }

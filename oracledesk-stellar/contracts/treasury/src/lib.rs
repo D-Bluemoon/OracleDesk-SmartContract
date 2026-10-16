@@ -5,7 +5,7 @@ pub mod ttl;
 use soroban_sdk::{
     auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
     contract, contracterror, contractevent, contractimpl, contracttype, token, vec, Address,
-    BytesN, Env, IntoVal, String, Symbol,
+    BytesN, Env, IntoVal, String, Symbol, Vec,
 };
 
 // See the comment on the equivalent `mod market_core` in
@@ -16,7 +16,7 @@ use soroban_sdk::{
 mod market_core {
     soroban_sdk::contractimport!(file = "market_core.wasm");
 }
-use market_core::{Category, Client as MarketCoreClient, Outcome};
+use market_core::{BatchResult, Category, Client as MarketCoreClient, Outcome};
 
 const DAY_SECONDS: u64 = 86_400;
 
@@ -352,6 +352,34 @@ impl Treasury {
         Ok(MarketCoreClient::new(&env, &config.market_core).claim_pool_remainder(&market_id))
     }
 
+    /// Redeems the treasury's positions in up to `MAX_BATCH` markets in one
+    /// call (market-core issue #15). `market_ids` must be strictly ascending;
+    /// markets that cannot be paid out right now are reported as skipped
+    /// rather than aborting the whole batch, so one bad id does not strand
+    /// the rest. The single aggregated token transfer at the end is why this
+    /// exists: batching amortizes fixed per-call costs (footprint entries,
+    /// event size), keeping the treasury inside the per-transaction resource
+    /// limits even when it holds positions in many markets.
+    pub fn redeem_many(env: Env, market_ids: Vec<u64>) -> Result<BatchResult, Error> {
+        let config = Self::get_config(env.clone())?;
+        config.agent.require_auth();
+        let treasury_addr = env.current_contract_address();
+        Ok(MarketCoreClient::new(&env, &config.market_core)
+            .redeem_many(&treasury_addr, &market_ids))
+    }
+
+    /// Claims the LP pool remainders of up to `MAX_BATCH` treasury-created
+    /// markets in one call. Skips (never aborts on) markets the treasury did
+    /// not create, markets that have not settled, and markets already
+    /// claimed — see `redeem_many` for the batching rationale.
+    pub fn claim_pool_remainders(env: Env, market_ids: Vec<u64>) -> Result<BatchResult, Error> {
+        let config = Self::get_config(env.clone())?;
+        config.agent.require_auth();
+        let treasury_addr = env.current_contract_address();
+        Ok(MarketCoreClient::new(&env, &config.market_core)
+            .claim_pool_remainders(&treasury_addr, &market_ids))
+    }
+
     /// Pulls accrued fees from a configured market-core contract.
     pub fn collect_market_fees(env: Env, market_id: u64) -> Result<i128, Error> {
         Self::require_admin(&env)?;
@@ -488,13 +516,15 @@ impl Treasury {
 
 #[cfg(test)]
 mod test {
+    extern crate std;
+
     use super::*;
     use soroban_sdk::{
         testutils::{
             storage::{Instance as _, Persistent as _},
             Address as _, Ledger, MockAuth, MockAuthInvoke,
         },
-        token::StellarAssetClient,
+        token::{Client as TokenClient, StellarAssetClient},
         BytesN, String,
     };
 
@@ -867,5 +897,194 @@ mod test {
         f.treasury
             .agent_buy(&f.market_id, &Outcome::Yes, &(20 * 10_000_000_i128), &0);
         assert_eq!(instance_ttl(&f.env, &f.treasury_id), ttl::INSTANCE_TARGET);
+    }
+
+    // ----- batch redemption through the treasury (issue #15) --------------
+
+    struct BatchFixture {
+        env: Env,
+        treasury: TreasuryClient<'static>,
+        treasury_id: Address,
+        market_core: MarketCoreClient<'static>,
+        token: Address,
+        ids: Vec<u64>,
+    }
+
+    /// `n` markets created *by the treasury*, each holding a 1 USDC YES
+    /// position bought through `agent_buy`, all closed and resolved YES at
+    /// the same timestamp. Sized so the treasury can pay for everything.
+    fn batch_fixture(n: u64) -> BatchFixture {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+        let admin = Address::generate(&env);
+        let agent = Address::generate(&env);
+        let treasury_id = Address::generate(&env);
+        let collateral = env.register_stellar_asset_contract_v2(admin.clone());
+        let sac = StellarAssetClient::new(&env, &collateral.address());
+        // n x 100 USDC seeds + n x 1 USDC buys + slack.
+        sac.mint(&treasury_id, &((n as i128 + 10) * 102 * 10_000_000));
+
+        let market_core_id = env.register(
+            market_core::WASM,
+            (
+                admin.clone(),
+                collateral.address(),
+                treasury_id.clone(),
+                Address::generate(&env),
+                100u32,
+            ),
+        );
+        let market_core = MarketCoreClient::new(&env, &market_core_id);
+        // Caps must satisfy max_trade <= max_market <= max_daily; buys are
+        // 1 USDC each, so the daily cap just needs to cover n of them.
+        let daily = (n.max(5) as i128 + 1) * 10_000_000;
+        let treasury = env.register_at(
+            &treasury_id,
+            Treasury,
+            TreasuryArgs::__constructor(
+                &admin,
+                &agent,
+                &collateral.address(),
+                &market_core_id,
+                &(5 * 10_000_000),
+                &(5 * 10_000_000),
+                &daily,
+            ),
+        );
+        let treasury_client = TreasuryClient::new(&env, &treasury);
+
+        let mut ids = Vec::new(&env);
+        for i in 0..n {
+            let id = market_core.create_market(
+                &treasury_id,
+                &BytesN::from_array(&env, &[(i % 250 + 1) as u8; 32]),
+                &BytesN::from_array(&env, &[211u8; 32]),
+                &String::from_str(&env, "ipfs://treasury-batch"),
+                &Category::Crypto,
+                &2_000u64,
+                &(100 * 10_000_000_i128),
+                &5000u32,
+            );
+            ids.push_back(id);
+        }
+        for id in ids.iter() {
+            treasury_client.agent_buy(&id, &Outcome::Yes, &10_000_000_i128, &0);
+        }
+        env.ledger().set_timestamp(2_001);
+        for id in ids.iter() {
+            market_core.resolve(&id, &Outcome::Yes);
+        }
+
+        BatchFixture {
+            env,
+            treasury: treasury_client,
+            treasury_id,
+            market_core,
+            token: collateral.address(),
+            ids,
+        }
+    }
+
+    /// The acceptance test for issue #15's treasury half: a full-size batch
+    /// (sized from the contract's own `max_batch` view, so it cannot drift
+    /// from `MAX_BATCH`) redeems every position in one call, pays exactly
+    /// the reported total in one balance delta, and skips nothing.
+    #[test]
+    fn agent_redeems_many_through_treasury_at_cap() {
+        let probe = batch_fixture(0);
+        let cap = probe.market_core.max_batch();
+        drop(probe);
+        let f = batch_fixture(cap as u64);
+
+        let before = TokenClient::new(&f.env, &f.token).balance(&f.treasury_id);
+        let result = f.treasury.redeem_many(&f.ids);
+        let after = TokenClient::new(&f.env, &f.token).balance(&f.treasury_id);
+
+        assert_eq!(result.items.len(), cap);
+        let mut sum: i128 = 0;
+        for (i, item) in result.items.iter().enumerate() {
+            assert_eq!(item.market_id, f.ids.get(i as u32).unwrap());
+            assert_eq!(item.status, market_core::BatchStatus::Settled);
+            assert!(item.payout > 0);
+            sum += item.payout;
+        }
+        assert_eq!(result.total, sum);
+        assert_eq!(after - before, result.total);
+    }
+
+    /// The batch forwarders are agent-gated exactly like their single-market
+    /// counterparts — and the gate holds at a full `max_batch` payload, so a
+    /// hostile caller cannot even get a validation error before the auth
+    /// check refuses them.
+    #[test]
+    fn wrong_caller_cannot_redeem_many() {
+        let probe = batch_fixture(0);
+        let cap = probe.market_core.max_batch();
+        let f = probe;
+        let mut ids = Vec::new(&f.env);
+        for i in 0..cap {
+            ids.push_back(i as u64);
+        }
+
+        let not_agent = Address::generate(&f.env);
+        f.env.set_auths(&[]);
+        assert!(f
+            .treasury
+            .mock_auths(&[MockAuth {
+                address: &not_agent,
+                invoke: &MockAuthInvoke {
+                    contract: &f.treasury_id,
+                    fn_name: "redeem_many",
+                    args: (ids.clone(),).into_val(&f.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_redeem_many(&ids)
+            .is_err());
+        assert!(f
+            .treasury
+            .mock_auths(&[MockAuth {
+                address: &not_agent,
+                invoke: &MockAuthInvoke {
+                    contract: &f.treasury_id,
+                    fn_name: "claim_pool_remainders",
+                    args: (ids.clone(),).into_val(&f.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_claim_pool_remainders(&ids)
+            .is_err());
+    }
+
+    /// Measurement harness behind the treasury half of market-core's
+    /// `MAX_BATCH` doc table (issue #15): run explicitly with
+    /// `cargo test -p treasury measure_treasury_redeem_many_resources -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement harness; run explicitly with --ignored --nocapture"]
+    fn measure_treasury_redeem_many_resources() {
+        let probe = batch_fixture(0);
+        let cap = probe.market_core.max_batch() as u64;
+        drop(probe);
+        for n in [1u64, 10, cap] {
+            let f = batch_fixture(n);
+            let res = f.treasury.redeem_many(&f.ids);
+            let r = f.env.cost_estimate().resources();
+            std::println!(
+                "treasury redeem_many n={} total={} items={} | insns={} mem={} disk_read_entries={} mem_read_entries={} write_entries={} footprint={} disk_read_bytes={} write_bytes={} events_bytes={}",
+                n,
+                res.total,
+                res.items.len(),
+                r.instructions,
+                r.mem_bytes,
+                r.disk_read_entries,
+                r.memory_read_entries,
+                r.write_entries,
+                r.disk_read_entries + r.memory_read_entries + r.write_entries,
+                r.disk_read_bytes,
+                r.write_bytes,
+                r.contract_events_size_bytes
+            );
+        }
     }
 }
