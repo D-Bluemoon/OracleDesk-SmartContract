@@ -1,6 +1,7 @@
 #![no_std]
 
 mod math;
+pub mod ttl;
 
 use math::{MathError, Settlement, BPS, MAX_SETS};
 use soroban_sdk::{
@@ -11,11 +12,6 @@ use soroban_sdk::{
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/// Ledger close time is ~5s, so 17_280 ledgers ~ 1 day. Tune if that changes.
-const DAY_IN_LEDGERS: u32 = 17_280;
-const BUMP_THRESHOLD: u32 = 30 * DAY_IN_LEDGERS;
-const BUMP_TO: u32 = 60 * DAY_IN_LEDGERS;
 
 /// Fee ceiling: 10%.
 const MAX_FEE_BPS: u32 = 1_000;
@@ -345,6 +341,7 @@ impl MarketCore {
                     yes: seed.creator_yes,
                     no: seed.creator_no,
                 },
+                market.close_time,
             );
         }
 
@@ -393,12 +390,12 @@ impl MarketCore {
         Self::set_reserves(&mut m, outcome, q.new_reserve_bought, q.new_reserve_other);
         m.sets_minted = new_sets;
         m.fees_accrued = m.fees_accrued.checked_add(q.fee).ok_or(Error::Overflow)?;
-        let mut pos = Self::load_position(&env, market_id, &trader);
+        let mut pos = Self::load_position(&env, market_id, &trader, m.close_time);
         match outcome {
             Outcome::Yes => pos.yes += q.shares_out,
             Outcome::No => pos.no += q.shares_out,
         }
-        Self::save_position(&env, market_id, &trader, &pos);
+        Self::save_position(&env, market_id, &trader, &pos, m.close_time);
         Self::save_market(&env, market_id, &m);
 
         // interaction
@@ -442,7 +439,7 @@ impl MarketCore {
             return Err(Error::SlippageExceeded);
         }
 
-        let mut pos = Self::load_position(&env, market_id, &trader);
+        let mut pos = Self::load_position(&env, market_id, &trader, m.close_time);
         let held = match outcome {
             Outcome::Yes => pos.yes,
             Outcome::No => pos.no,
@@ -456,7 +453,7 @@ impl MarketCore {
             Outcome::Yes => pos.yes -= q.shares_in,
             Outcome::No => pos.no -= q.shares_in,
         }
-        Self::save_position(&env, market_id, &trader, &pos);
+        Self::save_position(&env, market_id, &trader, &pos, m.close_time);
         Self::set_reserves(&mut m, outcome, q.new_reserve_sold, q.new_reserve_other);
         m.sets_minted -= q.gross;
         m.fees_accrued = m.fees_accrued.checked_add(q.fee).ok_or(Error::Overflow)?;
@@ -528,13 +525,19 @@ impl MarketCore {
         holder.require_auth();
         let m = Self::load_market(&env, market_id)?;
         let kind = Self::settlement(&m)?;
-        let pos = Self::load_position(&env, market_id, &holder);
+        let pos = Self::load_position(&env, market_id, &holder, m.close_time);
         if pos.yes == 0 && pos.no == 0 {
             return Err(Error::NothingToRedeem);
         }
         let payout = math::settle_value(kind, pos.yes, pos.no);
 
-        Self::save_position(&env, market_id, &holder, &Position { yes: 0, no: 0 });
+        Self::save_position(
+            &env,
+            market_id,
+            &holder,
+            &Position { yes: 0, no: 0 },
+            m.close_time,
+        );
         if payout > 0 {
             Self::token(&env)?.transfer(&env.current_contract_address(), &holder, &payout);
         }
@@ -604,7 +607,14 @@ impl MarketCore {
     }
 
     pub fn get_position(env: Env, market_id: u64, holder: Address) -> Position {
-        Self::load_position(&env, market_id, &holder)
+        // The TTL of the position entry tracks the market's close time. With
+        // no market to anchor to (a stale id), fall back to the settlement
+        // horizon from now so the entry at least keeps that much cover.
+        let close_time = match Self::load_market(&env, market_id) {
+            Ok(m) => m.close_time,
+            Err(_) => env.ledger().timestamp(),
+        };
+        Self::load_position(&env, market_id, &holder, close_time)
     }
 
     /// Spot price of `outcome` in bps (0..=10_000). YES + NO ~ 10_000.
@@ -652,7 +662,7 @@ impl MarketCore {
         env: &Env,
         key: &DataKey,
     ) -> Result<V, Error> {
-        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+        ttl::bump_instance(env);
         env.storage()
             .instance()
             .get(key)
@@ -731,27 +741,21 @@ impl MarketCore {
             .persistent()
             .get(&key)
             .ok_or(Error::MarketNotFound)?;
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        ttl::bump_persistent(env, &key, ttl::market_target(env, m.close_time));
         Ok(m)
     }
 
     fn save_market(env: &Env, id: u64, m: &Market) {
         let key = DataKey::Market(id);
         env.storage().persistent().set(&key, m);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        ttl::bump_persistent(env, &key, ttl::market_target(env, m.close_time));
     }
 
-    fn load_position(env: &Env, id: u64, holder: &Address) -> Position {
+    fn load_position(env: &Env, id: u64, holder: &Address, close_time: u64) -> Position {
         let key = DataKey::Position(id, holder.clone());
         match env.storage().persistent().get::<_, Position>(&key) {
             Some(p) => {
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+                ttl::bump_persistent(env, &key, ttl::market_target(env, close_time));
                 p
             }
             None => Position { yes: 0, no: 0 },
@@ -759,15 +763,13 @@ impl MarketCore {
     }
 
     /// Empty positions are removed so storage does not grow with dust entries.
-    fn save_position(env: &Env, id: u64, holder: &Address, p: &Position) {
+    fn save_position(env: &Env, id: u64, holder: &Address, p: &Position, close_time: u64) {
         let key = DataKey::Position(id, holder.clone());
         if p.yes == 0 && p.no == 0 {
             env.storage().persistent().remove(&key);
         } else {
             env.storage().persistent().set(&key, p);
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+            ttl::bump_persistent(env, &key, ttl::market_target(env, close_time));
         }
     }
 }
@@ -776,7 +778,7 @@ impl MarketCore {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
+        testutils::{storage::Persistent as _, Address as _, Ledger, MockAuth, MockAuthInvoke},
         token::StellarAssetClient,
         IntoVal,
     };
@@ -1142,5 +1144,108 @@ mod test {
             }])
             .try_resolve(&market_id, &Outcome::Yes)
             .is_err());
+    }
+
+    // ----- TTL policy ------------------------------------------------------
+
+    /// Advances both clocks together, as they move on a real network
+    /// (one ledger per `ttl::LEDGER_SECS`).
+    fn advance_ledgers(env: &Env, secs: u64) {
+        assert_eq!(secs % ttl::LEDGER_SECS, 0);
+        env.ledger()
+            .set_sequence_number(env.ledger().sequence() + (secs / ttl::LEDGER_SECS) as u32);
+        env.ledger().set_timestamp(env.ledger().timestamp() + secs);
+    }
+
+    fn persistent_ttl(env: &Env, contract: &Address, key: &DataKey) -> u32 {
+        env.as_contract(contract, || env.storage().persistent().get_ttl(key))
+    }
+
+    fn create_market_closing_in(
+        env: &Env,
+        client: &MarketCoreClient,
+        creator: &Address,
+        secs_from_now: u64,
+    ) -> u64 {
+        client.create_market(
+            creator,
+            &BytesN::from_array(env, &[21u8; 32]),
+            &BytesN::from_array(env, &[121u8; 32]),
+            &String::from_str(env, "ipfs://ttl-policy"),
+            &Category::Other,
+            &(env.ledger().timestamp() + secs_from_now),
+            &(100 * 10_000_000_i128),
+            &5000u32,
+        )
+    }
+
+    #[test]
+    fn market_entry_survives_until_close_plus_horizon() {
+        let (env, client, creator, _, _, _) = setup_market();
+        // Current network limits: persistent entries may live at most 180
+        // days; the minimum is deliberately left low so the measured TTL is
+        // the contract's own bump, not the network floor.
+        env.ledger().set_max_entry_ttl(3_110_400);
+        env.ledger().set_min_persistent_entry_ttl(4_096);
+
+        let market_id = create_market_closing_in(&env, &client, &creator, 90 * ttl::DAY_SECS);
+        let key = DataKey::Market(market_id);
+        // 90 days to close + the 90-day settlement horizon, at the 180-day cap.
+        assert!(persistent_ttl(&env, &client.address, &key) >= 3_110_399);
+
+        // The old fixed 60-day bump let the entry die at day 60, twenty days
+        // before this market could even close. Lay idle past that, then past
+        // close, and resolution must still work.
+        advance_ledgers(&env, 80 * ttl::DAY_SECS);
+        assert!(persistent_ttl(&env, &client.address, &key) > 0);
+        advance_ledgers(&env, 11 * ttl::DAY_SECS);
+
+        client.resolve(&market_id, &Outcome::Yes);
+        assert_eq!(
+            client.get_market(&market_id).status,
+            MarketStatus::Resolved(Outcome::Yes)
+        );
+    }
+
+    #[test]
+    fn position_ttl_tracks_close_time() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        env.ledger().set_max_entry_ttl(3_110_400);
+        env.ledger().set_min_persistent_entry_ttl(4_096);
+
+        let short = create_market_closing_in(&env, &client, &creator, 10 * ttl::DAY_SECS);
+        let long = create_market_closing_in(&env, &client, &creator, 100 * ttl::DAY_SECS);
+        client.buy(
+            &trader,
+            &short,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        client.buy(
+            &trader,
+            &long,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+
+        let short_ttl = persistent_ttl(
+            &env,
+            &client.address,
+            &DataKey::Position(short, trader.clone()),
+        );
+        let long_ttl = persistent_ttl(
+            &env,
+            &client.address,
+            &DataKey::Position(long, trader.clone()),
+        );
+
+        // 10 days to close + 90-day horizon = 100 days.
+        assert_eq!(short_ttl, 100 * ttl::DAY_IN_LEDGERS);
+        // 100 days to close exceeds the 180-day cap only together with the
+        // horizon, so the long market is clamped at the maximum.
+        assert!(long_ttl >= 3_110_399);
+        assert!(long_ttl > short_ttl);
     }
 }

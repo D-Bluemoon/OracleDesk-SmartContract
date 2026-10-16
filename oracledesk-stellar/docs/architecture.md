@@ -82,6 +82,28 @@ events. An indexer (Soroban events → Postgres, replayable) is required for
 any UI that wants to list traces/trades older than that window — this is
 one of the seeded `docs/wave-issues/`.
 
+## Storage TTL policy
+
+Soroban archives persistent/instance entries once their TTL runs out, and an
+archived entry cannot be read or written until it is restored. Every contract
+carries an identical `src/ttl.rs` (duplicated because contract crates cannot
+depend on each other — [ADR 0002](adr/0002-cross-contract-calls.md)) with the
+shared policy:
+
+- Per-market entries (`Market`, `Position`, resolver configs, treasury
+  exposure) are extended to `close_time` plus a 90-day settlement horizon,
+  clamped to the network's `max_ttl()`. The threshold is half the target, so
+  a frequently touched entry is only rewritten when its remaining TTL halves.
+- Instance TTL is extended by every entrypoint that reads instance storage
+  (30-day target, 7-day threshold); pure views over persistent entries stay
+  read-only so indexer simulations keep read-only footprints.
+- The registry additionally refreshes an agent's registration on every
+  successful `publish_trace`.
+- Markets whose `close_time` is further out than `max_ttl` cannot be kept
+  alive by a single bump and need periodic touches or the keeper described in
+  [`docs/wave-issues/14-storage-ttl-keeper.md`](wave-issues/14-storage-ttl-keeper.md),
+  which also covers TTL monitoring and the rent cost model.
+
 ## Off-chain pieces
 
 - **x402/**: an Express service selling reasoning traces for ~$0.01 via

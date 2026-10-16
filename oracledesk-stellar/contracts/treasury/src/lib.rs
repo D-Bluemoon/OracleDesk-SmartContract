@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod ttl;
+
 use soroban_sdk::{
     auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
     contract, contracterror, contractevent, contractimpl, contracttype, token, vec, Address,
@@ -17,8 +19,6 @@ mod market_core {
 use market_core::{Category, Client as MarketCoreClient, Outcome};
 
 const DAY_SECONDS: u64 = 86_400;
-const BUMP_THRESHOLD: u32 = 30 * 17_280;
-const BUMP_TO: u32 = 60 * 17_280;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,6 +140,7 @@ impl Treasury {
     }
 
     pub fn get_config(env: Env) -> Result<RiskConfig, Error> {
+        ttl::bump_instance(&env);
         env.storage()
             .instance()
             .get(&DataKey::Config)
@@ -232,7 +233,7 @@ impl Treasury {
             &seed_amount,
             &initial_yes_bps,
         );
-        Self::reserve_capacity(&env, &config, market_id, seed_amount)?;
+        Self::reserve_capacity(&env, &config, market_id, seed_amount, close_time)?;
         Ok(market_id)
     }
 
@@ -273,7 +274,13 @@ impl Treasury {
             &collateral_in,
             &min_shares_out,
         );
-        Self::reserve_capacity(&env, &config, market_id, collateral_in)?;
+        // One extra `get_market` read per buy, to key the exposure entry's TTL
+        // to the market's close time rather than a fixed window (the market
+        // knows its own `close_time`; the treasury otherwise would not).
+        let close_time = MarketCoreClient::new(&env, &config.market_core)
+            .get_market(&market_id)
+            .close_time;
+        Self::reserve_capacity(&env, &config, market_id, collateral_in, close_time)?;
         Ok(shares)
     }
 
@@ -313,7 +320,10 @@ impl Treasury {
         }
         exposure.open = false;
         let amount = exposure.amount;
-        Self::save_market(&env, market_id, &exposure);
+        let close_time = MarketCoreClient::new(&env, &config.market_core)
+            .get_market(&market_id)
+            .close_time;
+        Self::save_market(&env, market_id, &exposure, close_time);
         PositionClosed { market_id, amount }.publish(&env);
         Ok(amount)
     }
@@ -345,6 +355,7 @@ impl Treasury {
 
 impl Treasury {
     fn require_admin(env: &Env) -> Result<(), Error> {
+        ttl::bump_instance(env);
         let admin: Address = env
             .storage()
             .instance()
@@ -355,6 +366,7 @@ impl Treasury {
     }
 
     fn assert_not_paused(env: &Env) -> Result<(), Error> {
+        ttl::bump_instance(env);
         let paused: bool = env
             .storage()
             .instance()
@@ -367,6 +379,7 @@ impl Treasury {
     }
 
     fn rolled_daily_usage(env: &Env) -> Result<DailyUsage, Error> {
+        ttl::bump_instance(env);
         let usage: DailyUsage = env
             .storage()
             .instance()
@@ -390,6 +403,7 @@ impl Treasury {
         config: &RiskConfig,
         market_id: u64,
         amount: i128,
+        close_time: u64,
     ) -> Result<(), Error> {
         let mut usage = Self::rolled_daily_usage(env)?;
         let mut exposure = Self::market_exposure(env, market_id);
@@ -410,7 +424,7 @@ impl Treasury {
         exposure.amount = new_market;
         exposure.open = true;
         usage.amount = new_daily;
-        Self::save_market(env, market_id, &exposure);
+        Self::save_market(env, market_id, &exposure, close_time);
         env.storage().instance().set(&DataKey::Daily, &usage);
         TradeAuthorized {
             market_id,
@@ -456,12 +470,10 @@ impl Treasury {
             })
     }
 
-    fn save_market(env: &Env, market_id: u64, exposure: &MarketExposure) {
+    fn save_market(env: &Env, market_id: u64, exposure: &MarketExposure, close_time: u64) {
         let key = DataKey::Market(market_id);
         env.storage().persistent().set(&key, exposure);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        ttl::bump_persistent(env, &key, ttl::market_target(env, close_time));
     }
 }
 
@@ -469,7 +481,10 @@ impl Treasury {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
+        testutils::{
+            storage::{Instance as _, Persistent as _},
+            Address as _, Ledger, MockAuth, MockAuthInvoke,
+        },
         token::StellarAssetClient,
         BytesN, String,
     };
@@ -802,5 +817,46 @@ mod test {
             }])
             .agent_buy(&market_id, &outcome, &amount, &min_out);
         assert!(shares > 0);
+    }
+
+    fn advance_ledgers(env: &Env, secs: u64) {
+        assert_eq!(secs % ttl::LEDGER_SECS, 0);
+        env.ledger()
+            .set_sequence_number(env.ledger().sequence() + (secs / ttl::LEDGER_SECS) as u32);
+        env.ledger().set_timestamp(env.ledger().timestamp() + secs);
+    }
+
+    fn instance_ttl(env: &Env, contract: &Address) -> u32 {
+        env.as_contract(contract, || env.storage().instance().get_ttl())
+    }
+
+    fn persistent_ttl(env: &Env, contract: &Address, key: &DataKey) -> u32 {
+        env.as_contract(contract, || env.storage().persistent().get_ttl(key))
+    }
+
+    #[test]
+    fn instance_ttl_extended_on_agent_buy() {
+        let f = fixture();
+        f.env.ledger().set_max_entry_ttl(3_110_400);
+        f.env.ledger().set_min_persistent_entry_ttl(4_096);
+
+        f.treasury
+            .agent_buy(&f.market_id, &Outcome::Yes, &(20 * 10_000_000_i128), &0);
+        assert_eq!(instance_ttl(&f.env, &f.treasury_id), ttl::INSTANCE_TARGET);
+        // The exposure entry's TTL is keyed to the market's close time:
+        // 30 days until close + the 90-day settlement horizon.
+        assert_eq!(
+            persistent_ttl(&f.env, &f.treasury_id, &DataKey::Market(f.market_id)),
+            120 * ttl::DAY_IN_LEDGERS
+        );
+
+        // 25 days idle drains the instance TTL below the 7-day threshold...
+        advance_ledgers(&f.env, 25 * ttl::DAY_SECS);
+        assert!(instance_ttl(&f.env, &f.treasury_id) < ttl::INSTANCE_THRESHOLD);
+
+        // ...and the next trade re-extends it.
+        f.treasury
+            .agent_buy(&f.market_id, &Outcome::Yes, &(20 * 10_000_000_i128), &0);
+        assert_eq!(instance_ttl(&f.env, &f.treasury_id), ttl::INSTANCE_TARGET);
     }
 }
