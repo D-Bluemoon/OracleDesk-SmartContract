@@ -206,6 +206,21 @@ markers in the files themselves:
   independent agent deployments from trading against the same
   `market-core` markets. The treasury's caps bound one deployment's own
   risk, not systemic market behavior.
+- **Unredeemed shares expire after the redemption window.** Each market
+  snapshots a redemption horizon at creation (default 365 days; the admin
+  default is bounded to 180–1825 days). Once `finalized_at + horizon_secs`
+  has passed, anyone can call `finalize_market`, which sweeps the market's
+  **entire** remaining balance — expired user claims, void rounding dust,
+  any unclaimed LP remainder and accrued fees — to the treasury and closes
+  redemption (`redeem`/`claim_pool_remainder` then revert with
+  `RedemptionClosed`). Redeeming before the deadline always pays the exact
+  `settle_value`; expired claims go to the treasury, not the LP. Markets
+  created before this `SettleState` bookkeeping (issue #14) have no deadline
+  and cannot be finalized (`NotSupported`), and stay redeemable through the
+  old paths. A market waiting on a multi-year deadline can be
+  TTL-archived before it is finalized and needs a restore (or the keeper,
+  `docs/wave-issues/14-storage-ttl-keeper.md`) first; the deadline itself is
+  on-chain state, so a late finalization is still exact.
 - **Single admin key per contract**, no multisig/timelock. A compromised
   admin key has a large blast radius per contract (see
   `docs/wave-issues/12-architecture-deep-dive-and-threat-model.md`, which

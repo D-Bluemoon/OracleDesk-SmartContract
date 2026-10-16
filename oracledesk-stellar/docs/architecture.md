@@ -27,7 +27,29 @@ time — see [ADR 0001](adr/0001-resolution-commitment.md) for why.
 
 Lifecycle: `create_market` → `buy`/`sell` (while open) → `resolve` or
 `void_market` (resolver-only) → `redeem` per holder, `claim_pool_remainder`
-for the creator/LP, `sweep_fees` (permissionless) to the treasury.
+for the creator/LP, `sweep_fees` (permissionless) to the treasury →
+`finalize_market` (permissionless, after the redemption deadline) closes the
+market and sweeps the residual.
+
+A per-market `SettleState` side entry (views `settle_state` and
+`redeem_deadline`) tracks user-held outstanding shares, the finality
+timestamp, a per-market redemption horizon snapshotted at creation (default
+365 days; admin-set default bounded to 180–1825 days), what has already been
+paid out, and whether the market is closed. `redeem` and
+`claim_pool_remainder` maintain it on every payout. Once
+`finalized_at + horizon_secs` has passed, anyone can call `finalize_market`:
+it reserves exactly what the outstanding shares can still claim
+(`settle_upper` — for void markets the aggregate floor, which is at least
+the sum of the per-holder floors) plus any unclaimed LP remainder, then
+sweeps the market's **entire** remaining balance — expired user claims,
+void rounding dust, the unclaimed remainder and accrued fees — to the
+treasury, marks the market `RedemptionClosed`, and zeroes the market's
+balance. A holder who redeems before the deadline is paid the exact
+`settle_value` they would have received without finalization; expired claims
+go to the treasury rather than the LP, so the LP cannot profit from
+suppressing redemptions. Markets created before this bookkeeping existed
+have no `Settle` entry: they have no deadline and cannot be finalized
+(`NotSupported`), and stay redeemable through the old paths.
 
 ### resolver
 
@@ -99,6 +121,13 @@ shared policy:
   read-only so indexer simulations keep read-only footprints.
 - The registry additionally refreshes an agent's registration on every
   successful `publish_trace`.
+- The market-core `Settle` entry (outstanding shares, redemption deadline) is
+  kept to the long-lived target — 365 days, clamped to `max_ttl()`. A market
+  whose redemption deadline is more than one network-max TTL away can archive
+  before it is finalized and needs touches or a restore first;
+  `finalize_market` works after a restore, and the deadline is computed from
+  on-chain state (`finalized_at + horizon_secs`), so a late finalization is
+  still exact.
 - Markets whose `close_time` is further out than `max_ttl` cannot be kept
   alive by a single bump and need periodic touches or the keeper described in
   [`docs/wave-issues/14-storage-ttl-keeper.md`](wave-issues/14-storage-ttl-keeper.md),

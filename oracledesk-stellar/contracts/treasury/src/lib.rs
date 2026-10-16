@@ -329,6 +329,15 @@ impl Treasury {
     }
 
     /// Redeems the treasury's position in a resolved/voided market.
+    ///
+    /// Deadline (market-core issue #14): every market has a redemption
+    /// window snapshotted at creation, and once `redeem_deadline(market_id)`
+    /// passes anyone can `finalize_market`, which forfeits anything still
+    /// unredeemed to the fee recipient. Nothing here tracks deadlines or
+    /// auto-redeems, so the agent is responsible for calling this before the
+    /// window expires. (This wrapper must exist: a contract address can only
+    /// authorize itself from inside its own call stack, so nobody outside
+    /// the treasury can redeem the treasury's position.)
     pub fn redeem(env: Env, market_id: u64) -> Result<i128, Error> {
         let config = Self::get_config(env.clone())?;
         config.agent.require_auth();

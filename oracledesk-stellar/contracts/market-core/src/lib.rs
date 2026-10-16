@@ -18,6 +18,15 @@ const MAX_FEE_BPS: u32 = 1_000;
 /// Minimum seed liquidity: 100 USDC (7 decimals). Stops spam markets.
 const MIN_SEED: i128 = 100 * 10_000_000;
 
+/// Redemption-window bounds, in seconds. A holder cannot be forced to redeem
+/// within weeks of resolution (180-day floor), and a market cannot sit
+/// waitable-forever (5-year ceiling). The 365-day default is snapshotted
+/// into each market at creation, so an admin change never moves an
+/// existing deadline.
+const DEFAULT_REDEEM_HORIZON_SECS: u64 = 365 * ttl::DAY_SECS;
+const MIN_REDEEM_HORIZON_SECS: u64 = 180 * ttl::DAY_SECS;
+const MAX_REDEEM_HORIZON_SECS: u64 = 1_825 * ttl::DAY_SECS;
+
 // ---------------------------------------------------------------------------
 // Types shared with the frontend/backend
 // ---------------------------------------------------------------------------
@@ -92,6 +101,29 @@ pub struct Position {
     pub no: i128,
 }
 
+/// Per-market settlement bookkeeping (issue #14). Lives in its own entry so
+/// the `Market` XDR stays unchanged.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettleState {
+    /// Outcome shares held outside the pool (user positions), still
+    /// redeemable. `redeem` decrements the redeeming holder's shares on both
+    /// sides, so a losing-side redemption (payout 0) still clears here.
+    pub outstanding_yes: i128,
+    pub outstanding_no: i128,
+    /// Timestamp of `resolve` / `void_market`; 0 while the market is Open.
+    pub finalized_at: u64,
+    /// Redemption window, snapshotted at creation from the admin default.
+    /// `redeem_deadline = finalized_at + horizon_secs`.
+    pub horizon_secs: u64,
+    /// Collateral already paid to holders and the LP (`redeem` +
+    /// `claim_pool_remainder` payouts); tracks what has left the market.
+    pub paid_out: i128,
+    /// `finalize_market` has swept the market's remaining balance; no
+    /// redemption or claim can ever pay out again.
+    pub closed: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -117,9 +149,11 @@ pub enum DataKey {
     DefaultFeeBps,
     Paused,
     NextId,
+    DefaultRedeemHorizon,
     // persistent storage (one entry each, own TTL)
     Market(u64),
     Position(u64, Address),
+    Settle(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +182,15 @@ pub enum Error {
     NothingToRedeem = 16,
     AlreadyClaimed = 17,
     Overflow = 18,
+    // 19 is reserved for the TWAP accumulator's `ObservationTooOld` (#11).
+    /// `finalize_market` called before the redemption deadline.
+    RedemptionWindowOpen = 20,
+    /// Market already closed by `finalize_market`; redemption is over.
+    RedemptionClosed = 21,
+    /// Legacy market created before `SettleState` existed: outstanding shares
+    /// cannot be reconstructed on-chain, so it has no deadline and cannot be
+    /// finalized (still fully redeemable).
+    NotSupported = 22,
 }
 
 impl From<MathError> for Error {
@@ -215,6 +258,19 @@ pub struct FeesSwept {
     pub amount: i128,
 }
 
+#[contractevent]
+pub struct MarketFinalized {
+    #[topic]
+    pub market_id: u64,
+    /// Everything swept to the treasury: expired user claims, an unclaimed
+    /// LP remainder, rounding dust and accrued fees.
+    pub swept: i128,
+    /// The part of `swept` that was reserved for shares never redeemed.
+    pub unclaimed_user: i128,
+    /// Rounding left over after per-holder void floors were accounted for.
+    pub dust: i128,
+}
+
 // ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
@@ -244,6 +300,7 @@ impl MarketCore {
         s.set(&DataKey::DefaultFeeBps, &default_fee_bps);
         s.set(&DataKey::Paused, &false);
         s.set(&DataKey::NextId, &0u64);
+        s.set(&DataKey::DefaultRedeemHorizon, &DEFAULT_REDEEM_HORIZON_SECS);
     }
 
     // ----- admin ----------------------------------------------------------
@@ -275,6 +332,20 @@ impl MarketCore {
     pub fn set_treasury(env: Env, treasury: Address) -> Result<(), Error> {
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Treasury, &treasury);
+        Ok(())
+    }
+
+    /// Affects markets created after the call; existing markets keep the
+    /// horizon snapshotted at their creation. Must be within
+    /// [180 days, 1825 days].
+    pub fn set_default_redeem_horizon(env: Env, secs: u64) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if !(MIN_REDEEM_HORIZON_SECS..=MAX_REDEEM_HORIZON_SECS).contains(&secs) {
+            return Err(Error::InvalidAmount);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::DefaultRedeemHorizon, &secs);
         Ok(())
     }
 
@@ -315,6 +386,9 @@ impl MarketCore {
         let fee_bps: u32 = s
             .get(&DataKey::DefaultFeeBps)
             .ok_or(Error::NotInitialized)?;
+        let horizon_secs: u64 = s
+            .get(&DataKey::DefaultRedeemHorizon)
+            .ok_or(Error::NotInitialized)?;
 
         let market = Market {
             creator: creator.clone(),
@@ -344,6 +418,17 @@ impl MarketCore {
                 market.close_time,
             );
         }
+        // The creator's seed shares count as *user* outstanding, not pool.
+        let settle = SettleState {
+            outstanding_yes: seed.creator_yes,
+            outstanding_no: seed.creator_no,
+            finalized_at: 0,
+            horizon_secs,
+            paid_out: 0,
+            closed: false,
+        };
+        Self::debug_assert_share_invariant(&market, &settle);
+        Self::save_settle(&env, id, &settle);
 
         Self::token(&env)?.transfer(&creator, env.current_contract_address(), &seed_amount);
 
@@ -397,6 +482,25 @@ impl MarketCore {
         }
         Self::save_position(&env, market_id, &trader, &pos, m.close_time);
         Self::save_market(&env, market_id, &m);
+        // Legacy markets (no `Settle` entry) predate this bookkeeping.
+        if let Some(mut settle) = Self::load_settle_opt(&env, market_id) {
+            match outcome {
+                Outcome::Yes => {
+                    settle.outstanding_yes = settle
+                        .outstanding_yes
+                        .checked_add(q.shares_out)
+                        .ok_or(Error::Overflow)?
+                }
+                Outcome::No => {
+                    settle.outstanding_no = settle
+                        .outstanding_no
+                        .checked_add(q.shares_out)
+                        .ok_or(Error::Overflow)?
+                }
+            }
+            Self::debug_assert_share_invariant(&m, &settle);
+            Self::save_settle(&env, market_id, &settle);
+        }
 
         // interaction
         Self::token(&env)?.transfer(&trader, env.current_contract_address(), &collateral_in);
@@ -455,9 +559,27 @@ impl MarketCore {
         }
         Self::save_position(&env, market_id, &trader, &pos, m.close_time);
         Self::set_reserves(&mut m, outcome, q.new_reserve_sold, q.new_reserve_other);
-        m.sets_minted -= q.gross;
+        m.sets_minted = m.sets_minted.checked_sub(q.gross).ok_or(Error::Overflow)?;
         m.fees_accrued = m.fees_accrued.checked_add(q.fee).ok_or(Error::Overflow)?;
         Self::save_market(&env, market_id, &m);
+        if let Some(mut settle) = Self::load_settle_opt(&env, market_id) {
+            match outcome {
+                Outcome::Yes => {
+                    settle.outstanding_yes = settle
+                        .outstanding_yes
+                        .checked_sub(q.shares_in)
+                        .ok_or(Error::Overflow)?
+                }
+                Outcome::No => {
+                    settle.outstanding_no = settle
+                        .outstanding_no
+                        .checked_sub(q.shares_in)
+                        .ok_or(Error::Overflow)?
+                }
+            }
+            Self::debug_assert_share_invariant(&m, &settle);
+            Self::save_settle(&env, market_id, &settle);
+        }
 
         // interaction
         Self::token(&env)?.transfer(&env.current_contract_address(), &trader, &collateral_out);
@@ -492,6 +614,7 @@ impl MarketCore {
         }
         m.status = MarketStatus::Resolved(outcome);
         Self::save_market(&env, market_id, &m);
+        Self::mark_finalized(&env, market_id);
         MarketResolved {
             market_id,
             outcome: Some(outcome),
@@ -509,6 +632,7 @@ impl MarketCore {
         }
         m.status = MarketStatus::Void;
         Self::save_market(&env, market_id, &m);
+        Self::mark_finalized(&env, market_id);
         MarketResolved {
             market_id,
             outcome: None,
@@ -525,6 +649,11 @@ impl MarketCore {
         holder.require_auth();
         let m = Self::load_market(&env, market_id)?;
         let kind = Self::settlement(&m)?;
+        if let Some(settle) = Self::load_settle_opt(&env, market_id) {
+            if settle.closed {
+                return Err(Error::RedemptionClosed);
+            }
+        }
         let pos = Self::load_position(&env, market_id, &holder, m.close_time);
         if pos.yes == 0 && pos.no == 0 {
             return Err(Error::NothingToRedeem);
@@ -538,6 +667,20 @@ impl MarketCore {
             &Position { yes: 0, no: 0 },
             m.close_time,
         );
+        // Both sides decrement even when only one pays: the shares are no
+        // longer outstanding, so a losing-side redemption still clears here.
+        if let Some(mut settle) = Self::load_settle_opt(&env, market_id) {
+            settle.outstanding_yes = settle
+                .outstanding_yes
+                .checked_sub(pos.yes)
+                .ok_or(Error::Overflow)?;
+            settle.outstanding_no = settle
+                .outstanding_no
+                .checked_sub(pos.no)
+                .ok_or(Error::Overflow)?;
+            settle.paid_out = settle.paid_out.checked_add(payout).ok_or(Error::Overflow)?;
+            Self::save_settle(&env, market_id, &settle);
+        }
         if payout > 0 {
             Self::token(&env)?.transfer(&env.current_contract_address(), &holder, &payout);
         }
@@ -555,6 +698,11 @@ impl MarketCore {
         let mut m = Self::load_market(&env, market_id)?;
         m.creator.require_auth();
         let kind = Self::settlement(&m)?;
+        if let Some(settle) = Self::load_settle_opt(&env, market_id) {
+            if settle.closed {
+                return Err(Error::RedemptionClosed);
+            }
+        }
         if m.lp_claimed {
             return Err(Error::AlreadyClaimed);
         }
@@ -564,10 +712,88 @@ impl MarketCore {
         m.lp_claimed = true;
         let creator = m.creator.clone();
         Self::save_market(&env, market_id, &m);
+        if let Some(mut settle) = Self::load_settle_opt(&env, market_id) {
+            settle.paid_out = settle.paid_out.checked_add(payout).ok_or(Error::Overflow)?;
+            Self::save_settle(&env, market_id, &settle);
+        }
         if payout > 0 {
             Self::token(&env)?.transfer(&env.current_contract_address(), &creator, &payout);
         }
         Ok(payout)
+    }
+
+    /// Permissionless close-out of a final market after its redemption
+    /// deadline. Sweeps the market's entire remaining balance — value
+    /// reserved for shares never redeemed, an unclaimed LP remainder,
+    /// per-holder rounding dust and accrued fees — to the treasury, and
+    /// marks the market closed so nothing can ever pay out again.
+    ///
+    /// The deadline is `redeem_deadline(market_id)` = `finalized_at +
+    /// horizon_secs`, the horizon being snapshotted at creation from the
+    /// admin default. Anyone who redeems before the deadline is paid the
+    /// exact `settle_value` they would have received without this call;
+    /// only shares still unredeemed at the deadline are forfeit, and their
+    /// value goes to the treasury rather than the LP so the LP cannot
+    /// profit from suppressing redemptions.
+    ///
+    /// Returns the amount swept. The swept total is exactly the market's
+    /// contract balance: sets plus fees minus everything already paid out.
+    pub fn finalize_market(env: Env, market_id: u64) -> Result<i128, Error> {
+        let mut m = Self::load_market(&env, market_id)?;
+        let kind = Self::settlement(&m)?;
+        let mut settle = Self::load_settle(&env, market_id)?;
+        if settle.closed {
+            return Err(Error::RedemptionClosed);
+        }
+        if env.ledger().timestamp() < settle.finalized_at.saturating_add(settle.horizon_secs) {
+            return Err(Error::RedemptionWindowOpen);
+        }
+        // Upper bound on what the outstanding shares can still claim. For
+        // Yes/No this is exact; for Void, `floor((oy + on) / 2)` is at least
+        // the sum of per-holder floors (`settle_value` floors each pair), so
+        // reserving the aggregate floor never under-reserves.
+        let unclaimed_user =
+            math::settle_upper(kind, settle.outstanding_yes, settle.outstanding_no);
+        let lp_claim = if m.lp_claimed {
+            0
+        } else {
+            math::settle_value(kind, m.reserve_yes, m.reserve_no)
+        };
+        // Sets are collateralized 1:1 and `paid_out` tracks what already
+        // left the market, so remaining claims minus those two figures is
+        // non-negative: it is exactly the per-holder void rounding dust
+        // (zero for Yes/No markets). checked_sub makes that an assertion.
+        let dust = m
+            .sets_minted
+            .checked_sub(settle.paid_out)
+            .and_then(|v| v.checked_sub(unclaimed_user))
+            .and_then(|v| v.checked_sub(lp_claim))
+            .ok_or(Error::Overflow)?;
+        let swept = dust
+            .checked_add(unclaimed_user)
+            .and_then(|v| v.checked_add(lp_claim))
+            .and_then(|v| v.checked_add(m.fees_accrued))
+            .ok_or(Error::Overflow)?;
+
+        m.reserve_yes = 0;
+        m.reserve_no = 0;
+        m.lp_claimed = true;
+        m.fees_accrued = 0;
+        settle.outstanding_yes = 0;
+        settle.outstanding_no = 0;
+        settle.closed = true;
+        Self::save_market(&env, market_id, &m);
+        Self::save_settle(&env, market_id, &settle);
+        let treasury: Address = Self::instance_get(&env, &DataKey::Treasury)?;
+        Self::token(&env)?.transfer(&env.current_contract_address(), &treasury, &swept);
+        MarketFinalized {
+            market_id,
+            swept,
+            unclaimed_user,
+            dust,
+        }
+        .publish(&env);
+        Ok(swept)
     }
 
     /// Anyone can move accrued fees to the treasury.
@@ -615,6 +841,24 @@ impl MarketCore {
             Err(_) => env.ledger().timestamp(),
         };
         Self::load_position(&env, market_id, &holder, close_time)
+    }
+
+    /// Outstanding-share accounting for a market (issue #14).
+    /// `NotSupported` for markets created before this bookkeeping existed.
+    pub fn settle_state(env: Env, market_id: u64) -> Result<SettleState, Error> {
+        Self::load_market(&env, market_id)?;
+        Self::load_settle(&env, market_id)
+    }
+
+    /// Timestamp after which unredeemed shares are forfeit (see
+    /// `finalize_market`). `None` while the market is still Open — its
+    /// deadline is not known yet — and for legacy markets, which have no
+    /// deadline and cannot be finalized.
+    pub fn redeem_deadline(env: Env, market_id: u64) -> Option<u64> {
+        match Self::load_settle_opt(&env, market_id) {
+            Some(s) if s.finalized_at > 0 => Some(s.finalized_at.saturating_add(s.horizon_secs)),
+            _ => None,
+        }
     }
 
     /// Spot price of `outcome` in bps (0..=10_000). YES + NO ~ 10_000.
@@ -770,6 +1014,57 @@ impl MarketCore {
         } else {
             env.storage().persistent().set(&key, p);
             ttl::bump_persistent(env, &key, ttl::market_target(env, close_time));
+        }
+    }
+
+    /// Records the finality timestamp on `resolve` / `void_market` (both
+    /// already require status == Open, so it is never overwritten). No-op
+    /// for legacy markets without a `Settle` entry.
+    fn mark_finalized(env: &Env, id: u64) {
+        if let Some(mut settle) = Self::load_settle_opt(env, id) {
+            settle.finalized_at = env.ledger().timestamp();
+            Self::save_settle(env, id, &settle);
+        }
+    }
+
+    /// `None` for legacy markets created before `SettleState` existed; their
+    /// outstanding shares cannot be reconstructed on-chain, so they have no
+    /// deadline and `finalize_market` refuses them (`NotSupported`) while
+    /// `redeem` / `claim_pool_remainder` keep working as before.
+    fn load_settle_opt(env: &Env, id: u64) -> Option<SettleState> {
+        let key = DataKey::Settle(id);
+        let settle = env.storage().persistent().get::<_, SettleState>(&key)?;
+        // The deadline can be up to 5 years out, past `max_ttl()`; the entry
+        // is kept as long as the network allows and then needs a restore or
+        // the keeper (docs/wave-issues/14) until the market is finalized.
+        ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
+        Some(settle)
+    }
+
+    fn load_settle(env: &Env, id: u64) -> Result<SettleState, Error> {
+        Self::load_settle_opt(env, id).ok_or(Error::NotSupported)
+    }
+
+    fn save_settle(env: &Env, id: u64, settle: &SettleState) {
+        let key = DataKey::Settle(id);
+        env.storage().persistent().set(&key, settle);
+        ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
+    }
+
+    /// Debug-build check of the share-count invariant
+    /// `reserve_<side> + outstanding_<side> == sets_minted`.
+    ///
+    /// Only valid while no collateral has left the market (`paid_out == 0`
+    /// and the LP unclaimed), which is exactly every Open market plus a
+    /// final one nobody redeemed from yet: redeeming a losing-side position
+    /// (payout 0) burns outstanding shares without a matching payout, so
+    /// after the first payout collateral conservation is tracked by
+    /// `paid_out` instead and enforced by `finalize_market`'s checked
+    /// residual. Exercised on create / buy / sell and in the tests.
+    fn debug_assert_share_invariant(m: &Market, settle: &SettleState) {
+        if settle.paid_out == 0 && !m.lp_claimed {
+            debug_assert_eq!(m.reserve_yes + settle.outstanding_yes, m.sets_minted);
+            debug_assert_eq!(m.reserve_no + settle.outstanding_no, m.sets_minted);
         }
     }
 }
@@ -1247,5 +1542,414 @@ mod test {
         // horizon, so the long market is clamped at the maximum.
         assert!(long_ttl >= 3_110_399);
         assert!(long_ttl > short_ttl);
+    }
+
+    // ----- Outstanding shares + redemption deadline (#14) ------------------
+
+    fn create_market_with(
+        env: &Env,
+        client: &MarketCoreClient,
+        creator: &Address,
+        yes_bps: u32,
+        close_in_secs: u64,
+    ) -> u64 {
+        client.create_market(
+            creator,
+            &BytesN::from_array(env, &[41u8; 32]),
+            &BytesN::from_array(env, &[141u8; 32]),
+            &String::from_str(env, "ipfs://settle"),
+            &Category::Macro,
+            &(env.ledger().timestamp() + close_in_secs),
+            &(100 * 10_000_000_i128),
+            &yes_bps,
+        )
+    }
+
+    /// `reserve_<side> + outstanding_<side> == sets_minted`, checked through
+    /// the public views. Only meaningful while no payout has left the market
+    /// (before any redeem/claim); afterwards collateral conservation is
+    /// tracked by `paid_out` and enforced by `finalize_market`'s checked
+    /// residual — see the settle tests below.
+    fn assert_share_invariant(client: &MarketCoreClient, market_id: u64) {
+        let m = client.get_market(&market_id);
+        let s = client.settle_state(&market_id);
+        assert_eq!(s.paid_out, 0, "payouts must be zero for this assertion");
+        assert_eq!(m.reserve_yes + s.outstanding_yes, m.sets_minted);
+        assert_eq!(m.reserve_no + s.outstanding_no, m.sets_minted);
+    }
+
+    #[test]
+    fn invariant_reserve_plus_outstanding_equals_sets() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 6800, 60_000);
+        assert_share_invariant(&client, market_id);
+
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        assert_share_invariant(&client, market_id);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::No,
+            &(7 * 10_000_000_i128),
+            &0_i128,
+        );
+        assert_share_invariant(&client, market_id);
+
+        client.sell(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(3 * 10_000_000_i128),
+            &i128::MAX,
+        );
+        assert_share_invariant(&client, market_id);
+        client.sell(
+            &trader,
+            &market_id,
+            &Outcome::No,
+            &(2 * 10_000_000_i128),
+            &i128::MAX,
+        );
+        assert_share_invariant(&client, market_id);
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&market_id, &Outcome::Yes);
+        assert_share_invariant(&client, market_id);
+    }
+
+    #[test]
+    fn outstanding_tracks_buy_sell_redeem() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 6800, 60_000);
+
+        let s0 = client.settle_state(&market_id);
+        let m0 = client.get_market(&market_id);
+        assert_eq!(s0.finalized_at, 0);
+        assert_eq!(s0.horizon_secs, DEFAULT_REDEEM_HORIZON_SECS);
+        assert_eq!(s0.paid_out, 0);
+        assert!(!s0.closed);
+        assert_eq!(client.redeem_deadline(&market_id), None);
+        // The creator's seed shares count as user outstanding, not pool.
+        assert_eq!(s0.outstanding_yes, m0.sets_minted - m0.reserve_yes);
+        assert_eq!(s0.outstanding_no, 0);
+
+        let bought = client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        let s1 = client.settle_state(&market_id);
+        assert_eq!(s1.outstanding_yes, s0.outstanding_yes + bought);
+
+        let sold = client.sell(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(5 * 10_000_000_i128),
+            &i128::MAX,
+        );
+        let s2 = client.settle_state(&market_id);
+        assert_eq!(s2.outstanding_yes, s1.outstanding_yes - sold);
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&market_id, &Outcome::Yes);
+        let resolved_at = env.ledger().timestamp();
+        assert_eq!(
+            client.redeem_deadline(&market_id),
+            Some(resolved_at + DEFAULT_REDEEM_HORIZON_SECS)
+        );
+
+        let trader_pos = client.get_position(&market_id, &trader);
+        let creator_pos = client.get_position(&market_id, &creator);
+        let trader_payout = client.redeem(&trader, &market_id);
+        assert_eq!(trader_payout, trader_pos.yes);
+        let s3 = client.settle_state(&market_id);
+        assert_eq!(s3.outstanding_yes, s2.outstanding_yes - trader_pos.yes);
+        assert_eq!(s3.paid_out, trader_payout);
+        assert_eq!(s3.finalized_at, resolved_at);
+
+        let creator_payout = client.redeem(&creator, &market_id);
+        assert_eq!(creator_payout, creator_pos.yes);
+        let s4 = client.settle_state(&market_id);
+        assert_eq!(s4.outstanding_yes, 0);
+        assert_eq!(s4.paid_out, trader_payout + creator_payout);
+
+        // The LP remainder still sits in the pool until claimed.
+        let before_claim = client.get_market(&market_id);
+        let lp_payout = client.claim_pool_remainder(&market_id);
+        assert_eq!(lp_payout, before_claim.reserve_yes);
+        let s5 = client.settle_state(&market_id);
+        assert_eq!(s5.paid_out, s4.paid_out + lp_payout);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #20)")]
+    fn finalize_before_deadline_rejected() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&market_id, &Outcome::Yes);
+        let deadline = client.redeem_deadline(&market_id).unwrap();
+        env.ledger().set_timestamp(deadline - 1);
+        client.finalize_market(&market_id);
+    }
+
+    #[test]
+    fn finalize_after_deadline_sweeps_exact_residual() {
+        let (env, client, creator, trader, _, collateral) = setup_market();
+        let trader2 = Address::generate(&env);
+        StellarAssetClient::new(&env, &collateral).mint(&trader2, &10_000_000_000_i128);
+        let token = soroban_sdk::token::TokenClient::new(&env, &collateral);
+
+        let market_id = create_market_with(&env, &client, &creator, 6800, 60_000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        client.buy(
+            &trader2,
+            &market_id,
+            &Outcome::No,
+            &(7 * 10_000_000_i128),
+            &0_i128,
+        );
+
+        // A void with a mix of odd positions: per-holder floors are what
+        // leaves rounding dust behind.
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        client.void_market(&market_id);
+
+        // One holder redeems before the deadline; the other never does.
+        let trader_payout = client.redeem(&trader, &market_id);
+        let deadline = client.redeem_deadline(&market_id).unwrap();
+        env.ledger().set_timestamp(deadline + 1);
+
+        let m_before = client.get_market(&market_id);
+        let s_before = client.settle_state(&market_id);
+        let expected_unclaimed = (s_before.outstanding_yes + s_before.outstanding_no) / 2;
+        let expected_lp = (m_before.reserve_yes + m_before.reserve_no) / 2;
+        let expected_dust =
+            m_before.sets_minted - s_before.paid_out - expected_unclaimed - expected_lp;
+        assert!(expected_dust >= 0);
+        let expected_swept =
+            expected_dust + expected_unclaimed + expected_lp + m_before.fees_accrued;
+
+        let balance_before = token.balance(&client.address);
+        let treasury_before = token.balance(&client.get_config().treasury);
+        let swept = client.finalize_market(&market_id);
+
+        // The sweep drains the market's entire balance — nothing stranded.
+        assert_eq!(swept, expected_swept);
+        assert_eq!(balance_before, swept);
+        assert_eq!(token.balance(&client.address), 0);
+        assert_eq!(
+            token.balance(&client.get_config().treasury),
+            treasury_before + swept
+        );
+
+        let m_after = client.get_market(&market_id);
+        assert!(m_after.lp_claimed);
+        assert_eq!(m_after.reserve_yes, 0);
+        assert_eq!(m_after.reserve_no, 0);
+        assert_eq!(m_after.fees_accrued, 0);
+        let s_after = client.settle_state(&market_id);
+        assert!(s_after.closed);
+        assert_eq!(s_after.outstanding_yes, 0);
+        assert_eq!(s_after.outstanding_no, 0);
+        // `paid_out` keeps only the holder payouts that ever happened.
+        assert_eq!(s_after.paid_out, trader_payout);
+
+        // The never-redeemed holder is forfeit, not unpaid-but-pending.
+        assert!(client.try_redeem(&trader2, &market_id).is_err());
+    }
+
+    #[test]
+    fn redeem_before_deadline_never_underpaid() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        // Two identical markets: one is finalized after the deadline, the
+        // other is finalized too — the redemptions in between must be paid
+        // exactly the same in both worlds.
+        let a = create_market_with(&env, &client, &creator, 6800, 60_000);
+        let b = create_market_with(&env, &client, &creator, 6800, 60_000);
+        for id in [a, b] {
+            client.buy(
+                &trader,
+                &id,
+                &Outcome::Yes,
+                &(10 * 10_000_000_i128),
+                &0_i128,
+            );
+        }
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&a, &Outcome::Yes);
+        client.resolve(&b, &Outcome::Yes);
+
+        let deadline_a = client.redeem_deadline(&a).unwrap();
+        let payout_a = client.redeem(&trader, &a);
+        let payout_b = client.redeem(&trader, &b);
+        assert_eq!(payout_a, payout_b);
+        assert!(payout_a > 0);
+
+        // Now let both deadlines pass and finalize both.
+        env.ledger().set_timestamp(deadline_a + 1);
+        let swept_b = client.finalize_market(&b);
+        let swept_a = client.finalize_market(&a);
+        assert_eq!(swept_a, swept_b);
+        // The redeemer's payout was never touched by the finalize.
+        assert_eq!(client.settle_state(&a).paid_out, payout_a);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #21)")]
+    fn redeem_after_close_rejected() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 6800, 60_000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&market_id, &Outcome::Yes);
+        let deadline = client.redeem_deadline(&market_id).unwrap();
+        env.ledger().set_timestamp(deadline + 1);
+        client.finalize_market(&market_id);
+        client.redeem(&trader, &market_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #21)")]
+    fn claim_after_close_rejected() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&market_id, &Outcome::Yes);
+        let deadline = client.redeem_deadline(&market_id).unwrap();
+        env.ledger().set_timestamp(deadline + 1);
+        client.finalize_market(&market_id);
+        client.claim_pool_remainder(&market_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #21)")]
+    fn finalize_twice_rejected() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&market_id, &Outcome::Yes);
+        let deadline = client.redeem_deadline(&market_id).unwrap();
+        env.ledger().set_timestamp(deadline + 1);
+        client.finalize_market(&market_id);
+        client.finalize_market(&market_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #22)")]
+    fn legacy_market_cannot_finalize() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&market_id, &Outcome::Yes);
+        // Simulate a market created before `Settle` entries existed.
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Settle(market_id));
+        });
+        client.finalize_market(&market_id);
+    }
+
+    #[test]
+    fn legacy_market_still_redeems_without_deadline() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 6800, 60_000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&market_id, &Outcome::Yes);
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Settle(market_id));
+        });
+
+        // No deadline, no finalize — but the old redemption paths keep working.
+        assert_eq!(client.redeem_deadline(&market_id), None);
+        assert!(client.try_settle_state(&market_id).is_err());
+        let payout = client.redeem(&trader, &market_id);
+        assert!(payout > 0);
+        assert!(client.claim_pool_remainder(&market_id) > 0);
+    }
+
+    #[test]
+    fn redeem_horizon_default_snapshot_and_bounds() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let long_horizon = 200 * ttl::DAY_SECS;
+        client.set_default_redeem_horizon(&long_horizon);
+        assert!(client
+            .try_set_default_redeem_horizon(&(100 * ttl::DAY_SECS))
+            .is_err());
+        assert!(client
+            .try_set_default_redeem_horizon(&(2_000 * ttl::DAY_SECS))
+            .is_err());
+
+        let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
+        assert_eq!(client.settle_state(&market_id).horizon_secs, long_horizon);
+        assert_eq!(client.redeem_deadline(&market_id), None);
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&market_id, &Outcome::Yes);
+        let resolved_at = env.ledger().timestamp();
+        assert_eq!(
+            client.redeem_deadline(&market_id),
+            Some(resolved_at + long_horizon)
+        );
+    }
+
+    #[test]
+    fn wrong_caller_cannot_set_default_redeem_horizon() {
+        let (env, client, _, trader, _, _) = setup_market();
+        env.set_auths(&[]);
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &trader,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "set_default_redeem_horizon",
+                    args: (365 * ttl::DAY_SECS,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_set_default_redeem_horizon(&(365 * ttl::DAY_SECS))
+            .is_err());
     }
 }
