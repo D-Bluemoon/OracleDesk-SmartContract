@@ -79,6 +79,43 @@ no on-chain sqrt (see the docstring on `sell` in
    `model/fpmm_model.py` — and the pool may have moved between your read and
    your transaction).
 
+## Reading TWAP prices
+
+`get_price(market_id)` is the instantaneous spot price; it is trivially
+movable by a single trade. For anything automated (bots, alerts, fair-value
+displays) prefer the accumulated oracle views:
+
+```ts
+const { result } = await contract.twap({ market_id: 0n, window_secs: 900n });
+// price in bps of YES, time-weighted over the trailing 15 minutes
+```
+
+- `twap(market_id, window_secs)` — time-weighted average price in bps over
+  the trailing `window_secs`, floor-rounded.
+- `observe(market_id, seconds_ago)` — the cumulative `price × seconds`
+  value at a past timestamp; difference two of them and divide for a
+  custom window.
+- `price_cumulative(market_id)` — the same value at "now", for streaming
+  consumers that just want the accumulator.
+
+Caveats to design around:
+
+- Observations are written once per trade *timestamp*, so at most the most
+  recent 16 distinct-timestamp trades are covered; a `seconds_ago` (or
+  `window_secs` span) that reaches past them reverts with
+  `ObservationTooOld`. For long windows on busy markets, poll
+  `price_cumulative`/`observe` regularly and difference snapshots client-side,
+  or mirror the ring with `agents/core/strategy.ts`'s
+  `twapFromObservations`.
+- Past the newest observation the last traded price is extended
+  counterfactually (this includes after `close_time`, until resolution), so
+  a quiet market's TWAP converges to its last price rather than failing.
+- Interpolation between two observations is exact — price is piecewise
+  constant between trades — but `twap` floors, so off-chain comparisons
+  should floor identically.
+- Markets created before the accumulator existed revert `NotSupported`;
+  fall back to `get_price` for them.
+
 ## Category enum
 
 `Category` is a plain enum (`Crypto | Macro | Geopolitics | Sports | Culture

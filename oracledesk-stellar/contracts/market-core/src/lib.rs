@@ -27,6 +27,12 @@ const DEFAULT_REDEEM_HORIZON_SECS: u64 = 365 * ttl::DAY_SECS;
 const MIN_REDEEM_HORIZON_SECS: u64 = 180 * ttl::DAY_SECS;
 const MAX_REDEEM_HORIZON_SECS: u64 = 1_825 * ttl::DAY_SECS;
 
+/// Observations kept per market for the TWAP ring buffer (issue #11). One
+/// observation is written per distinct trade timestamp; a consumer asking
+/// for a time older than the oldest surviving observation gets
+/// `ObservationTooOld` instead of a wrong answer.
+const ORACLE_RING: u32 = 16;
+
 // ---------------------------------------------------------------------------
 // Types shared with the frontend/backend
 // ---------------------------------------------------------------------------
@@ -124,6 +130,47 @@ pub struct SettleState {
     pub closed: bool,
 }
 
+/// Per-market TWAP accumulator (issue #11). Lives in its own entry so the
+/// `Market` XDR stays unchanged.
+///
+/// Semantics: at the start of every trade the price that held since the last
+/// trade is folded into `price_cumulative` over the elapsed interval; the
+/// post-trade price then becomes `last_price_bps` until the next trade. That
+/// is the Uniswap-v2 model, and it is what makes manipulation expensive —
+/// moving the average requires holding the price away from fair value across
+/// one or more ledger boundaries, not just within a single transaction.
+///
+/// Overflow analysis: `last_price_bps <= 10_000` and each interval adds
+/// `price * dt` seconds. A 100-year market lifetime accumulates at most
+/// `10_000 * 3.2e9 ~ 3.2e13`; even a pathological `dt = u64::MAX` gives
+/// `1.8e19 * 1e4 = 1.8e23`. `i128::MAX` is ~1.7e38, so there is no feasible
+/// lifetime that overflows — and every step is `checked_*` anyway, so a
+/// violation rejects the transaction instead of corrupting the accumulator.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleState {
+    /// Running sum of `last_price_bps * seconds_elapsed` since creation.
+    pub price_cumulative: i128,
+    /// Timestamp the accumulator was last advanced to (the timestamp of the
+    /// most recent trade). The last traded price holds from here onward.
+    pub last_ts: u64,
+    /// YES price in bps as of the most recent trade.
+    pub last_price_bps: u32,
+    /// Ring slot of the newest observation, in `0..ORACLE_RING`.
+    pub obs_index: u32,
+    /// Observations written so far, capped at `ORACLE_RING`.
+    pub obs_count: u32,
+}
+
+/// One point in the TWAP ring buffer. At most one per distinct timestamp.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Observation {
+    pub ts: u64,
+    /// `OracleState::price_cumulative` as of `ts`.
+    pub cumulative: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -154,6 +201,8 @@ pub enum DataKey {
     Market(u64),
     Position(u64, Address),
     Settle(u64),
+    Oracle(u64),
+    Obs(u64, u32),
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +231,9 @@ pub enum Error {
     NothingToRedeem = 16,
     AlreadyClaimed = 17,
     Overflow = 18,
-    // 19 is reserved for the TWAP accumulator's `ObservationTooOld` (#11).
+    /// `observe` / `twap` asked for a time older than every surviving
+    /// observation of the market (the ring keeps the most recent 16).
+    ObservationTooOld = 19,
     /// `finalize_market` called before the redemption deadline.
     RedemptionWindowOpen = 20,
     /// Market already closed by `finalize_market`; redemption is over.
@@ -430,6 +481,28 @@ impl MarketCore {
         Self::debug_assert_share_invariant(&market, &settle);
         Self::save_settle(&env, id, &settle);
 
+        // TWAP accumulator: cumulative 0 at creation; the seeded price holds
+        // from here until the first trade (slot 0 is the creation point).
+        let now = env.ledger().timestamp();
+        let oracle = OracleState {
+            price_cumulative: 0,
+            last_ts: now,
+            last_price_bps: math::price_yes_bps(market.reserve_yes, market.reserve_no)? as u32,
+            obs_index: 0,
+            obs_count: 1,
+        };
+        Self::save_oracle(&env, id, &oracle, market.close_time);
+        Self::save_obs(
+            &env,
+            id,
+            0,
+            &Observation {
+                ts: now,
+                cumulative: 0,
+            },
+            market.close_time,
+        );
+
         Self::token(&env)?.transfer(&creator, env.current_contract_address(), &seed_amount);
 
         MarketCreated {
@@ -460,6 +533,13 @@ impl MarketCore {
         trader.require_auth();
         let mut m = Self::load_market(&env, market_id)?;
         Self::assert_tradable(&env, &m)?;
+        // TWAP: fold the pre-trade price over the elapsed interval before
+        // reserves move; `last_price_bps` is refreshed from the post-trade
+        // reserves below and the state is persisted once (issue #11).
+        let mut oracle = Self::load_oracle_opt(&env, market_id, m.close_time);
+        if let Some(st) = oracle.as_mut() {
+            Self::accumulate(&env, market_id, &m, st)?;
+        }
 
         let (r_bought, r_other) = Self::reserves_for(&m, outcome);
         let q = math::calc_buy(r_bought, r_other, collateral_in, m.fee_bps)?;
@@ -482,6 +562,10 @@ impl MarketCore {
         }
         Self::save_position(&env, market_id, &trader, &pos, m.close_time);
         Self::save_market(&env, market_id, &m);
+        if let Some(mut st) = oracle {
+            st.last_price_bps = math::price_yes_bps(m.reserve_yes, m.reserve_no)? as u32;
+            Self::save_oracle(&env, market_id, &st, m.close_time);
+        }
         // Legacy markets (no `Settle` entry) predate this bookkeeping.
         if let Some(mut settle) = Self::load_settle_opt(&env, market_id) {
             match outcome {
@@ -536,6 +620,12 @@ impl MarketCore {
         trader.require_auth();
         let mut m = Self::load_market(&env, market_id)?;
         Self::assert_tradable(&env, &m)?;
+        // TWAP: same rule as `buy` — fold the pre-trade price in first, then
+        // refresh `last_price_bps` from the post-trade reserves below.
+        let mut oracle = Self::load_oracle_opt(&env, market_id, m.close_time);
+        if let Some(st) = oracle.as_mut() {
+            Self::accumulate(&env, market_id, &m, st)?;
+        }
 
         let (r_sold, r_other) = Self::reserves_for(&m, outcome);
         let q = math::calc_sell(r_sold, r_other, collateral_out, m.fee_bps)?;
@@ -562,6 +652,10 @@ impl MarketCore {
         m.sets_minted = m.sets_minted.checked_sub(q.gross).ok_or(Error::Overflow)?;
         m.fees_accrued = m.fees_accrued.checked_add(q.fee).ok_or(Error::Overflow)?;
         Self::save_market(&env, market_id, &m);
+        if let Some(mut st) = oracle {
+            st.last_price_bps = math::price_yes_bps(m.reserve_yes, m.reserve_no)? as u32;
+            Self::save_oracle(&env, market_id, &st, m.close_time);
+        }
         if let Some(mut settle) = Self::load_settle_opt(&env, market_id) {
             match outcome {
                 Outcome::Yes => {
@@ -872,6 +966,51 @@ impl MarketCore {
         Ok(p as u32)
     }
 
+    /// Cumulative `price_bps * seconds` for YES since creation, extrapolated
+    /// to now: `observe(market_id, 0)`. Ready-made for consumers that store
+    /// their own checkpoints and compute TWAPs off-chain.
+    pub fn price_cumulative(env: Env, market_id: u64) -> Result<i128, Error> {
+        let m = Self::load_market(&env, market_id)?;
+        let st = Self::load_oracle(&env, market_id, m.close_time)?;
+        Self::observe_at(&env, market_id, &st, env.ledger().timestamp())
+    }
+
+    /// Cumulative YES-price-seconds as of `now - seconds_ago`.
+    ///
+    /// The accumulator is piecewise linear in time (the price only moves when
+    /// a trade lands), so between observations the value is interpolated
+    /// along the chord, and times after the last trade extrapolate at the
+    /// last traded price. Fails with `ObservationTooOld` when `seconds_ago`
+    /// reaches before the oldest surviving observation (the ring keeps the
+    /// most recent 16), and with `NotSupported` for markets created before
+    /// the accumulator existed. A missing (archived) ring slot is skipped,
+    /// never a panic.
+    pub fn observe(env: Env, market_id: u64, seconds_ago: u64) -> Result<i128, Error> {
+        let m = Self::load_market(&env, market_id)?;
+        let st = Self::load_oracle(&env, market_id, m.close_time)?;
+        let now = env.ledger().timestamp();
+        Self::observe_at(&env, market_id, &st, now.saturating_sub(seconds_ago))
+    }
+
+    /// Time-weighted average YES price in bps over the trailing
+    /// `window_secs`, floored. Rejects a zero window (`InvalidAmount`).
+    /// A window reaching before the oldest observation fails with
+    /// `ObservationTooOld`; a window extending past `close_time` keeps
+    /// averaging the final price, because the accumulator only moves when
+    /// trades are possible.
+    pub fn twap(env: Env, market_id: u64, window_secs: u64) -> Result<u32, Error> {
+        if window_secs == 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let m = Self::load_market(&env, market_id)?;
+        let st = Self::load_oracle(&env, market_id, m.close_time)?;
+        let now = env.ledger().timestamp();
+        let cum_now = Self::observe_at(&env, market_id, &st, now)?;
+        let cum_then = Self::observe_at(&env, market_id, &st, now.saturating_sub(window_secs))?;
+        let delta = cum_now.checked_sub(cum_then).ok_or(Error::Overflow)?;
+        Ok((delta / window_secs as i128) as u32)
+    }
+
     /// Shares a `buy` of `collateral_in` would return right now.
     pub fn quote_buy(
         env: Env,
@@ -1049,6 +1188,136 @@ impl MarketCore {
         let key = DataKey::Settle(id);
         env.storage().persistent().set(&key, settle);
         ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
+    }
+
+    /// `None` for markets created before the accumulator existed; unlike a
+    /// missing `Settle` entry this cannot be reconstructed on-chain, so the
+    /// oracle views refuse them (`NotSupported`) while trading keeps working
+    /// (with no TWAP support) for backwards compatibility.
+    fn load_oracle_opt(env: &Env, id: u64, close_time: u64) -> Option<OracleState> {
+        let key = DataKey::Oracle(id);
+        let st = env.storage().persistent().get::<_, OracleState>(&key)?;
+        ttl::bump_persistent(env, &key, ttl::market_target(env, close_time));
+        Some(st)
+    }
+
+    fn load_oracle(env: &Env, id: u64, close_time: u64) -> Result<OracleState, Error> {
+        Self::load_oracle_opt(env, id, close_time).ok_or(Error::NotSupported)
+    }
+
+    fn save_oracle(env: &Env, id: u64, st: &OracleState, close_time: u64) {
+        let key = DataKey::Oracle(id);
+        env.storage().persistent().set(&key, st);
+        ttl::bump_persistent(env, &key, ttl::market_target(env, close_time));
+    }
+
+    fn save_obs(env: &Env, id: u64, slot: u32, obs: &Observation, close_time: u64) {
+        let key = DataKey::Obs(id, slot);
+        env.storage().persistent().set(&key, obs);
+        ttl::bump_persistent(env, &key, ttl::market_target(env, close_time));
+    }
+
+    /// Advances the accumulator to `now` using the pre-trade price and
+    /// writes one ring observation when `now` is a new timestamp.
+    ///
+    /// Same-timestamp trades do not accumulate and do not write an
+    /// observation; only `last_price_bps` is refreshed by the caller after
+    /// the trade lands. That is what makes the accumulator
+    /// manipulation-resistant: an attacker trading back and forth inside one
+    /// ledger can move spot, but the price that counts toward future time is
+    /// whatever the last trade of the ledger left behind — which arbitrageurs
+    /// can punish as soon as the next ledger opens.
+    fn accumulate(env: &Env, id: u64, m: &Market, st: &mut OracleState) -> Result<(), Error> {
+        let now = env.ledger().timestamp();
+        if now <= st.last_ts {
+            return Ok(());
+        }
+        let dt = (now - st.last_ts) as i128;
+        st.price_cumulative = st
+            .price_cumulative
+            .checked_add(
+                (st.last_price_bps as i128)
+                    .checked_mul(dt)
+                    .ok_or(Error::Overflow)?,
+            )
+            .ok_or(Error::Overflow)?;
+        st.last_ts = now;
+        st.obs_index = (st.obs_index + 1) % ORACLE_RING;
+        st.obs_count = core::cmp::min(st.obs_count + 1, ORACLE_RING);
+        Self::save_obs(
+            env,
+            id,
+            st.obs_index,
+            &Observation {
+                ts: now,
+                cumulative: st.price_cumulative,
+            },
+            m.close_time,
+        );
+        Ok(())
+    }
+
+    /// `price_cumulative` as of time `t`. Per-slot reads only, so a missing
+    /// (never-written or archived) slot is skipped, never a panic.
+    fn observe_at(env: &Env, id: u64, st: &OracleState, t: u64) -> Result<i128, Error> {
+        if t >= st.last_ts {
+            // Counterfactual extension: the last traded price holds.
+            let ext = (st.last_price_bps as i128)
+                .checked_mul((t - st.last_ts) as i128)
+                .ok_or(Error::Overflow)?;
+            return st.price_cumulative.checked_add(ext).ok_or(Error::Overflow);
+        }
+        // `obs_count >= 1` for every live market: slot 0 is the creation
+        // point. `oldest` is the ring position of the oldest written slot.
+        let oldest = (st.obs_index + ORACLE_RING + 1 - st.obs_count) % ORACLE_RING;
+        let mut a: Option<Observation> = None; // newest point with ts <= t
+        let mut b: Option<Observation> = None; // oldest point with ts >= t
+        for k in 0..st.obs_count {
+            let slot = (oldest + k) % ORACLE_RING;
+            let Some(obs) = env
+                .storage()
+                .persistent()
+                .get::<_, Observation>(&DataKey::Obs(id, slot))
+            else {
+                continue;
+            };
+            if obs.ts <= t && a.is_none_or(|p| obs.ts > p.ts) {
+                a = Some(obs);
+            }
+            if obs.ts >= t && b.is_none_or(|p| obs.ts < p.ts) {
+                b = Some(obs);
+            }
+        }
+        // If the newest ring slot was archived, the live edge still brackets
+        // `t` from above; it is always at least as new as every observation.
+        if b.is_none_or(|p| st.last_ts < p.ts) {
+            b = Some(Observation {
+                ts: st.last_ts,
+                cumulative: st.price_cumulative,
+            });
+        }
+        let Some(a) = a else {
+            return Err(Error::ObservationTooOld);
+        };
+        let Some(b) = b else {
+            return Err(Error::ObservationTooOld);
+        };
+        if a.ts == t {
+            return Ok(a.cumulative);
+        }
+        if b.ts == t {
+            return Ok(b.cumulative);
+        }
+        // Chord interpolation: exact between adjacent observations (the
+        // accumulator is linear on each interval, slope = the price that
+        // held), an approximation across a lost slot.
+        let interp = b
+            .cumulative
+            .checked_sub(a.cumulative)
+            .and_then(|d| d.checked_mul((t - a.ts) as i128))
+            .ok_or(Error::Overflow)?
+            / (b.ts - a.ts) as i128;
+        a.cumulative.checked_add(interp).ok_or(Error::Overflow)
     }
 
     /// Debug-build check of the share-count invariant
@@ -1951,5 +2220,370 @@ mod test {
             }])
             .try_set_default_redeem_horizon(&(365 * ttl::DAY_SECS))
             .is_err());
+    }
+
+    // ----- TWAP accumulator (#11) ------------------------------------------
+
+    fn oracle_state(env: &Env, client: &MarketCoreClient, market_id: u64) -> OracleState {
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get::<_, OracleState>(&DataKey::Oracle(market_id))
+                .unwrap()
+        })
+    }
+
+    fn obs_at(
+        env: &Env,
+        client: &MarketCoreClient,
+        market_id: u64,
+        slot: u32,
+    ) -> Option<Observation> {
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get::<_, Observation>(&DataKey::Obs(market_id, slot))
+        })
+    }
+
+    #[test]
+    fn twap_equals_spot_without_trades() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 6800, 600_000);
+        let spot = client.get_price(&market_id, &Outcome::Yes);
+
+        env.ledger().set_timestamp(3_600);
+        // No trade yet: every second so far held the seeded price.
+        assert_eq!(client.twap(&market_id, &3_600), spot);
+        assert_eq!(client.twap(&market_id, &60), spot);
+        assert_eq!(client.price_cumulative(&market_id), (spot as i128) * 3_600);
+        assert_eq!(client.observe(&market_id, &1_800), (spot as i128) * 1_800);
+    }
+
+    #[test]
+    fn twap_weights_by_time() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 6800, 600_000);
+
+        env.ledger().set_timestamp(1_000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        let p_a = client.get_price(&market_id, &Outcome::Yes) as i128;
+
+        env.ledger().set_timestamp(1_100);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(5 * 10_000_000_i128),
+            &0_i128,
+        );
+        let p_b = client.get_price(&market_id, &Outcome::Yes) as i128;
+
+        env.ledger().set_timestamp(1_400);
+        // [1000, 1100) held p_a, [1100, 1400) held p_b (extrapolated past
+        // the last trade). The first 1000 s of seeded price are outside the
+        // window and must not contribute.
+        let expected = (p_a * 100 + p_b * 300) / 400;
+        assert_eq!(client.twap(&market_id, &400) as i128, expected);
+        assert_eq!(client.twap(&market_id, &300), p_b as u32);
+    }
+
+    #[test]
+    fn same_timestamp_trades_do_not_accumulate() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 6800, 600_000);
+
+        env.ledger().set_timestamp(1_000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        let p1 = client.get_price(&market_id, &Outcome::Yes);
+        let cum1 = client.price_cumulative(&market_id);
+        let twap1 = client.twap(&market_id, &500);
+        let st1 = oracle_state(&env, &client, market_id);
+        assert_eq!(st1.obs_count, 2, "creation slot + first trade");
+        assert_eq!(st1.obs_index, 1);
+
+        // A second trade in the same ledger moves spot but must not write an
+        // observation or advance the cumulative.
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        let p2 = client.get_price(&market_id, &Outcome::Yes);
+        assert!(p2 > p1);
+
+        let st2 = oracle_state(&env, &client, market_id);
+        assert_eq!(st2.obs_count, 2);
+        assert_eq!(st2.obs_index, 1);
+        assert_eq!(st2.price_cumulative, st1.price_cumulative);
+        assert_eq!(client.price_cumulative(&market_id), cum1);
+        assert_eq!(client.twap(&market_id, &500), twap1);
+    }
+
+    #[test]
+    fn manipulation_within_one_ledger_does_not_move_twap() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 5_000, 600_000);
+
+        env.ledger().set_timestamp(5_000);
+        let spot_before = client.get_price(&market_id, &Outcome::Yes);
+        let twap_before = client.twap(&market_id, &1_000);
+
+        // Big buy, then a partial sell-back — all inside one ledger.
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(50 * 10_000_000_i128),
+            &0_i128,
+        );
+        let spot_after_buy = client.get_price(&market_id, &Outcome::Yes);
+        assert!(
+            spot_after_buy > spot_before + 200,
+            "the buy must move spot materially ({spot_before} -> {spot_after_buy})"
+        );
+        assert_eq!(client.twap(&market_id, &1_000), twap_before);
+
+        client.sell(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(40 * 10_000_000_i128),
+            &i128::MAX,
+        );
+        assert_eq!(client.twap(&market_id, &1_000), twap_before);
+    }
+
+    #[test]
+    fn observe_interpolates_between_observations() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 6800, 600_000);
+        let p0 = client.get_price(&market_id, &Outcome::Yes) as i128;
+
+        env.ledger().set_timestamp(1_000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        let p_a = client.get_price(&market_id, &Outcome::Yes) as i128;
+
+        env.ledger().set_timestamp(1_100);
+        // t = 950 sits between the creation point (0) and the t=1000
+        // observation; the chord has slope p0 (the price that held).
+        assert_eq!(client.observe(&market_id, &150), p0 * 950);
+        // Exact at a stored observation.
+        assert_eq!(client.observe(&market_id, &100), p0 * 1_000);
+        // The live edge: cumulative at t=1000 plus p_a over the 100 s since.
+        assert_eq!(client.price_cumulative(&market_id), p0 * 1_000 + p_a * 100);
+    }
+
+    #[test]
+    fn observe_rejects_too_old() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        env.ledger().set_timestamp(1_000);
+        let market_id = create_market_with(&env, &client, &creator, 6800, 600_000);
+        env.ledger().set_timestamp(2_000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+
+        // 1001 s ago is one second before the creation observation.
+        assert_eq!(
+            client.try_observe(&market_id, &1_001),
+            Err(Ok(Error::ObservationTooOld))
+        );
+        // A window reaching back that far fails the same way.
+        assert_eq!(
+            client.try_twap(&market_id, &1_001),
+            Err(Ok(Error::ObservationTooOld))
+        );
+        // Landing exactly on the creation observation is fine.
+        assert_eq!(client.observe(&market_id, &1_000), 0);
+    }
+
+    #[test]
+    fn ring_buffer_wraps_after_16_distinct_timestamps() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        env.ledger().set_timestamp(1_000);
+        let market_id = create_market_with(&env, &client, &creator, 5_000, 600_000);
+
+        for k in 1..=17u64 {
+            env.ledger().set_timestamp(1_000 + 100 * k);
+            client.buy(
+                &trader,
+                &market_id,
+                &Outcome::Yes,
+                &10_000_000_i128,
+                &0_i128,
+            );
+        }
+
+        // 1 creation + 17 trade observations into 16 slots: the oldest
+        // surviving slot holds t=1200, the newest holds t=2700.
+        let st = oracle_state(&env, &client, market_id);
+        assert_eq!(st.obs_count, 16);
+        assert_eq!(st.obs_index, 1);
+        assert_eq!(obs_at(&env, &client, market_id, 2).unwrap().ts, 1_200);
+        assert_eq!(obs_at(&env, &client, market_id, 0).unwrap().ts, 2_600);
+        assert_eq!(obs_at(&env, &client, market_id, 1).unwrap().ts, 2_700);
+
+        // The oldest surviving observation still answers; one second
+        // earlier is gone from the ring.
+        assert!(client.observe(&market_id, &1_500) > 0);
+        assert_eq!(
+            client.try_observe(&market_id, &1_501),
+            Err(Ok(Error::ObservationTooOld))
+        );
+    }
+
+    #[test]
+    fn quote_views_do_not_write_oracle_state() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 6800, 600_000);
+        env.ledger().set_timestamp(1_000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        env.ledger().set_timestamp(1_100);
+
+        let st_before = oracle_state(&env, &client, market_id);
+        let slots_before: [Option<Observation>; ORACLE_RING as usize] =
+            core::array::from_fn(|k| obs_at(&env, &client, market_id, k as u32));
+
+        let _ = client.quote_buy(&market_id, &Outcome::Yes, &(10 * 10_000_000_i128));
+        let _ = client.quote_sell(&market_id, &Outcome::No, &(5 * 10_000_000_i128));
+        let _ = client.get_price(&market_id, &Outcome::No);
+        let _ = client.get_market(&market_id);
+        let _ = client.observe(&market_id, &50);
+        let _ = client.twap(&market_id, &100);
+        let _ = client.price_cumulative(&market_id);
+
+        assert_eq!(oracle_state(&env, &client, market_id), st_before);
+        let slots_after: [Option<Observation>; ORACLE_RING as usize] =
+            core::array::from_fn(|k| obs_at(&env, &client, market_id, k as u32));
+        assert_eq!(slots_before, slots_after);
+    }
+
+    #[test]
+    fn accumulator_is_overflow_safe_over_ten_years() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let ten_years: u64 = 10 * 365 * ttl::DAY_SECS;
+        env.ledger().set_timestamp(1_000);
+        let market_id = create_market_with(
+            &env,
+            &client,
+            &creator,
+            5_000,
+            ten_years + 30 * ttl::DAY_SECS,
+        );
+
+        // Monthly trades for 10 years, alternating sides so the price stays
+        // in a sane band. Each step feeds a ~30-day dt through the checked
+        // accumulator arithmetic; the final cumulative is ~p_avg * 3.2e8.
+        let step = ten_years / 120;
+        for m in 1..=119u64 {
+            env.ledger().set_timestamp(1_000 + m * step);
+            let outcome = if m % 2 == 0 {
+                Outcome::Yes
+            } else {
+                Outcome::No
+            };
+            client.buy(&trader, &market_id, &outcome, &10_000_000_i128, &0_i128);
+        }
+        env.ledger().set_timestamp(1_000 + 120 * step);
+        let p_held_for_last_day = client.get_price(&market_id, &Outcome::Yes);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &10_000_000_i128,
+            &0_i128,
+        );
+
+        let cum = client.price_cumulative(&market_id);
+        let elapsed = (env.ledger().timestamp() - 1_000) as i128;
+        assert!(cum > 0);
+        // Every second contributes at most 10_000 bps.
+        assert!(cum <= elapsed * 10_000);
+        // The trailing day was held at the pre-final-trade price the whole
+        // time (the final trade lands exactly at `now`).
+        assert_eq!(client.twap(&market_id, &ttl::DAY_SECS), p_held_for_last_day);
+        assert_eq!(oracle_state(&env, &client, market_id).obs_count, 16);
+    }
+
+    #[test]
+    fn legacy_market_oracle_views_not_supported() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 6800, 60_000);
+        // Simulate a market created before the accumulator existed.
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Oracle(market_id));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Obs(market_id, 0));
+        });
+        assert_eq!(
+            client.try_observe(&market_id, &1),
+            Err(Ok(Error::NotSupported))
+        );
+        assert_eq!(
+            client.try_twap(&market_id, &10),
+            Err(Ok(Error::NotSupported))
+        );
+        assert_eq!(
+            client.try_price_cumulative(&market_id),
+            Err(Ok(Error::NotSupported))
+        );
+    }
+
+    /// Cost harness for the numbers reported in the PR for issue #11. Run
+    /// explicitly with: `cargo test -p market-core measure_buy_resources --
+    /// --ignored --nocapture`. The same test body run against the parent
+    /// commit's build gives the before/after delta for `buy`.
+    #[test]
+    #[ignore = "measurement harness; run explicitly with --ignored --nocapture"]
+    fn measure_buy_resources() {
+        extern crate std;
+        let (env, client, creator, trader, _, _) = setup_market();
+        let market_id = create_market_with(&env, &client, &creator, 5_000, 10_000_000);
+        env.ledger().set_timestamp(1_000);
+        client.buy(
+            &trader,
+            &market_id,
+            &Outcome::Yes,
+            &(10 * 10_000_000_i128),
+            &0_i128,
+        );
+        std::println!(
+            "buy (new timestamp, with accumulator): {:?}",
+            env.cost_estimate().resources()
+        );
     }
 }

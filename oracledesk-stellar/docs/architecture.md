@@ -51,6 +51,22 @@ suppressing redemptions. Markets created before this bookkeeping existed
 have no `Settle` entry: they have no deadline and cannot be finalized
 (`NotSupported`), and stay redeemable through the old paths.
 
+A per-market **TWAP accumulator** records a time-weighted price. Every trade
+(`buy`/`sell`) folds the market's pre-trade price into a cumulative
+`price × time` value before reserves move (Uniswap-v2 semantics), with state
+in `Oracle(id)` and a 16-slot ring of `Obs(id, k)` observations so the
+`Market` entry's XDR is unchanged. `observe(id, seconds_ago)`,
+`twap(id, window_secs)` and `price_cumulative(id)` read it back: between two
+bracketing observations the cumulative is interpolated (exact — the
+cumulative is piecewise-linear between trades, since no price moves inside
+an interval), past the newest observation the last price
+is extended counterfactually, and a time earlier than the oldest surviving
+observation fails with `ObservationTooOld`. Same-timestamp trades only
+refresh the spot price — nothing is accumulated within one ledger, so a
+manipulator cannot move the TWAP without holding the price across a ledger
+boundary. Markets created before the accumulator existed return
+`NotSupported` from these views.
+
 ### resolver
 
 Two independent resolution modes, both ultimately calling
@@ -128,6 +144,10 @@ shared policy:
   `finalize_market` works after a restore, and the deadline is computed from
   on-chain state (`finalized_at + horizon_secs`), so a late finalization is
   still exact.
+- The market-core `Oracle` entry and every written `Obs` slot are extended to
+  the same close-time-aware target as the market's other entries. Unwritten
+  ring slots are never extended and the read path skips missing slots, so a
+  half-used ring costs nothing and never fails a read.
 - Markets whose `close_time` is further out than `max_ttl` cannot be kept
   alive by a single bump and need periodic touches or the keeper described in
   [`docs/wave-issues/14-storage-ttl-keeper.md`](wave-issues/14-storage-ttl-keeper.md),

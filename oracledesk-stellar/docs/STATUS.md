@@ -221,6 +221,17 @@ markers in the files themselves:
   TTL-archived before it is finalized and needs a restore (or the keeper,
   `docs/wave-issues/14-storage-ttl-keeper.md`) first; the deadline itself is
   on-chain state, so a late finalization is still exact.
+- **The TWAP ring keeps only the most recent 16 observations.** Each
+  observation is written per trade timestamp, so 16 distinct-timestamp trades
+  supersede the creation point: `observe`/`twap` windows that reach further
+  back than the surviving ring revert with `ObservationTooOld` rather than
+  returning a value. Windows that extend past the newest observation keep
+  averaging the last traded price (the accumulator extends
+  counterfactually), including past `close_time` until a resolver action.
+  `twap` divides with floor rounding; off-chain mirroring code must floor
+  identically. Markets created before the accumulator (issue #11) return
+  `NotSupported` from `observe`/`twap`/`price_cumulative`, and an archived
+  `Oracle`/`Obs` entry needs a restore like any other entry.
 - **Single admin key per contract**, no multisig/timelock. A compromised
   admin key has a large blast radius per contract (see
   `docs/wave-issues/12-architecture-deep-dive-and-threat-model.md`, which
