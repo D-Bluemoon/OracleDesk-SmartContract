@@ -3226,6 +3226,21 @@ mod test {
         assert_eq!(token.balance(&creator), before + res.total);
         assert!(client.get_market(&m_mine).lp_claimed);
         assert!(!client.get_market(&m_other).lp_claimed);
+
+        // Re-running the same batch is safe: the claimed market reports
+        // AlreadyClaimed, the stranger's still NotCreator, and no further
+        // transfer happens.
+        let again = client.claim_pool_remainders(&creator, &ids_vec(&env, &[m_mine, m_other]));
+        assert_eq!(
+            again.items.get(0).unwrap().status,
+            BatchStatus::Skipped(SkipReason::AlreadyClaimed)
+        );
+        assert_eq!(
+            again.items.get(1).unwrap().status,
+            BatchStatus::Skipped(SkipReason::NotCreator)
+        );
+        assert_eq!(again.total, 0);
+        assert_eq!(token.balance(&creator), before + expected_payout);
     }
 
     #[test]
