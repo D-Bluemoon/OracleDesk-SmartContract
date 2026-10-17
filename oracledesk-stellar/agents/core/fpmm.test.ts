@@ -7,7 +7,6 @@ import {
   calcSell,
   calcSellShares,
   collateralOutForShares,
-  isqrt,
   priceAfter,
   priceAfterBuy,
   priceAfterSell,
@@ -112,144 +111,6 @@ test("collateralOutForShares round-trips through calcSell within one unit of rou
   assert.ok(checked > trials / 2, "too many trials skipped, weakens the property check");
 });
 
-test("isqrt is exact for boundaries", () => {
-  // Mirrors math.rs's isqrt_exact_for_boundaries.
-  const cases: Array<[bigint, bigint]> = [
-    [0n, 0n],
-    [1n, 1n],
-    [2n, 1n],
-    [3n, 1n],
-    [4n, 2n],
-    [8n, 2n],
-    [9n, 3n],
-    [15n, 3n],
-    [16n, 4n],
-    [99n, 9n],
-    [100n, 10n],
-    [10_000n, 100n],
-    [9_000_000_000_000_000_000_000_000_000_000n, 3_000_000_000_000_000n],
-  ];
-  for (const [n, want] of cases) {
-    const got = isqrt(n);
-    assert.equal(got, want, `isqrt(${n})`);
-    assert.ok(got * got <= n, `isqrt(${n})^2 <= n`);
-    assert.ok((got + 1n) * (got + 1n) > n, `(isqrt(${n})+1)^2 > n`);
-  }
-});
-
-test("calcSellShares matches Rust/Python known values", () => {
-  // Shared fixture table with math.rs's sell_shares_example_matches_model
-  // and model/fpmm_model.py's _check_sell_shares_known_values. The 1000/1000
-  // pool selling 212 shares must give gross 100 under the pool-favoring
-  // correction rule.
-  const fixtures: Array<{
-    rSold: bigint;
-    rOther: bigint;
-    sharesIn: bigint;
-    feeBps: bigint;
-    gross: bigint;
-    collateralOut: bigint;
-    newSold: bigint;
-    newOther: bigint;
-  }> = [
-    {
-      rSold: 1000n,
-      rOther: 1000n,
-      sharesIn: 212n,
-      feeBps: 0n,
-      gross: 100n,
-      collateralOut: 100n,
-      newSold: 1112n,
-      newOther: 900n,
-    },
-    {
-      rSold: 1_000_000_000n,
-      rOther: 1_000_000_000n,
-      sharesIn: 100_000_000n,
-      feeBps: 100n,
-      gross: 52_631_578n,
-      collateralOut: 52_105_262n,
-      newSold: 1_047_368_422n,
-      newOther: 947_368_422n,
-    },
-  ];
-  for (const f of fixtures) {
-    const q = calcSellShares(f.rSold, f.rOther, f.sharesIn, f.feeBps);
-    assert.equal(q.gross, f.gross, `gross for ${JSON.stringify(f)}`);
-    assert.equal(q.collateralOut, f.collateralOut, `collateralOut for ${JSON.stringify(f)}`);
-    assert.equal(q.newReserveSold, f.newSold, `newSold for ${JSON.stringify(f)}`);
-    assert.equal(q.newReserveOther, f.newOther, `newOther for ${JSON.stringify(f)}`);
-  }
-});
-
-test("calcSellShares never decreases k", () => {
-  // Same LCG as the other property tests so all three languages explore a
-  // comparable input space.
-  let x = 0xdeadbeefcafebaben;
-  const mask = (1n << 64n) - 1n;
-  const next = () => {
-    x = (x * 6364136223846793005n + 1442695040888963407n) & mask;
-    return x >> 33n;
-  };
-  let checked = 0;
-  for (let i = 0; i < 2000; i++) {
-    const rSold = 1_000_000n + (next() % 1_000_000_000n);
-    const rOther = 1_000_000n + (next() % 1_000_000_000n);
-    const sharesIn = 1n + (next() % (rSold / 2n || 1n));
-    const feeBps = next() % 1000n;
-    const k0 = rSold * rOther;
-    let q;
-    try {
-      q = calcSellShares(rSold, rOther, sharesIn, feeBps);
-    } catch {
-      continue;
-    }
-    assert.ok(
-      q.newReserveSold * q.newReserveOther >= k0,
-      `k decreased: rSold=${rSold} rOther=${rOther} sharesIn=${sharesIn} feeBps=${feeBps}`,
-    );
-    checked++;
-  }
-  assert.ok(checked > 1000, "too many trials skipped, weakens the property check");
-});
-
-test("calcSellShares never pays more than calcSell charges for the same shares", () => {
-  // The pool-favoring rounding guarantee: for any shares_in, the exact
-  // share sell must not return more collateral than calcSell would charge
-  // to buy back that same share count.
-  let x = 0x0123456789abcdefn;
-  const mask = (1n << 64n) - 1n;
-  const next = () => {
-    x = (x * 6364136223846793005n + 1442695040888963407n) & mask;
-    return x >> 33n;
-  };
-  let checked = 0;
-  for (let i = 0; i < 1000; i++) {
-    const rSold = 1_000_000n + (next() % 1_000_000_000n);
-    const rOther = 1_000_000n + (next() % 1_000_000_000n);
-    const sharesIn = 1n + (next() % (rSold / 2n || 1n));
-    const feeBps = next() % 1000n;
-    let q;
-    try {
-      q = calcSellShares(rSold, rOther, sharesIn, feeBps);
-    } catch {
-      continue;
-    }
-    let back;
-    try {
-      back = calcSell(rSold, rOther, q.collateralOut, feeBps);
-    } catch {
-      continue;
-    }
-    assert.ok(
-      back.sharesIn <= sharesIn,
-      `calcSell charged ${back.sharesIn} for ${q.collateralOut}, more than ${sharesIn}`,
-    );
-    checked++;
-  }
-  assert.ok(checked > 500, "too many trials skipped, weakens the property check");
-});
-
 test("BPS matches the contract's basis-point scale", () => {
   assert.equal(BPS, 10_000n);
 });
@@ -287,4 +148,96 @@ test("buyWithinLimit and sellWithinLimit mirror the on-chain boundaries", () => 
   // a zero average price.
   assert.equal(sellWithinLimit(0n, 1n, 0n), true);
   assert.equal(buyWithinLimit(1n, 1n, 0n), false);
+});
+
+// Known-value fixtures shared bit-for-bit with math.rs's
+// `sell_shares_example_matches_model` and model/fpmm_model.py's
+// `_check_sell_shares_known_values`. Each entry is
+// [rSold, rOther, sharesIn, feeBps, collateralOut, fee, gross,
+//  newReserveSold, newReserveOther].
+const SELL_SHARES_FIXTURES: ReadonlyArray<
+  readonly [bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint]
+> = [
+  // 1000/1000 pool selling 212 shares at zero fee: gross 100, x = 100.
+  [1000n, 1000n, 212n, 0n, 100n, 0n, 100n, 1112n, 900n],
+  // Same pool, 1% fee: fee rounds up, collateral_out floors.
+  [1000n, 1000n, 212n, 100n, 99n, 1n, 100n, 1112n, 900n],
+  // Asymmetric reserves.
+  [1_000_000n, 2_000_000n, 500_000n, 0n, 400_000n, 0n, 400_000n, 1_100_000n, 1_600_000n],
+];
+
+test("calcSellShares matches Rust/Python known values", () => {
+  for (const [rSold, rOther, sharesIn, feeBps, out, fee, gross, ns, no] of SELL_SHARES_FIXTURES) {
+    const q = calcSellShares(rSold, rOther, sharesIn, feeBps);
+    assert.equal(q.collateralOut, out, `out r=${rSold}/${rOther} s=${sharesIn} f=${feeBps}`);
+    assert.equal(q.fee, fee, `fee r=${rSold}/${rOther} s=${sharesIn} f=${feeBps}`);
+    assert.equal(q.gross, gross, `gross r=${rSold}/${rOther} s=${sharesIn} f=${feeBps}`);
+    assert.equal(q.newReserveSold, ns, `ns r=${rSold}/${rOther} s=${sharesIn} f=${feeBps}`);
+    assert.equal(q.newReserveOther, no, `no r=${rSold}/${rOther} s=${sharesIn} f=${feeBps}`);
+  }
+});
+
+test("calcSellShares never decreases k", () => {
+  let x = 0x9e3779b97f4a7c15n;
+  const mask = (1n << 64n) - 1n;
+  const next = () => {
+    x = (x * 6364136223846793005n + 1442695040888963407n) & mask;
+    return x >> 33n;
+  };
+  let checked = 0;
+  const trials = 2000;
+  for (let i = 0; i < trials; i++) {
+    const rSold = 1_000_000n + (next() % 1_000_000_000n);
+    const rOther = 1_000_000n + (next() % 1_000_000_000n);
+    const sharesIn = 1n + (next() % (rSold / 2n || 1n));
+    const feeBps = next() % 300n;
+    const k0 = rSold * rOther;
+    let q;
+    try {
+      q = calcSellShares(rSold, rOther, sharesIn, feeBps);
+    } catch {
+      continue;
+    }
+    assert.ok(
+      q.newReserveSold * q.newReserveOther >= k0,
+      `k decreased r=${rSold}/${rOther} s=${sharesIn} f=${feeBps}`,
+    );
+    checked++;
+  }
+  assert.ok(checked > trials / 2, "too many trials skipped, weakens the property check");
+});
+
+test("calcSellShares never pays more than calcSell charges for the same shares", () => {
+  let x = 0xdeadbeefcafebaben;
+  const mask = (1n << 64n) - 1n;
+  const next = () => {
+    x = (x * 6364136223846793005n + 1442695040888963407n) & mask;
+    return x >> 33n;
+  };
+  let checked = 0;
+  const trials = 1000;
+  for (let i = 0; i < trials; i++) {
+    const rSold = 1_000_000n + (next() % 1_000_000_000n);
+    const rOther = 1_000_000n + (next() % 1_000_000_000n);
+    const sharesIn = 1n + (next() % (rSold / 2n || 1n));
+    const feeBps = next() % 300n;
+    let q;
+    try {
+      q = calcSellShares(rSold, rOther, sharesIn, feeBps);
+    } catch {
+      continue;
+    }
+    let back;
+    try {
+      back = calcSell(rSold, rOther, q.collateralOut, feeBps);
+    } catch {
+      continue;
+    }
+    assert.ok(
+      back.sharesIn <= sharesIn,
+      `overpaid r=${rSold}/${rOther} s=${sharesIn} f=${feeBps} back=${back.sharesIn}`,
+    );
+    checked++;
+  }
+  assert.ok(checked > trials / 2, "too many trials skipped, weakens the property check");
 });

@@ -1,4 +1,3 @@
-
 import { Buffer } from "buffer";
 import { Address } from "@stellar/stellar-sdk";
 import {
@@ -229,15 +228,23 @@ export interface Client {
 
   /**
    * Construct and simulate a sell_shares transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   * Sell exactly `shares_in` of `outcome` for collateral. Returns collateral
-   * received. Reverts if fewer than `min_collateral_out` would be received.
-   * 
-   * Unlike `sell`, which takes an exact `collateral_out` and returns the
-   * shares needed, this entrypoint takes an exact share count and computes
-   * the collateral on-chain via `math::calc_sell_shares`. Selling an entire
-   * position (`shares_in == held`) leaves no dust in `DataKey::Position`.
+   * Sell exactly `shares_in` of `outcome` for collateral. Returns
+   * collateral received. Reverts if less than `min_collateral_out` would be
+   * received.
+   *
+   * Unlike `sell`, this takes an exact share count and computes the
+   * collateral on-chain with a pool-favoring integer square root, so a
+   * client can express "sell N shares" or "close my whole position"
+   * without inverting the curve off-chain.
    */
   sell_shares: ({trader, market_id, outcome, shares_in, min_collateral_out}: {trader: string, market_id: u64, outcome: Outcome, shares_in: i128, min_collateral_out: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<i128>>>
+
+  /**
+   * Construct and simulate a quote_sell_shares transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Collateral a `sell_shares` of `shares_in` would return right now.
+   * Does not check tradability, consistent with `quote_sell`.
+   */
+  quote_sell_shares: ({market_id, outcome, shares_in}: {market_id: u64, outcome: Outcome, shares_in: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<i128>>>
 
   /**
    * Construct and simulate a buy_v2 transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -304,15 +311,6 @@ export interface Client {
    * Shares a `sell` for exactly `collateral_out` would consume right now.
    */
   quote_sell: ({market_id, outcome, collateral_out}: {market_id: u64, outcome: Outcome, collateral_out: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<i128>>>
-
-  /**
-   * Construct and simulate a quote_sell_shares transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   * Collateral a `sell_shares` of `shares_in` would return right now.
-   * 
-   * Like `quote_sell`, this is a pure view: it does not check tradability
-   * (paused, closed, or resolved markets still quote).
-   */
-  quote_sell_shares: ({market_id, outcome, shares_in}: {market_id: u64, outcome: Outcome, shares_in: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<i128>>>
 
   /**
    * Construct and simulate a set_paused transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -520,7 +518,6 @@ export class Client extends ContractClient {
   public readonly fromJSON = {
     buy: this.txFromJSON<Result<i128>>,
         sell: this.txFromJSON<Result<i128>>,
-        sell_shares: this.txFromJSON<Result<i128>>,
         buy_v2: this.txFromJSON<Result<i128>>,
         redeem: this.txFromJSON<Result<i128>>,
         resolve: this.txFromJSON<Result<void>>,
@@ -530,7 +527,6 @@ export class Client extends ContractClient {
         get_config: this.txFromJSON<Result<Config>>,
         get_market: this.txFromJSON<Result<Market>>,
         quote_sell: this.txFromJSON<Result<i128>>,
-        quote_sell_shares: this.txFromJSON<Result<i128>>,
         set_paused: this.txFromJSON<Result<void>>,
         sweep_fees: this.txFromJSON<Result<i128>>,
         would_trip: this.txFromJSON<Result<boolean>>,
