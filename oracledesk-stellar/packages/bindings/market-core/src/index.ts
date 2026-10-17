@@ -1,3 +1,4 @@
+
 import { Buffer } from "buffer";
 import { Address } from "@stellar/stellar-sdk";
 import {
@@ -228,13 +229,13 @@ export interface Client {
 
   /**
    * Construct and simulate a sell_shares transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   * Receive collateral by selling exactly `shares_in` of `outcome`. Returns
-   * collateral received. Reverts if less than `min_collateral_out` would be
-   * received.
+   * Sell exactly `shares_in` of `outcome` for collateral. Returns collateral
+   * received. Reverts if fewer than `min_collateral_out` would be received.
    * 
-   * Unlike `sell`, the share count is exact, so "sell all" can be expressed
-   * without off-chain inversion or dust. The on-chain integer square root
-   * rounds in the pool's favour: `k` never decreases.
+   * Unlike `sell`, which takes an exact `collateral_out` and returns the
+   * shares needed, this entrypoint takes an exact share count and computes
+   * the collateral on-chain via `math::calc_sell_shares`. Selling an entire
+   * position (`shares_in == held`) leaves no dust in `DataKey::Position`.
    */
   sell_shares: ({trader, market_id, outcome, shares_in, min_collateral_out}: {trader: string, market_id: u64, outcome: Outcome, shares_in: i128, min_collateral_out: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<i128>>>
 
@@ -306,10 +307,10 @@ export interface Client {
 
   /**
    * Construct and simulate a quote_sell_shares transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   * Collateral a `sell_shares` of exactly `shares_in` would return right now.
+   * Collateral a `sell_shares` of `shares_in` would return right now.
    * 
-   * Like `quote_sell`, this does not check tradability (paused, close time,
-   * status); it only quotes the curve.
+   * Like `quote_sell`, this is a pure view: it does not check tradability
+   * (paused, closed, or resolved markets still quote).
    */
   quote_sell_shares: ({market_id, outcome, shares_in}: {market_id: u64, outcome: Outcome, shares_in: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<i128>>>
 
