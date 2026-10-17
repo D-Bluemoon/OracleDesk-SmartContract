@@ -1,4 +1,3 @@
-
 import { Buffer } from "buffer";
 import { Address } from "@stellar/stellar-sdk";
 import {
@@ -218,16 +217,6 @@ export interface Client {
 
   /**
    * Construct and simulate a sell transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   * Sell exactly `shares_in` shares of `outcome` for collateral. Returns
-   * collateral received. Reverts if fewer than `min_collateral_out` would be
-   * received. This is the on-chain exact-share counterpart to `sell`: the
-   * contract computes the collateral from the shares, so clients no longer
-   * need to invert the curve off-chain.
-   */
-  sell_shares: ({trader, market_id, outcome, shares_in, min_collateral_out}: {trader: string, market_id: u64, outcome: Outcome, shares_in: i128, min_collateral_out: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<i128>>>
-
-  /**
-   * Construct and simulate a sell transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Receive exactly `collateral_out` by selling `outcome` shares. Returns
    * shares sold. Reverts if more than `max_shares_in` would be needed.
    * Clients turn "sell N shares" into `collateral_out` off-chain
@@ -236,6 +225,18 @@ export interface Client {
    * Legacy entrypoint: no deadline and no limit price. Prefer `sell_v2`.
    */
   sell: ({trader, market_id, outcome, collateral_out, max_shares_in}: {trader: string, market_id: u64, outcome: Outcome, collateral_out: i128, max_shares_in: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<i128>>>
+
+  /**
+   * Construct and simulate a sell_shares transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Receive collateral by selling exactly `shares_in` of `outcome`. Returns
+   * collateral received. Reverts if less than `min_collateral_out` would be
+   * received.
+   * 
+   * Unlike `sell`, the share count is exact, so "sell all" can be expressed
+   * without off-chain inversion or dust. The on-chain integer square root
+   * rounds in the pool's favour: `k` never decreases.
+   */
+  sell_shares: ({trader, market_id, outcome, shares_in, min_collateral_out}: {trader: string, market_id: u64, outcome: Outcome, shares_in: i128, min_collateral_out: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<i128>>>
 
   /**
    * Construct and simulate a buy_v2 transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -299,16 +300,18 @@ export interface Client {
 
   /**
    * Construct and simulate a quote_sell transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   * Collateral a `sell_shares` of `shares_in` would return right now.
-   * Read-only: does not check tradability, consistent with `quote_sell`.
-   */
-  quote_sell_shares: ({market_id, outcome, shares_in}: {market_id: u64, outcome: Outcome, shares_in: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<i128>>>
-
-  /**
-   * Construct and simulate a quote_sell transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Shares a `sell` for exactly `collateral_out` would consume right now.
    */
   quote_sell: ({market_id, outcome, collateral_out}: {market_id: u64, outcome: Outcome, collateral_out: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<i128>>>
+
+  /**
+   * Construct and simulate a quote_sell_shares transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Collateral a `sell_shares` of exactly `shares_in` would return right now.
+   * 
+   * Like `quote_sell`, this does not check tradability (paused, close time,
+   * status); it only quotes the curve.
+   */
+  quote_sell_shares: ({market_id, outcome, shares_in}: {market_id: u64, outcome: Outcome, shares_in: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<i128>>>
 
   /**
    * Construct and simulate a set_paused transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -515,8 +518,8 @@ export class Client extends ContractClient {
   }
   public readonly fromJSON = {
     buy: this.txFromJSON<Result<i128>>,
-        sell_shares: this.txFromJSON<Result<i128>>,
         sell: this.txFromJSON<Result<i128>>,
+        sell_shares: this.txFromJSON<Result<i128>>,
         buy_v2: this.txFromJSON<Result<i128>>,
         redeem: this.txFromJSON<Result<i128>>,
         resolve: this.txFromJSON<Result<void>>,
@@ -525,8 +528,8 @@ export class Client extends ContractClient {
         quote_buy: this.txFromJSON<Result<i128>>,
         get_config: this.txFromJSON<Result<Config>>,
         get_market: this.txFromJSON<Result<Market>>,
-        quote_sell_shares: this.txFromJSON<Result<i128>>,
         quote_sell: this.txFromJSON<Result<i128>>,
+        quote_sell_shares: this.txFromJSON<Result<i128>>,
         set_paused: this.txFromJSON<Result<void>>,
         sweep_fees: this.txFromJSON<Result<i128>>,
         would_trip: this.txFromJSON<Result<boolean>>,

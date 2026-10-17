@@ -5,17 +5,13 @@
  * plus a property check that `collateralOutForShares` (the off-chain
  * inverse for "sell N shares") round-trips through `calcSell`.
  *
- * `calcSellShares` is the exact, pool-favoring mirror of
- * math.rs::calc_sell_shares / model/fpmm_model.py::calc_sell_shares and is
- * what the on-chain `sell_shares` entrypoint uses.
- *
  * All amounts are non-negative bigints in collateral base units (USDC on
  * Stellar = 7 decimals). Rounding always favours the pool, matching the
  * contract.
  */
 
 export const BPS = 10_000n;
-export const MAX_SETS = 1_000_000_000_000_000n; // 1e15 = 100M USDC (7 dp)
+export const MAX_SETS = 1_000_000_000_000_000_000n; // 1e15 = 100M USDC (A 7dp)
 export const MIN_PROB_BPS = 100n; // 1%
 export const MAX_PROB_BPS = 9_900n; // 99%
 
@@ -55,7 +51,7 @@ export function seedReserves(seed: bigint, yesBps: bigint): SeedReserves {
   let reserveNo: bigint;
   if (p >= BPS / 2n) {
     reserveYes = mulDivFloor(seed, BPS - p, p);
-    reserveNo = seed;
+    reserveNo= seed;
   } else {
     reserveYes = seed;
     reserveNo = mulDivFloor(seed, p, BPS - p);
@@ -125,21 +121,30 @@ export function settleValue(kind: Settlement, yes: bigint, no: bigint): bigint {
 }
 
 /**
- * Integer square root (Newton's method), needed because `sell` takes an
- * exact collateral amount rather than a share count (no on-chain sqrt — see
- * the docstring on `sell` in contracts/market-core/src/lib.rs). This is
- * what makes `grossForShares` computable in BigInt without floating point.
+ * Integer square root (Newton's method). Exact for every non-negative
+ * bigint: isqrt(n)^2 <= n < (isqrt(n)+1)^2. Matches math.rs::isqrt.
  */
 export function isqrt(n: bigint): bigint {
   if (n < 0n) throw new MathError("isqrt of negative");
   if (n < 2n) return n;
-  let x = n;
-  let y = (x + 1n) / 2n;
-  while (y < x) {
-    x = y;
-    y = (x + n / x) / 2n;
+  // Seed with a power of two that is >= sqrt(n), so Newton converges
+  // monotonically down to floor(sqrt(n)). Seeding from n itself also
+  // works but takes more iterations for large n.
+  let bitLen = 0n;
+  {
+    let t = n;
+    while (t > 0n) {
+      bitLen += 1n;
+      t >>= 1n;
+    }
   }
-  return x;
+  const shift = (bitLen + 1n) / 2n;
+  let x = 1n << shift; // x >= sqrt(n)
+  for (;;) {
+    const y = (x + n / x) >> 1n;
+    if (y >= x) return x;
+    x = y;
+  }
 }
 
 /**
@@ -148,6 +153,11 @@ export function isqrt(n: bigint): bigint {
  * constant-product invariant, ignoring the contract's integer rounding.
  * Solves (sharesIn + rSold - x)(rOther - x) = rSold * rOther for the
  * smaller root of x.
+ *
+ * @deprecated Use `calcSellShares` instead. This function ignores
+ * the contract's pool-favoring correction and is only kept for old
+ * callers. `calcSellShares` is bit-for-bit identical to the on-chain
+ * `sell_shares`.
  */
 export function grossForShares(
   rSold: bigint,
@@ -168,6 +178,27 @@ export function grossForShares(
   return gross;
 }
 
+/**
+ * Estimated `collateral_out` for selling `sharesIn` shares, rounded down
+ * (pool-favoring) so a real `sell` call with this value and a
+ * `max_shares_in` slippage bound of `sharesIn` (plus your own safety
+ * margin — see docs/frontend-integration.md) should not need more shares
+ * than intended.
+ *
+ * @deprecated Use `calcSellShares` instead. This function ignores
+ * the contract's pool-favoring correction and is only kept for old
+ * callers.
+ */
+export function collateralOutForShares(
+  rSold: bigint,
+  rOther: bigint,
+  sharesIn: bigint,
+  feeBps: bigint,
+): bigint {
+  const gross = grossForShares(rSold, rOther, sharesIn, feeBps);
+  return mulDivFloor(gross, BPS - feeBps, BPS);
+}
+
 export interface SellSharesQuote {
   collateralOut: bigint;
   fee: bigint;
@@ -177,14 +208,14 @@ export interface SellSharesQuote {
 }
 
 /**
- * Exact, pool-favoring mirror of math.rs::calc_sell_shares. Given an exact
- * share count, returns the collateral the seller receives, the fee, and the
- * resulting reserves. Uses the same integer square root and the same
- * correction loop as the contract so results match bit-for-bit.
+ * Exact on-chain share-to-collateral function. Mirrors math.rs::calc_sell_shares
+ * and model/fpmm_model.py::calc_sell_shares bit-for-bit.
  *
- * Rounding is provably pool-favoring: `newReserveSold * newReserveOther >=
- * rSold * rOther`, and `collateralOut` is never more than `calcSell` would
- * charge `sharesIn` for.
+ * Solves (r_sold + shares - x)(r_other - x) = r_sold * r_other for the
+ * smaller root x, then corrects for the floor in isqrt so that
+ * new_sold * new_other >= r_sold * r_other (ke never decreases) and
+ * collateral_out is never more than calcSell would charge for the
+ * same shares.
  */
 export function calcSellShares(
   rSold: bigint,
@@ -198,45 +229,22 @@ export function calcSellShares(
   const b = rSold + sharesIn + rOther;
   const disc = b * b - 4n * rOther * sharesIn;
   if (disc < 0n) throw new MathError("insufficient liquidity");
-  let x = (b - isqrt(disc)) / 2n;
-  // Pool-favoring correction: isqrt rounds down, so x can overshoot the
-  // real root by one. Decrement while the invariant would decrease.
-  const k = rSold * rOther;
-  while (x > 0n && (rSold + sharesIn - x) * (rOther - x) < k) {
+  const root = isqrt(disc);
+  let x = (b - root) / 2n;
+  // Pool-favoring correction: the floor in isqrt can push x one above
+  // the real root. Decrement until k does not decrease. This loop runs
+  // at most twice.
+  const k0 = rSold * rOther;
+  while (x > 0n && (rSold + sharesIn - x) * (rOther - x) < k0) {
     x -= 1n;
   }
   if (x <= 0n || x >= rOther) throw new MathError("insufficient liquidity");
   const collateralOut = mulDivFloor(x, BPS - feeBps, BPS);
-  const fee = x - collateralOut;
   if (collateralOut <= 0n) throw new MathError("invalid input");
+  const fee = x - collateralOut;
   const newSold = rSold + sharesIn - x;
   const newOther = rOther - x;
-  return {
-    collateralOut,
-    fee,
-    gross: x,
-    newReserveSold: newSold,
-    newReserveOther: newOther,
-  };
-}
-
-/**
- * Estimated `collateral_out` for selling `sharesIn` shares, rounded down
- * (pool-favoring) so a real `sell` call with this value and a
- * `max_shares_in` slippage bound of `sharesIn` (plus your own safety
- * margin — see docs/frontend-integration.md) should not need more shares
- * than intended.
- *
- * @deprecated Use `calcSellShares` for exact, on-chain-matching results.
- */
-export function collateralOutForShares(
-  rSold: bigint,
-  rOther: bigint,
-  sharesIn: bigint,
-  feeBps: bigint,
-): bigint {
-  const gross = grossForShares(rSold, rOther, sharesIn, feeBps);
-  return mulDivFloor(gross, BPS - feeBps, BPS);
+  return { collateralOut, fee, gross: x, newReserveSold: newSold, newReserveOther: newOther };
 }
 
 /**

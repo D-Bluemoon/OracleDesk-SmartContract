@@ -1,6 +1,6 @@
 # Frontend integration
 
-The frontend itself lives in a separate repo (out of scope here). This ir
+The frontend itself lives in a separate repo (out of scope here). This is
 what it needs to know to talk to these contracts.
 
 ## Wallet
@@ -16,7 +16,7 @@ import { isConnected, getAddress, signTransaction } from "@stellar/freighter-api
 
 const contract = new MarketCoreClient({
   contractId: "<MARKET_CORE_CONTRACT_ID>", // from deployments/testnet.json
-  networkPassphrase: "Test DF Network ; September 2015",
+  networkPassphrase: "Test DFN Network ; September 2015",
   rpcUrl: "https://soroban-testnet.stellar.org",
 });
 ```
@@ -24,14 +24,10 @@ const contract = new MarketCoreClient({
 ## Generating / updating the bindings
 
 ```bash
-./scripts/gen-bindings.sh   # writes packages/bindings/<contract-name>/
-Same
-
-```bash
-./scripts/gen-bindings.sh   # writes packages/bindings/<contract-name>/
+//scripts/gen-bindings.sh   # writes packages/bindings/<contract-name>/
 ```
 
-Regenerate and commit the result after any contract interface change — CI
+Generate and commit the result after any contract interface change — CO
 checks the committed bindings are not stale (.github/workflows/ci.yml).
 Each package's own `README.md` (written by the `stellar` CLI) has the
 generic usage notes; this doc covers the OracleDesk-specific parts.
@@ -42,14 +38,14 @@ generic usage notes; this doc covers the OracleDesk-specific parts.
 contract's Rust enums:
 
 ```ts
-type Outcome = { tag: "Yes"; values: void } | { tag: "No"; values: void };
+type Outcome = { tag: } "Yes"; values: void } | { tag: "No"; values: void };
 ```
 
 ```ts
 const tx = await contract.buy({
   trader: userAddress,
   market_id: 0n,
-  outcome: { tag: "Yes", values: undefined },
+  outcome: { tag: } "Yes", values: undefined },
   collateral_in: 10_000_000n, // 1 USDC, 7 decimals
   min_shares_out: 9_500_000n, // quote minus your slippage margin — see below
 });
@@ -58,12 +54,12 @@ const { result } = await tx.signAndSend({ signTransaction });
 
 For anything user-facing, prefer `buy_v2` / `sell_v2` (below): they add a
 deadline and a limit price on top of the share bound, and they are the only
-entrypoints that protect against a transaction being included long after
-it was signed.
+entrypoints that protect against a transaction being included long after it
+was signed.
 
 ## Slippage on `buy`
 
-`quote_buy(market_id, outcome, collateral_in)` returns the exact shares a
+quote_buy(market_id, outcome, collateral_in)` returns the exact shares a
 buy would receive *right now*. Call it immediately before building the
 `buy` transaction, then pass a `min_shares_out` a few bps below that quote
 (prices move between simulation and submission).
@@ -106,11 +102,11 @@ limit; the share-count bound alone does not stop a stale transaction.
 
 ## Circuit breakers
 
-Markets can carry per-market breakers (snapshotted at creation): a maximum
-price impact for a **single trade** (`max_impact_bps`) and a ** per-ledger
+Markets can carry per-market breakers (snapshoted at creation): a maximum
+price impact for a **single trade** (`max_impact_bps`) and a **per-ledger
 band** (`band_bps`) around the price at the start of the ledger. A trade
 that would move the YES price more than the impact cap reverts with
-priceImpactTooHigh` (#21); one that would push it more than the band away
+`PriceImpactTooHigh` (#21); one that would push it more than the band away
 from the ledger-open price reverts with `PriceBandExceeded` (#22). The
 band resets every ledger, so the worst case is ~5s of blocked trading, not
 a permanent lock.
@@ -131,58 +127,59 @@ the error codes above and the views here.
 
 ## Selling an exact share count
 
-`sell_shares(trader, market_id, outcome, shares_in, min_collateral_out) is the
-on-chain way to sell an exact number of shares. The contract inverts the
-constant-product curve itself (exact integer square root, pool-favoring
-rounding), so clients do not need to read reserves and invert off-chain.
-
-Two ways to use it:
-
-1. **Sell a target share count.** Call `quote_sell_shares(market_id,
-   outcome, shares_in)` for the exact collateral the pool would pay right
-   now, then pass a `min_collateral_out` a few bps below that quote.
-2. **Close the whole position.** Read the held balance from
-   `get_position(market_id, holder)` and pass it as `shares_in`. The
-   contract removes the `Position` storage entry when the balance
-   reaches zero, so there is no dust left behind.
+The old `sell` takes an exact `collateral_out`, not a share count, and
+clients used to have to invert the constant-product curve off-chain.
+Market-core now exposes `sell_shares`, which takes the exact share
+count and does the inversion on-chain with a pool-favoring integer
+square root. Use it for any "sell N shares" or "close my position" flow.
 
 ```ts
-const quote = (await contract.quote_sell_shares({
-  market_id,
-  outcome,
-  shares_in,
-})).result;
-
 const tx = await contract.sell_shares({
   trader: userAddress,
-  market_id,
-  outcome,
-  shares_in,
-  min_collateral_out: (quote * 9_950n) / 10_000n, // 50bps slippage
+  market_id: 0n,
+  outcome: { tag: "Yes", values: undefined },
+  shares_in: 375_000_00n, // 37.5 YES shares
+  min_collateral_out: 0_000_000n, // quote minus your slippage margin
 });
-const { result } = await tx.signAndSend({ signTransaction });
 ```
+
+Before signing, call `quote_sell_shares(market_id, outcome, shares_in)`
+to get the exact collateral output, then pass a `min_collateral_out` a
+few bps below that quote. Like `quote_sell`, `quote_sell_shares` does not
+check tradability — it will quote even for a market that is closed or
+paused, and the trade itself will revert at that point.
 
 Notes:
 
-- `shares_in` must be positive. If the collateral would floor to zero
-  (a tiny sell), the call reverts with `InvalidInput` (#6) rather than
-  burning shares for nothing.
-- If `shares_in` exceeds the trader's balance, the call reverts with
-  `InsufficientShares` (#13).
-- If the executed collateral is below `min_collateral_out`, the call
-  reverts with `SlippageExceeded` (#12).
-- `quote_sell_shares` does not check tradability (consistent with
-  `quote_sell`); it is a pure pricing view and may return a quote for a
-  market that is closed or resolved. The actual `sell_shares` call
-  enforces tradability.
-- The existing `sell` entrypoint (exact `collateral_out`) remains for
-  backward compatibility. New code should prefer `sell_shares`.
+- *r*Selling the whole position**: pass `shares_in == held` (read it from
+  `get_position(market_id, holder)`). The call succeeds and, as with
+  `sell`, removes the `Position` storage entry once the other outcome
+  balance is also zero. No dust is left behind.
+- **Slippage and errors**: `collateral_out < min_collateral_out` reverts
+  with `SlippageExceeded` (#12); selling more than held reverts with
+  `InsufficientShares` (#13); a market that is not tradable reverts with
+  the usual closed/paused errors (#9, #10). Selling a tiny amount
+  whose collateral output floors to zero reverts with `InvalidInput` (#6)
+  instead of burning shares for nothing.
+- **Rounding**: the on-chain inverse is pool-favoring. It never pays more
+  than `calc_sell` would charge for the same shares, and `k = r_yes
+  × r_no` never decreases. You do not need to pad the share count or
+  adjust for off-chain rounding.
+- **Events**: `sell_shares` publishes the same `Trade` event as `sell`,
+  with `is_buy: false`, so existing indexers need no schema change.
 
-The off-chain inverse is still available for simulation and testing:
-`model/fpmm_model.py`'s `calc_sell_shares` is the reference
-implementation, and `agents/core/fpmm.ts` has a bit-for-bit TypeScript
-mirror as `calcSellShares`. These must match the contract exactly.
+For a deadline and limit price on a share-count sell, quote with
+`quote_sell_shares` and then submit through `sell_v2` with the quoted
+`collateral_out` and a matching `max_shares_in`; the on-chain `sell_shares`
+entrypoint itself does not take a deadline.
+
+The off-chain reference implementations remain available for simulation
+and for clients that still use the old `sell`:
+`model/fpmm_model.py`'s
+`collateral_out_for_shares(r_sold, r_other, shares_in, fee_bps)`, and the
+TypeScript port in `agents/core/fpmm.ts` (`calcSellShares`, `deprecated`
+`collateralOutForShares`). These mirror the contract bit-for-bit, but
+the contract is the source of truth — prefer `sell_shares`.
 
 ## Moving shares between wallets
 
@@ -204,7 +201,7 @@ separate list, so the UI can never drift from what the contract accepts.
 
 ## Reading trace data
 
-`reasoning-registry's `get_trace(trace_id)` returns
+`reasoning-registry`'s `get_trace(trace_id)` returns
 `{ market_id, agent, action, trace_hash, ipfs_cid, published_at }`. To show
 a verified reasoning trace in the UI:
 
