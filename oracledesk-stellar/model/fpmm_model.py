@@ -6,13 +6,11 @@ file, which run with no dependencies beyond the standard library:
 
     python3 model/fpmm_model.py
 
-This is also where the off-chain inverse for "sell N shares" lives
-(`gross_for_shares` / `collateral_out_for_shares`): the contract's `sell`
-takes an exact collateral amount (no on-chain sqrt), so a client that wants
-to sell a specific share count computes the matching collateral_out here,
-then calls `sell` with a `max_shares_in` slippage bound. `calc_sell_shares`
-is the exact, pool-favoring mirror of the on-chain `sell_shares` entrypoint
-and must match it bit-for-bit. `agents/core` ports these same functions to
+`calc_sell_shares` mirrors the on-chain `sell_shares` entrypoint: it takes an
+exact share count and returns the pool-favoring collateral_out, using the
+same integer square root and correction loop as math.rs so results match
+bit-for-bit. `gross_for_shares` / `collateral_out_for_shares` remain as the
+off-chain inverse for the legacy `sell` path. `agents/core` ports both to
 TypeScript (BigInt) for the trading agent; all three must agree.
 
 Conventions match math.rs: all amounts are non-negative ints in collateral
@@ -133,13 +131,14 @@ class SellSharesQuote:
 
 
 def calc_sell_shares(r_sold: int, r_other: int, shares_in: int, fee_bps: int) -> SellSharesQuote:
-    """Exact on-chain mirror of math.rs::calc_sell_shares.
+    """Exact-share sell: burn `shares_in` shares and return the collateral
+    the pool pays out, rounded so the pool never loses. Mirrors
+    math.rs::calc_sell_shares bit-for-bit.
 
-    Solves (shares_in + r_sold - x)(r_other - x) = r_sold * r_other for the
-    smaller root x (the gross sets burned), then applies the same
-    pool-favoring correction loop as the Rust implementation so results match
-    bit-for-bit. `isqrt` rounds down, so the closed-form root can overshoot by
-    one; the loop decrements until `new_sold * new_other >= r_sold * r_other`.
+    Solves (r_sold + shares_in - x)(r_other - x) = r_sold * r_other for the
+    smaller root x (the gross sets burned). `isqrt` rounds down, so the
+    closed-form root can overshoot by one; the correction loop decrements
+    until the invariant `new_sold * new_other >= r_sold * r_other` holds.
     """
     if shares_in <= 0 or r_sold <= 0 or r_other <= 0 or fee_bps >= BPS:
         raise MathError("invalid input")
@@ -201,11 +200,6 @@ def collateral_out_for_shares(r_sold: int, r_other: int, shares_in: int, fee_bps
     more shares than the caller intended to sell."""
     gross = gross_for_shares(r_sold, r_other, shares_in, fee_bps)
     return mul_div_floor(gross, BPS - fee_bps, BPS)
-
-
-# Deprecated: prefer `calc_sell_shares`, which matches the on-chain
-# `sell_shares` entrypoint exactly (including the pool-favoring correction
-# loop) instead of relying on a one-unit rounding tolerance.
 
 
 def price_after(outcome_is_yes: bool, r_after: int, r_other_after: int) -> int:
@@ -332,7 +326,11 @@ def _check_gross_for_shares_inverts_calc_sell(trials: int = 2_000, seed: int = 1
 
 
 def _check_sell_shares_known_values():
-    """Pins the same worked examples as math.rs's `sell_shares_example_matches_model`."""
+    """Pinned values shared with math.rs and agents/core/fpmm.test.ts.
+
+    A 1000/1000 pool selling 212 shares must burn gross 100 and pay out 100
+    (fee 0), matching the calc_sell worked example above.
+    """
     q = calc_sell_shares(1000, 1000, 212, 0)
     assert (q.gross, q.collateral_out, q.new_reserve_sold, q.new_reserve_other) == (
         100,
@@ -340,10 +338,10 @@ def _check_sell_shares_known_values():
         1112,
         900,
     ), q
-    # Fee rounds up: fee = gross - floor(gross * (BPS - fee_bps) / BPS).
-    q = calc_sell_shares(1_000_000_000, 1_000_000_000, 212_000_000, 100)
-    assert q.fee == q.gross - mul_div_floor(q.gross, BPS - 100, BPS), q
-    assert q.fee * BPS >= q.gross * 100, q
+    # With a 1% fee the fee rounds up, so collateral_out floors.
+    q = calc_sell_shares(1_000_000_000, 1_000_000_000, 1_000_000, 100)
+    assert q.fee == q.gross - q.collateral_out
+    assert q.fee * BPS >= q.gross * 100
 
 
 def _check_sell_shares_k_non_decreasing(trials: int = 2_000, seed: int = 13):
@@ -358,14 +356,15 @@ def _check_sell_shares_k_non_decreasing(trials: int = 2_000, seed: int = 13):
             q = calc_sell_shares(r_sold, r_other, shares_in, fee_bps)
         except MathError:
             continue
-        assert q.new_reserve_sold * q.new_reserve_other >= r_sold * r_other, q
+        assert q.new_reserve_sold * q.new_reserve_other >= r_sold * r_other, (r_sold, r_other, shares_in, q)
         checked += 1
     assert checked > trials // 2, "too many trials skipped, weakens the property check"
 
 
 def _check_sell_shares_never_beats_calc_sell(trials: int = 2_000, seed: int = 17):
-    """calc_sell_shares must never pay more than calc_sell charges for the
-    same shares: calc_sell(r, o, out, fee).shares_in <= shares_in."""
+    """The exact-share quote must never pay more than calc_sell would charge
+    for the same shares_in: calc_sell(r, o, q.collateral_out, fee).shares_in
+    <= shares_in. This is the pool-favoring guarantee."""
     rng = random.Random(seed)
     checked = 0
     for _ in range(trials):
@@ -381,7 +380,7 @@ def _check_sell_shares_never_beats_calc_sell(trials: int = 2_000, seed: int = 17
             back = calc_sell(r_sold, r_other, q.collateral_out, fee_bps)
         except MathError:
             continue
-        assert back.shares_in <= shares_in, (q, back)
+        assert back.shares_in <= shares_in, (r_sold, r_other, shares_in, q, back)
         checked += 1
     assert checked > trials // 2, "too many trials skipped, weakens the property check"
 
