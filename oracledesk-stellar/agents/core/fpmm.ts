@@ -5,6 +5,10 @@
  * plus a property check that `collateralOutForShares` (the off-chain
  * inverse for "sell N shares") round-trips through `calcSell`.
  *
+ * `calcSellShares` is the exact, pool-favoring mirror of
+ * math.rs::calc_sell_shares / model/fpmm_model.py::calc_sell_shares and is
+ * what the on-chain `sell_shares` entrypoint uses.
+ *
  * All amounts are non-negative bigints in collateral base units (USDC on
  * Stellar = 7 decimals). Rounding always favours the pool, matching the
  * contract.
@@ -164,12 +168,66 @@ export function grossForShares(
   return gross;
 }
 
+export interface SellSharesQuote {
+  collateralOut: bigint;
+  fee: bigint;
+  gross: bigint;
+  newReserveSold: bigint;
+  newReserveOther: bigint;
+}
+
+/**
+ * Exact, pool-favoring mirror of math.rs::calc_sell_shares. Given an exact
+ * share count, returns the collateral the seller receives, the fee, and the
+ * resulting reserves. Uses the same integer square root and the same
+ * correction loop as the contract so results match bit-for-bit.
+ *
+ * Rounding is provably pool-favoring: `newReserveSold * newReserveOther >=
+ * rSold * rOther`, and `collateralOut` is never more than `calcSell` would
+ * charge `sharesIn` for.
+ */
+export function calcSellShares(
+  rSold: bigint,
+  rOther: bigint,
+  sharesIn: bigint,
+  feeBps: bigint,
+): SellSharesQuote {
+  if (sharesIn <= 0n || rSold <= 0n || rOther <= 0n || feeBps >= BPS) {
+    throw new MathError("invalid input");
+  }
+  const b = rSold + sharesIn + rOther;
+  const disc = b * b - 4n * rOther * sharesIn;
+  if (disc < 0n) throw new MathError("insufficient liquidity");
+  let x = (b - isqrt(disc)) / 2n;
+  // Pool-favoring correction: isqrt rounds down, so x can overshoot the
+  // real root by one. Decrement while the invariant would decrease.
+  const k = rSold * rOther;
+  while (x > 0n && (rSold + sharesIn - x) * (rOther - x) < k) {
+    x -= 1n;
+  }
+  if (x <= 0n || x >= rOther) throw new MathError("insufficient liquidity");
+  const collateralOut = mulDivFloor(x, BPS - feeBps, BPS);
+  const fee = x - collateralOut;
+  if (collateralOut <= 0n) throw new MathError("invalid input");
+  const newSold = rSold + sharesIn - x;
+  const newOther = rOther - x;
+  return {
+    collateralOut,
+    fee,
+    gross: x,
+    newReserveSold: newSold,
+    newReserveOther: newOther,
+  };
+}
+
 /**
  * Estimated `collateral_out` for selling `sharesIn` shares, rounded down
  * (pool-favoring) so a real `sell` call with this value and a
  * `max_shares_in` slippage bound of `sharesIn` (plus your own safety
  * margin — see docs/frontend-integration.md) should not need more shares
  * than intended.
+ *
+ * @deprecated Use `calcSellShares` for exact, on-chain-matching results.
  */
 export function collateralOutForShares(
   rSold: bigint,
@@ -179,4 +237,54 @@ export function collateralOutForShares(
 ): bigint {
   const gross = grossForShares(rSold, rOther, sharesIn, feeBps);
   return mulDivFloor(gross, BPS - feeBps, BPS);
+}
+
+/**
+ * YES price in bps of the pool **after** applying an outcome-relative
+ * reserve update (the `newReserve*` pair of a BuyQuote/SellQuote). Mirrors
+ * math.rs::price_after: pass `outcomeIsYes = false` for a NO trade, where
+ * `rAfter` is the NO reserve.
+ */
+export function priceAfter(outcomeIsYes: boolean, rAfter: bigint, rOtherAfter: bigint): bigint {
+  return outcomeIsYes ? priceYesBps(rAfter, rOtherAfter) : priceYesBps(rOtherAfter, rAfter);
+}
+
+/**
+ * Post-trade YES price of a `calcBuy` quote for the outcome the buyer
+ * receives (`takenIsYes = false` for a NO buy). This is what the per-market
+ * impact breaker measures against the pre-trade price.
+ */
+export function priceAfterBuy(takenIsYes: boolean, quote: BuyQuote): bigint {
+  return priceAfter(takenIsYes, quote.newReserveBought, quote.newReserveOther);
+}
+
+/**
+ * Post-trade YES price of a `calcSell` quote for the outcome the seller
+ * gave up (`takenIsYes = false` for a NO sell).
+ */
+export function priceAfterSell(takenIsYes: boolean, quote: SellQuote): bigint {
+  return priceAfter(takenIsYes, quote.newReserveSold, quote.newReserveOther);
+}
+
+/**
+ * True when a buy's average execution price `collateralIn / sharesOut`
+ * (fees included) is at most `limitBps` per share. Compared by
+ * cross-multiplication so rounding cannot flip the decision; exact
+ * equality passes. Mirrors math.rs::buyWithinLimit / the on-chain
+ * `buy_v2` limit check.
+ */
+export function buyWithinLimit(collateralIn: bigint, sharesOut: bigint, limitBps: bigint): boolean {
+  if (collateralIn < 0n || sharesOut <= 0n) throw new MathError("invalid input");
+  return collateralIn * BPS <= sharesOut * limitBps;
+}
+
+/**
+ * True when a sell's average execution price `collateralOut / sharesIn`
+ * is at least `limitBps` per share. Exact equality passes; a zero limit is
+ * trivially satisfied, which buys the caller no protection. Mirrors
+ * math.rs::sellWithinLimit / the on-chain `sell_v2` limit check.
+ */
+export function sellWithinLimit(collateralOut: bigint, sharesIn: bigint, limitBps: bigint): boolean {
+  if (collateralOut < 0n || sharesIn <= 0n) throw new MathError("invalid input");
+  return collateralOut * BPS >= sharesIn * limitBps;
 }

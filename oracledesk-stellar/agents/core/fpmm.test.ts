@@ -2,11 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   BPS,
+  buyWithinLimit,
   calcBuy,
   calcSell,
+  calcSellShares,
   collateralOutForShares,
+  priceAfter,
+  priceAfterBuy,
+  priceAfterSell,
   priceYesBps,
   seedReserves,
+  sellWithinLimit,
   settleValue,
 } from "./fpmm.js";
 
@@ -24,6 +30,17 @@ test("calcSell matches the reference example", () => {
   const q = calcSell(1000n, 1000n, 100n, 0n);
   assert.equal(q.sharesIn, 212n);
   assert.equal(q.gross, 100n);
+  assert.equal(q.newReserveSold, 1112n);
+  assert.equal(q.newReserveOther, 900n);
+});
+
+test("calcSellShares matches the reference example", () => {
+  // Selling 212 shares into a 1000/1000 pool at zero fee must return gross
+  // 100, the same value calcSell(1000, 1000, 100, 0) charges 212 shares for.
+  const q = calcSellShares(1000n, 1000n, 212n, 0n);
+  assert.equal(q.gross, 100n);
+  assert.equal(q.collateralOut, 100n);
+  assert.equal(q.fee, 0n);
   assert.equal(q.newReserveSold, 1112n);
   assert.equal(q.newReserveOther, 900n);
 });
@@ -105,6 +122,82 @@ test("collateralOutForShares round-trips through calcSell within one unit of rou
   assert.ok(checked > trials / 2, "too many trials skipped, weakens the property check");
 });
 
+test("calcSellShares matches Rust/Python known values", () => {
+  // Shared fixture table with math.rs's sell_shares_example_matches_model and
+  // model/fpmm_model.py's _check_sell_shares_known_values. Any divergence in
+  // the correction loop or isqrt rounding shows up here immediately.
+  const fixtures: Array<[bigint, bigint, bigint, bigint, bigint, bigint]> = [
+    // rSold, rOther, sharesIn, feeBps, collateralOut, fee
+    [1000n, 1000n, 212n, 0n, 100n, 0n],
+    [1000n, 1000n, 212n, 100n, 99n, 1n],
+    [1_000_000n, 1_000_000n, 1000n, 0n, 999n, 0n],
+    [1_000_000_000n, 1_000_000_000n, 1_000_000n, 100n, 998_999n, 10_101n],
+  ];
+  for (const [rSold, rOther, sharesIn, feeBps, out, fee] of fixtures) {
+    const q = calcSellShares(rSold, rOther, sharesIn, feeBps);
+    assert.equal(q.collateralOut, out, `out rSold=${rSold} rOther=${rOther} shares=${sharesIn} fee=${feeBps}`);
+    assert.equal(q.fee, fee, `fee rSold=${rSold} rOther=${rOther} shares=${sharesIn} fee=${feeBps}`);
+  }
+});
+
+test("calcSellShares never decreases k", () => {
+  let x = 0xdeadbeefcafebaben;
+  const mask = (1n << 64n) - 1n;
+  const next = () => {
+    x = (x * 6364136223846793005n + 1442695040888963407n) & mask;
+    return x >> 33n;
+  };
+  for (let i = 0; i < 2000; i++) {
+    const rSold = 1_000_000n + (next() % 1_000_000_000n);
+    const rOther = 1_000_000n + (next() % 1_000_000_000n);
+    const sharesIn = 1n + (next() % (rSold / 2n));
+    const feeBps = next() % 300n;
+    let q;
+    try {
+      q = calcSellShares(rSold, rOther, sharesIn, feeBps);
+    } catch {
+      continue;
+    }
+    assert.ok(q.newReserveSold * q.newReserveOther >= rSold * rOther, "k decreased");
+    assert.ok(q.collateralOut > 0n, "zero collateral out");
+  }
+});
+
 test("BPS matches the contract's basis-point scale", () => {
   assert.equal(BPS, 10_000n);
+});
+
+test("priceAfter maps both outcomes to the same YES price", () => {
+  assert.equal(priceAfter(true, 1000n, 1000n), 5000n);
+  assert.equal(priceAfter(false, 1000n, 1000n), 5000n);
+  assert.equal(priceAfter(true, 910n, 1100n), priceYesBps(910n, 1100n));
+  assert.equal(priceAfter(false, 910n, 1100n), priceYesBps(1100n, 910n));
+});
+
+test("priceAfterBuy matches the reference example shared with math.rs and the Python model", () => {
+  // Buying 10 USDC of YES in a 100-sets pool at 50% with a 1% fee moves
+  // YES from 5000 to 5470 bps.
+  const q = calcBuy(1_000_000_000n, 1_000_000_000n, 100_000_000n, 100n);
+  assert.equal(priceYesBps(1_000_000_000n, 1_000_000_000n), 5000n);
+  assert.equal(priceAfterBuy(true, q), 5470n);
+  // Selling right back must land below the pre-trade price (two fees).
+  const s = calcSell(q.newReserveBought, q.newReserveOther, 100_000_000n, 100n);
+  assert.ok(priceAfterSell(true, s) < 5000n);
+});
+
+test("buyWithinLimit and sellWithinLimit mirror the on-chain boundaries", () => {
+  // Exact equality passes, one unit over fails, in both directions.
+  assert.equal(buyWithinLimit(100n, 100n, 10_000n), true);
+  assert.equal(buyWithinLimit(100n, 101n, 10_000n), true);
+  assert.equal(buyWithinLimit(101n, 100n, 10_000n), false);
+  assert.equal(buyWithinLimit(100n, 200n, 5_000n), true);
+  assert.equal(buyWithinLimit(101n, 200n, 5_000n), false);
+  assert.equal(sellWithinLimit(100n, 100n, 10_000n), true);
+  assert.equal(sellWithinLimit(99n, 100n, 10_000n), false);
+  assert.equal(sellWithinLimit(100n, 200n, 5_000n), true);
+  assert.equal(sellWithinLimit(100n, 201n, 5_000n), false);
+  // A zero limit is trivially satisfied for sells and binds a buy only at
+  // a zero average price.
+  assert.equal(sellWithinLimit(0n, 1n, 0n), true);
+  assert.equal(buyWithinLimit(1n, 1n, 0n), false);
 });
