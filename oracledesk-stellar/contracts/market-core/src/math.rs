@@ -95,6 +95,22 @@ pub fn price_yes_bps(reserve_yes: i128, reserve_no: i128) -> Result<i128, MathEr
     mul_div_floor(reserve_no, BPS, sum)
 }
 
+/// YES price in bps of the pool **after** applying an outcome-relative
+/// reserve update (the `new_reserve_*` pair of a `BuyQuote`/`SellQuote`).
+/// Follows `reserves_for`'s convention: pass `outcome_is_yes = false` for a
+/// NO trade, where `r_after` is the NO reserve.
+pub fn price_after(
+    outcome_is_yes: bool,
+    r_after: i128,
+    r_other_after: i128,
+) -> Result<i128, MathError> {
+    if outcome_is_yes {
+        price_yes_bps(r_after, r_other_after)
+    } else {
+        price_yes_bps(r_other_after, r_after)
+    }
+}
+
 /// Pool opens at `yes_bps` probability with `seed` complete sets minted.
 /// The pool keeps fewer of the *likelier* outcome; the creator keeps the rest.
 pub fn seed_reserves(seed: i128, yes_bps: u32) -> Result<SeedReserves, MathError> {
@@ -193,6 +209,50 @@ pub fn calc_sell(
     })
 }
 
+/// True when a buy's average execution price `collateral_in / shares_out`
+/// (fees included) is at most `limit_bps` per share (1.0 = BPS).
+/// Compared by cross-multiplication so division rounding cannot flip the
+/// decision; exact equality passes. `shares_out` comes from `calc_buy`, so
+/// it is always > 0 in practice.
+pub fn buy_within_limit(
+    collateral_in: i128,
+    shares_out: i128,
+    limit_bps: u32,
+) -> Result<bool, MathError> {
+    if collateral_in < 0 || shares_out <= 0 {
+        return Err(MathError::InvalidInput);
+    }
+    Ok(mul(collateral_in, BPS)? <= mul(shares_out, limit_bps as i128)?)
+}
+
+/// True when a sell's average execution price `collateral_out / shares_in`
+/// is at least `limit_bps` per share. Exact equality passes; a zero limit is
+/// trivially satisfied (`collateral_out >= 0`), which buys the caller no
+/// protection — see `sell_v2`'s docs.
+pub fn sell_within_limit(
+    collateral_out: i128,
+    shares_in: i128,
+    limit_bps: u32,
+) -> Result<bool, MathError> {
+    if collateral_out < 0 || shares_in <= 0 {
+        return Err(MathError::InvalidInput);
+    }
+    Ok(mul(collateral_out, BPS)? >= mul(shares_in, limit_bps as i128)?)
+}
+
+/// Splits a gross fee between the protocol and the LP.
+///
+/// The protocol portion rounds **up** so `protocol + lp == fee` exactly (no
+/// rounding leakage): the LP absorbs at most one sub-unit of dust, and the
+/// default `protocol_share_bps = BPS` is exact (all protocol, 0 to the LP).
+pub fn split_fee(fee: i128, protocol_share_bps: u32) -> Result<(i128, i128), MathError> {
+    if fee < 0 || protocol_share_bps as i128 > BPS {
+        return Err(MathError::InvalidInput);
+    }
+    let protocol = mul_div_ceil(fee, protocol_share_bps as i128, BPS)?;
+    Ok((protocol, fee - protocol))
+}
+
 /// Collateral value of a (yes, no) share pair once a market is final.
 /// Void pays 0.5 per share, which keeps total payouts <= sets minted.
 pub fn settle_value(kind: Settlement, yes: i128, no: i128) -> i128 {
@@ -264,5 +324,68 @@ mod tests {
     fn void_never_overpays() {
         assert_eq!(settle_value(Settlement::Void, 3, 4), 3);
         assert!(settle_value(Settlement::Void, 5, 5) <= 5);
+    }
+
+    #[test]
+    fn split_fee_sums_exactly() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) as i128
+        };
+        for _ in 0..2_000 {
+            let fee = next() % 1_000_000_000_000;
+            let share = (next() % (BPS + 1)) as u32;
+            let (protocol, lp) = split_fee(fee, share).unwrap();
+            assert_eq!(protocol + lp, fee, "fee={fee} share={share}");
+            assert!(protocol >= 0 && lp >= 0);
+            // protocol rounds up: never below the exact proportional share
+            assert!(protocol * BPS >= fee * share as i128);
+        }
+    }
+
+    #[test]
+    fn split_fee_default_is_all_protocol() {
+        assert_eq!(split_fee(12_345, 10_000).unwrap(), (12_345, 0));
+        assert_eq!(split_fee(12_345, 0).unwrap(), (0, 12_345));
+        assert_eq!(split_fee(0, 3_333).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn buy_within_limit_boundaries() {
+        // avg price exactly 1.0: passing costs the full limit, passes
+        assert!(buy_within_limit(100, 100, 10_000).unwrap());
+        // cheaper than the limit
+        assert!(buy_within_limit(100, 101, 10_000).unwrap());
+        // one unit above the limit fails
+        assert!(!buy_within_limit(101, 100, 10_000).unwrap());
+        // 100 in -> 200 shares = 0.5 per share, exactly at 5_000 bps
+        assert!(buy_within_limit(100, 200, 5_000).unwrap());
+        assert!(!buy_within_limit(101, 200, 5_000).unwrap());
+    }
+
+    #[test]
+    fn sell_within_limit_boundaries() {
+        assert!(sell_within_limit(100, 100, 10_000).unwrap());
+        assert!(!sell_within_limit(99, 100, 10_000).unwrap());
+        // 100 out from 200 shares = 0.5 per share, exactly at 5_000 bps
+        assert!(sell_within_limit(100, 200, 5_000).unwrap());
+        assert!(!sell_within_limit(100, 201, 5_000).unwrap());
+        // a zero limit is trivially satisfied
+        assert!(sell_within_limit(0, 1, 0).unwrap());
+    }
+
+    #[test]
+    fn price_after_maps_both_sides() {
+        assert_eq!(price_after(true, 1_000, 1_000).unwrap(), 5_000);
+        assert_eq!(price_after(false, 1_000, 1_000).unwrap(), 5_000);
+        // NO buy pushing NO reserve to 910 with 1100 YES: YES price is
+        // 1100 / (1100 + 910), i.e. price_yes_bps(yes, no)
+        assert_eq!(
+            price_after(false, 910, 1_100).unwrap(),
+            price_yes_bps(1_100, 910).unwrap()
+        );
     }
 }
