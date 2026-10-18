@@ -258,7 +258,7 @@ export function priceAfterSell(takenIsYes: boolean, quote: SellQuote): bigint {
  * (fees included) is at most `limitBps` per share. Compared by
  * cross-multiplication so rounding cannot flip the decision; exact
  * equality passes. Mirrors math.rs::buyWithinLimit / the on-chain
- * `buy_v2` imit check.
+ * `buy_v2` limit check.
  */
 export function buyWithinLimit(collateralIn: bigint, sharesOut: bigint, limitBps: bigint): boolean {
   if (collateralIn < 0n || sharesOut <= 0n) throw new MathError("invalid input");
