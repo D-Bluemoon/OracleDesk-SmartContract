@@ -1,1 +1,235 @@
-IyBGcm9udGVuZCBpbnRlZ3JhdGlvbgoKVGhlIGZyb250ZW5kIGl0c2VsZiBsaXZlcyBpbiBhIHNlcGFyYXRlIHJlcG8gKG91dCBvZiBzY29wZSBoZXJlKS4gVGhpcyBpcwp3aGF0IGl0IG5lZWRzIHRvIGtub3cgdG8gdGFsayB0byB0aGVzZSBjb250cmFjdHMuCgojIyBXYWxsZXQKClVzZSBbRnJlaWdodGVyXShodHRwczovL3d3dy5mcmVpZ2h0ZXIuYXBwLykgKG9yIGFueSBbU0VQLTQzXShodHRwczovL2dpdGh1Yi5jb20vc3RlbGxhci9zdGVsbGFyLXByb3RvY29sL2Jsb2IvbWFzdGVyL2Vjb3N5c3RlbS9zZXAtMDA0My5tZCktY29tcGF0aWJsZQp3YWxsZXQpIHRvIGdldCB0aGUgdXNlcidzIHB1YmxpYyBrZXkgYW5kIHNpZ24gdHJhbnNhY3Rpb25zLiBUaGUgZ2VuZXJhdGVkCmJpbmRpbmdzJyBgQXNzZW1ibGVkVHJhbnNhY3Rpb25gIGFscmVhZHkgZG9lcyB0aGUgc2ltdWxhdGUg4oaSIHNpZ24g4oaSIHN1Ym1pdApkYW5jZTsgeW91IG9ubHkgbmVlZCB0byBwbHVnIGluIGEgYHNpZ25UcmFuc2FjdGlvbmAgY2FsbGJhY2s6CgpgYGB0cwppbXBvcnQgeyBDbGllbnQgYXMgTWFya2V0Q29yZUNsaWVudCB9IGZyb20gIkBvcmFjbGVkZXNrL21hcmtldC1jb3JlLWJpbmRpbmdzIjsKaW1wb3J0IHsgaXNDb25uZWN0ZWQsIGdldEFkZHJlc3MsIHNpZ25UcmFuc2FjdGlvbiB9IGZyb20gIkBzdGVsbGFyL2ZyZWlnaHRlci1hcGkiOwoKY29uc3QgY29udHJhY3QgPSBuZXcgTWFya2V0Q29yZUNsaWVudCh7CiAgY29udHJhY3RJZDogIjxNQVJLRVRfQ09SRV9DT05UUkFDVF9JRD4iLCAvLyBmcm9tIGRlcGxveW1lbnRzL3Rlc3RuZXQuanNvbgogIG5ldHdvcmtQYXNzcGhyYXNlOiAiVGVzdCBERk4gTmV0d29yayA7IFNlcHRlbWJlciAyMDE1IiwKICBycGNVcmw6ICJodHRwczovL3Nvcm9iYW4tdGVzdG5ldC5zdGVsbGFyLm9yZyIsCn0pOwpgYGAKCiMjIEdlbmVyYXRpbmcgLyB1cGRhdGluZyB0aGUgYmluZGluZ3MKCmBgYGJhc2gKL3NjcmlwdHMvZ2VuLWJpbmRpbmdzLnNoICAgIyB3cml0ZXMgcGFja2FnZXMvYmluZGluZ3MvPGNvbnRyYWN0LW5hbWU+LwpTYW1lIGFzIGBhYm92ZQpgYGAKClJlZ2VuZXJhdGUgYW5kIGNvbW1pdCB0aGUgcmVzdWx0IGFmdGVyIGFueSBjb250cmFjdCBpbnRlcmZhY2UgY2hhbmdlIOKAlCBDSQpjaGVja3MgdGhlIGNvbW1pdHRlZCBiaW5kaW5ncyBhcmUgbm90IHN0YWxlIChgLmdpdGh1Yi93b3JrZmxvd3MvY2kueW1sYCkuCkVhY2ggcGFja2FnZSdzIG93biBgUkVBRE1FLm1kYCAod3JpdHRlbiBieSB0aGUgYHN0ZWxsYXJgIENMSSkgaGFzIHRoZQpnZW5lcmljIHVzYWdlIG5vdGVzOyB0aGlzIGRvYyBjb3ZlcnMgdGhlIE9yYWNsZURlc2stc3BlY2lmaWMgcGFydHMuCgojIyBDYWxsaW5nIGBidXlgIC8gYHNlbGxgCgpgT3V0Y29tZWAgYW5kIGBDYXRlZ29yeWAgYXJlIGdlbmVyYXRlZCBhcyB0YWdnZWQgdW5pb25zIG1hdGNoaW5nIHRoZQpjb250cmFjdCdzIFJ1c3QgZW51bXM6CgpgYGB0cwp0eXBlIE91dGNvbWUgPSB7IHRhZzog-IFllcyI7IHZhbHVlczogdm9pZCB9IHwgeyB0YWc6ICJObCI7IHZhbHVlczogdm9pZCB9OwpgYGAKClRoZSByZXNvbHZlcidzIGBhdHRlc3RgIC8gYGF0dGVzdF93aXRoX2V2aWRlbmNlYCB0YWtlIGl0cyBvd24KYEF0dGVzdGVkT3V0Y29tZWAgaW5zdGVhZCwgd2hpY2ggYWRkcyBgeyB0YWc6ICJJbnZhbGlkIjsgdmFsdWVzOiB2b2lkIH1gCihmaW5hbGl6aW5nIGFuIGBJbnZhbGlkYCBwcm9wb3NhbCB2b2lkcyB0aGUgbWFya2V0KS4gYGZpbmFsaXplX3NpZ25lcnNgCnJldHVybnMgYEF0dGVzdGVkT3V0Y29tZWAuIEluZGV4ZXJzIHNob3VsZCBkZWNvZGUgYFJlc29sdXRpb25Qcm9wb3NlZFYyYCAvCmBSZXNvbHV0aW9uRmluYWxpemVkVjJgIC8gYENvbW1pdHRlZVZvaWRlZGA7IHRoZSBgT3V0Y29tZWAtdHlwZWQKYFJlc29sdXRpb25Qcm9wb3NlZGAgLyBgUmVzb2x1dGlvbkZpbmFsaXplZGAgYXJlIG5vIGxvbmdlciBlbWl0dGVkLgoKYGBgdHMKY29uc3QgdHggPSBhd2FpdCBjb250cmFjdC5idXkoewogIHRyYWRlcjogdXNlckFkZHJlc3MsCiAgbWFya2V0X2lkOiAwbiwKICBvdXRjb21lOiB7IHRhZzogIlllcyIsIHZhbHVlczogdW5kZWZpbmVkIH0sCiAgY29sbGF0ZXJhbF9pbjogMTBfMDAwXzAwMG4sIC8vIDEgVVNEQywgNyBkZWNpbWFscwogIG1pbl9zaGFyZXNfb3V0OiA5XzUwMF8wMDBuLCAvLyBxdW90ZSBtaW51cyB5b3VyIHNsaXBwYWdlIG1hcmdpbiDigJQgc2VlIGJlbG93Cn0pOwpjb25zdCB7IHJlc3VsdCB9ID0gYXdhaXQgdHguc2lnbkFuZFNlbmQoeyBzaWduVHJhbnNhY3Rpb24gfSk7CmBgYAoKRm9yIGFueXRoaW5nIHVzZXItZmFjaW5nLCBwcmVmZXIgYGJ1eV92MmAgLyBgc2VsbF92MmAgKGJlbG93KTogdGhleSBhZGQgYQpkZWFkbGluZSBhbmQgYSBsaW1pdCBwcmljZSBvbiB0b3Agb2YgdGhlIHNoYXJlIGJvdW5kLCBhbmQgdGhleSBhcmUgdGhlIG9ubHkKZW50cnlwb2ludHMgdGhhdCBwcm90ZWN0IGFnYWluc3QgYSB0cmFuc2FjdGlvbiBiZWluZyBpbmNsdWRlZCBsb25nIGFmdGVyIGl0CndhcyBzaWduZWQuCgojIyBTbGlwcGFnZSBvbiBgYnV5YAoKYHF1b3RlX2J1eShtYXJrZXRfaWQsIG91dGNvbWUsIGNvbGxhdGVyYWxfaW4pYCByZXR1cm5zIHRoZSBleGFjdCBzaGFyZXMgYQpidXkgd291bGQgcmVjZWl2ZSAqcmlnaHQgbm93Ki4gQ2FsbCBpdCBpbW1lZGlhdGVseSBiZWZvcmUgYnVpbGRpbmcgdGhlCmBidXlgIHRyYW5zYWN0aW9uLCB0aGVuIHBhc3MgYSBgbWluX3NoYXJlc19vdXRgIGEgZmV3IGJwcyBiZWxvdyB0aGF0IHF1b3RlCihwcmljZXMgbW92ZSBiZXR3ZWVuIHNpbXVsYXRpb24gYW5kIHN1Ym1pc3Npb24pLgoKTmV2ZXIgcGFzcyBgbWluX3NoYXJlc19vdXQ6IDBgICh0aGUgb2xkIGV4YW1wbGUgZGlkKTogaXQgYWNjZXB0cyBhbnkKZXhlY3V0aW9uIHByaWNlIGF0IGFsbCwgd2hpY2ggaW4gYSB0aGluIHBvb2wgaXMgaG93IGEgc2FuZHdpY2ggdGFrZXMgeW91cgptb25leS4KCiMjIERlYWRsaW5lcyBhbmQgbGltaXQgcHJpY2VzCgpgYnV5X3YyYCAvIGBzZWxsX3YyYCBhZGQgdHdvIGNvbnRyYWN0LWVuZm9yY2VkIGJvdW5kcyB0byBldmVyeSB0cmFkZToKCi0gYGRlYWRsaW5lOiB1NjRgIOKAlCB1bml4IHNlY29uZHMsIGNvbXBhcmVkIGFnYWluc3QgdGhlICoqIGxlZGdlcgogIHRpbWVzdGFtcCoqIChuZXR3b3JrIHRpbWUsIG5vdCB0aGUgdXNlcidzIGNsb2NrKS4gUGFzdCBpdCB0aGUgdHJhZGUKICByZXZlcnRzIHdpdGggYERlYWRsaW5lRXhwaXJlZGAgKCMxOSkuCi0gYGxpbWl0X3ByaWNlX2Jwc2A6IHUzMmAg4oCUIHRoZSAqKmF2ZXJhZ2UgZXhlY3V0aW9uIHByaWNlKiogYm91bmQsCiAgZmVlIGluY2x1ZGVkOiBmb3IgYSBidXksIGBjb2xsYXRlcmFsX2luIC8gc2hhcmVzX291dCA8PSBsaW1pdGA7IGZvciBhCiAgc2VsbCwgYGNvbGxhdGVyYWxfb3V0IC8gc2hhcmVzX2luID49IGxpbWl0YC4gV29yc2UgdGhhbiB0aGUgbGltaXQKICByZXZlcnRzIHdpdGggYExpbWl0UHJpY2VFeGNlZWRlZGAgKCMyMCkuIFRoZSBsaW1pdCBpcyBvbiB0aGUgcHJpY2Ugb2YKICAqdGhlIG91dGNvbWUgYmVpbmcgdHJhZGVkKiDigJQgYSBOTyBidXkncyBsaW1pdCBpcyBjaGVja2VkIGFnYWluc3QgTk8KICBwcmljZXMsIGkuZS4gdGhlIGNvbXBsZW1lbnQgb2YgdGhlIFlFUyBwcmljZS4gYDBgIG1lYW5zICJubyBsaW1pdCIgZm9yCiAgYnV5czsgZm9yIHNlbGxzIGl0IGlzIHRyaXZpYWxseSBzYXRpc2ZpZWQgYW5kIGJ1eXMgeW91IG5vdGhpbmcuIFZhbHVlcwogIGFib3ZlIGAxMF8wMDBgIGFyZSByZWplY3RlZCAoYEludmFsaWRBbW91bnRgKS4KCmBgYHRzCmNvbnN0IHF1b3RlID0gKGF3YWl0IGNvbnRyYWN0LnF1b3RlX2J1eSh7IG1hcmtldF9pZCwgb3V0Y29tZSwgY29sbGF0ZXJhbF9pbiB9KSkucmVzdWx0Owpjb25zdCB0eCA9IGF3YWl0IGNvbnRyYWN0LmJ1eV92Mih7CiAgdHJhZGVyOiB1c2VyQWRkcmVzcywKICBtYXJrZXRfaWQsCiAgb3V0Y29tZSwKICBjb2xsYXRlcmFsX2luLAogIG1pbl9zaGFyZXNfb3V0OiAocXVvdGUgKiA5Xzk1MG4pIC8gMTBfMDAwbiwgLy8gNTBicHMgc2xpcHBhZ2UKICBsaW1pdF9wcmljZV9icHM6IDY1MDAsICAgIC8vIG5ldmVyIHBheSBtb3JlIHRoYW4gNjXCiIHBlciBzaGFyZQogIGRlYWRsaW5lOiBCaWdJbnQoTWF0aC5mbG9vcihEYXRlLm5vdygpIC8gMTAwMCkgKyA2MCksCn0pOwpgYGAKCmBidXlgIC8gYHNlbGxgIHJlbWFpbiBmb3IgYmFja3dhcmQgY29tcGF0aWJpbGl0eSBidXQgY2Fycnkgbm8gZGVhZGxpbmUgb3IKbGltaXQ7IHRoZSBzaGFyZS1jb3VudCBib3VuZCBhbG9uZSBkb2VzIG5vdCBzdG9wIGEgc3RhbGUgdHJhbnNhY3Rpb24uCgojIyBDaXJjdWl0IGJyZWFrZXJzCgpNYXJrZXRzIGNhbiBjYXJyeSBwZXItbWFya2V0IGJyZWFrZXJzIChzbmFwc2hvdHRlZCBhdCBjcmVhdGlvbik6IGEgbWF4aW11bQpwcmljZSBpbXBhY3QgZm9yIGEgKipzaW5nbGUgdHJhZGUqKiAoYG1heF9pbXBhY3RfYnBzYCkgYW5kIGEgKipwZXItbGVkZ2VyCmJhbmQqKiAoYGJhbmRfYnBzYCkgYXJvdW5kIHRoZSBwcmljZSBhdCB0aGUgc3RhcnQgb2YgdGhlIGxlZGdlci4gQSB0cmFkZQp0aGF0IHdvdWxkIG1vdmUgdGhlIFlFUyBwcmljZSBtb3JlIHRoYW4gdGhlIGltcGFjdCBjYXAgcmV2ZXJ0cyB3aXRoCmBQcmljZUltcGFjdFRvb0hpZ2hgICgjMjEpOyBvbmUgdGhhdCB3b3VsZCBwdXNoIGl0IG1vcmUgdGhhbiB0aGUgYmFuZCBhd2F5CmZyb20gdGhlIGxlZGdlci1vcGVuIHByaWNlIHJldmVydHMgd2l0aCBgUHJpY2VCYW5kRXhjZWVkZWRgICgjMjIpLiBUaGUKYmFuZCByZXNldHMgZXZlcnkgbGVkZ2VyLCBzbyB0aGUgd29yc3QgY2FzZSBpcyB+NXMgb2YgYmxvY2tlZCB0cmFkaW5nLCBub3QKYSBwZXJtYW5lbnQgbG9jay4KClJlYWQgdGhlIGNvbmZpZyBhbmQgdGhlIGN1cnJlbnQgYmFuZCByZWZlcmVuY2UgYmVmb3JlIHF1b3Rpbmcgc28geW91ciBVSQpjYW4gc2l6ZSB0cmFkZXMgdGhhdCB3aWxsIGFjdHVhbGx5IGV4ZWN1dGU6CgotIGBicmVha2VyX2NvbmZpZyhtYXJrZXRfaWQpYCDihpIgYHsgbWF4X2ltcGFjdF9icHMsIGJhbmRfYnBzIH0gfCBudWxsYAogIChgbnVsbGAgPSBvbGQgbWFya2V0LCBubyBicmVha2VycykKLSBgYnJlYWtlcl9zdGF0ZShtYXJrZXRfaWQpYCDihpIgYHsgbGVkZ2VyX3NlcSwgcmVmX3ByaWNlX2JwcyB9IHwgbnVsbGAKLSBgd291bGRfdHJpcChtYXJrZXRfaWQsIG91dGNvbWUsIGNvbGxhdGVyYWxfaW4pYCDihpIgYm9vbDogd2hldGhlciBhIGJ1eSBvZgogIHRoYXQgc2l6ZSB3b3VsZCB0cmlwIGVpdGhlciBjaGVjayByaWdodCBub3cuIFVzZSBpdCB0byB3YXJuIHVzZXJzIGJlZm9yZQogIHRoZXkgc2lnbjsgYHF1b3RlX2J1eWAgaXMgbm90IGZpbHRlcmVkIGJ5IHRoZSBicmVha2Vycy4KClRoZXJlIGlzIGRlbGliZXJhdGVseSBubyBvbi1jaGFpbiAiYnJlYWtlciB0cmlwcGVkIiBldmVudCAoYSByZXZlcnRlZAppbnZvY2F0aW9uJ3MgZXZlbnRzIGFyZSByb2xsZWQgYmFjayB3aXRoIGl0KSDigJQgc3VyZmFjZSB0cmlwcyB0byB1c2VycyBmcm9tCnRoZSBlcnJvciBjb2RlcyBhYm92ZSBhbmQgdGhlIHZpZXdzIGhlcmUuCgojIyBTZWxsaW5nIGFuIGV4YWN0IHNoYXJlIGNvdW50CgpVc2UgYHNlbGxfc2hhcmVzYCB0byBzZWxsIGFuIGV4YWN0IG51bWJlciBvZiBvdXRjb21lIHNoYXJlcy4gVGhlCmNvbnRyYWN0IGRvZXMgdGhlIGN1cnZlIGludmVyc2lvbiBvbi1jaGFpbiAoaW5jbHVkaW5nIGFuIGV4YWN0IGludGVnZXIKc3F1YXJlIHJvb3QpIGFuZCByb3VuZHMgaW4gdGhlIHBvb2wncyBmYXZvdXIsIHNvIHlvdSBuZXZlciBoYXZlIHRvIGludmVydCBhbnl0aGluZyBvZmYtY2hhaW4gb3IgcGFkIHRoZSBzaGFyZSBib3VuZC4KCmBgYHRzCmNvbnN0IHF1b3RlID0gKGF3YWl0IGNvbnRyYWN0LnF1b3RlX3NlbGxfc2hhcmVzKHsKICBtYXJrZXRfaWQsCiAgb3V0Y29tZSwKICBzaGFyZXNfaW46IDM3NV8wMDBfMDAwbiwgLy8gMzcuNSBZRVMgc2hhcmVzCn0pKS5yZXN1bHQ7Cgpjb25zdCB0eCA9IGF3YWl0IGNvbnRyYWN0LnNlbGxfc2hhcmVzKHsKICB0cmFkZXI6IHVzZXJBZGRyZXNzLAogIG1hcmtldF9pZCwKICBvdXRjb21lLAogIHNoYXJlc19pbjogMzc1XzAwMF8wMDBuLAogIG1pbl9jb2xsYXRlcmFsX291dDogKHF1b3RlICogOV85NTBuKSAvIDEwXzAwMG4sIC8vIDUwYnBzIHNsaXBwYWdlCn0pOwpgYGAKCkJlaGF2aW91ciBhbmQgZXJyb3JzOgoKLSBSZXR1cm5zIHRoZSBleGFjdCBgY29sbGF0ZXJhbF9vdXRgIHRyYW5zZmVycmVkIHRvIHRoZSB0cmFkZXIuCi0gYFNsaXBwYWdlRXhjZWVkZWRgICgjMTIpIGlmIGBjb2xsYXRlcmFsX291dCA8IG1pbl9jb2xsYXRlcmFsX291dGAuCi0gYEluc3VmZmljaWVudFNoYXJlc2AgKCMxMykgaWYgdGhlIHRyYWRlciBob2xkcyBmZXdlciB0aGFuIGBzaGFyZXNfaW5gLgotIGBJbnN1ZmZpY2llbnRMaXF1aWRpdHlgICgjMTEpIGlmIHRoZSBwb29sIGNhbm5vdCBhYnNvcmIgdGhlIHNpemUuCi0gYEludmFsaWRJbnB1dGAgKCMyKSBmb3Igbm9uLXBvc2l0aXZlIGBzaGFyZXNfaW5gLCBvciB3aGVuIHRoZSByZXN1bHRpbmcKICBgY29sbGF0ZXJhbF9vdXRgIGZsb29ycyB0byB6ZXJvIChhIHRpbnkgc2VsbCB3aWxsIHJldmVydCByYXRoZXIgdGhhbgogIHNpbGVudGx5IGJ1cm4gc2hhcmVzKS4KLSBQdWJsaXNoZXMgdGhlIHNhbWUgYFRyYWRlYCBldmVudCBhcyBgc2VsbGAgd2l0aCBgaXNfYnV5OiBmYWxzZWAsIHNvCiAgaW5kZXhlcnMgbmVlZCBubyBzY2hlbWEgY2hhbmdlLgoKVG8gY2xvc2UgYSBwb3NpdGlvbiBlbnRpcmVseSwgcGFzcyBgc2hhcmVzX2luID09IGhlbGRgIChyZWFkIHZpYQpgZ2V0X3Bvc2l0aW9uKG1hcmtldF9pZCwgaG9sZGVyKWApLiBTZWxsaW5nIHRoZSB3aG9sZSBwb3NpdGlvbiByZW1vdmVzIHRoZQpgUG9zaXRpb25gIHN0b3JhZ2UgZW50cnkgd2hlbiB0aGUgb3RoZXIgc2lkZSBpcyBhbHNvIHplcm8sIHNvIGEgIlNlbGwgYWxsIgpidXR0b24gbGVhdmVzIG5vIGR1c3QgYmVoaW5kLgoKYHF1b3RlX3NlbGxfc2hhcmVzKG1hcmtldF9pZCwgb3V0Y29tZSwgc2hhcmVzX2luKWAgcmV0dXJucyB0aGUgY29sbGF0ZXJhbAphIHNlbGwgd291bGQgcGF5ICpyaWdodCBub3cqLiBMaWtlIGBxdW90ZV9zZWxsYCwgaXQgZG9lcyBub3QgY2hlY2sgdGhlCm1hcmtldCBpcyB0cmFkYWJsZSDigJQgaXQgaXMgYSBwdXJlIHByaWNpbmcgdmlldy4gQ2FsbCBpdCBpbW1lZGlhdGVseSBiZWZvcmUKYnVpbGRpbmcgdGhlIGBzZWxsX3NoYXJlc2AgdHJhbnNhY3Rpb24gYW5kIHBhc3MgYSBgbWluX2NvbGxhdGVyYWxfb3V0YCBhCmZldyBicHMgYmVsb3cgdGhlIHF1b3RlLgoKYHNlbGxgIC8gYHF1b3RlX3NlbGxgIHN0aWxsIHRha2UgYW4gZXhhY3QgYGNvbGxhdGVyYWxfb3V0YCBhbmQgcmV0dXJuCmhvdyBtYW55IHNoYXJlcyBpdCBjb3N0cywgZm9yIGJhY2t3YXJkIGNvbXBhdGliaWxpdHkuIE5ldyBjb2RlIHNob3VsZCBwcmVmZXIKYHNlbGxfc2hhcmVzYC4KCiMjIE1vdmluZyBzaGFyZXMgYmV0d2VlbiB3YWxsZXRzCgpgdHJhbnNmZXJfcG9zaXRpb24oZnJvbSwgdG8sIG1hcmtldF9pZCwgb3V0Y29tZSwgYW1vdW50KWAgc2VuZHMgb3V0Y29tZQpzaGFyZXMgdG8gYW5vdGhlciB3YWxsZXQgKHRoZSBzZW5kZXIgc2lnbnM7IGB0cmFuc2Zlcl9scChtYXJrZXRfaWQsCm5ld19jcmVhdG9yKWAgZG9lcyB0aGUgc2FtZSBmb3IgdGhlIGNyZWF0b3IvTFAgcm9sZSkuIEl0IGlzIGFsbG93ZWQgd2hpbGUKdGhlIG1hcmtldCBpcyBvcGVuIGFuZCBhZnRlciByZXNvbHV0aW9uLCB1cCB0byB0aGUgbW9tZW50IHNoYXJlcyBhcmUKcmVkZWVtZWQsIGFuZCBlbWl0cyBgUG9zaXRpb25UcmFuc2ZlcnJlZGAuIElmIHlvdXIgVUkgdHJhY2tzIGJhbGFuY2VzCml0c2VsZiwgaGFuZGxlIHRoYXQgZXZlbnQgKGFuZCBgTHBUcmFuc2ZlcnJlZGApOyB1bnRpbCB5b3VyIGluZGV4ZXIgZG9lcywKcmVhZCBiYWxhbmNlcyBmcm9tIGBnZXRfcG9zaXRpb24obWFya2V0X2lkLCBob2xkZXIpYCByYXRoZXIgdGhhbiBmcm9tCmV2ZW50LWRlcml2ZWQgc3RhdGUuCgojIyBDYXRlZ29yeSBlbnVtCgpgQ2F0ZWdvcnlgIGlzIGEgcGxhaW4gZW51bSAoYENyeXB0byB8IE1hY3JvIHwgR2VvcG9saXRpY3MgfCBTcG9ydHMgfCBDdWx0dXJlCnwgT3RoZXJgKSBnZW5lcmF0ZWQgZnJvbSB0aGUgY29udHJhY3Qgc3BlYyDigJQgYnVpbGQgYW55IGNhdGVnb3J5IHBpY2tlciBvZmYKdGhlIGJpbmRpbmdzJyBgQ2F0ZWdvcnlgIHR5cGUgZGlyZWN0bHkgcmF0aGVyIHRoYW4gaGFuZC1tYWludGFpbmluZyBhCnNlcGFyYXRlIGxpc3QsIHNvIHRoZSBVSSBjYW4gbmV2ZXIgZHJpZnQgZnJvbSB3aGF0IHRoZSBjb250cmFjdCBhY2NlcHRzLgoKIyMgUmVhZGluZyB0cmFjZSBkYXRhCgpgcmVhc29uaW5nLXJlZ2lzdHJ5YCdzIGBnZXRfdHJhY2UodHJhY2VfaWQpYCByZXR1cm5zCmB7IG1hcmtldF9pZCwgYWdlbnQsIGFjdGlvbiwgdHJhY2VfaGFzaCwgaXBmc19jaWQsIHB1Ymxpc2hlZF9hdCB9YC4gVG8gc2hvdwphIHZlcmlmaWVkIHJlYXNvbmluZyB0cmFjZSBpbiB0aGUgVUk6CgoxLiBGZXRjaCB0aGUgdHJhY2UgY29udGVudCBmcm9tIGBpcGZzX2NpZGAgKHZpYSBhIGdhdGV3YXksIG9yIHRocm91Z2ggdGhlCiAgIHg0MDIgc2VydmljZSBpbiBgeDQwMi9gIGlmIGl0J3MgZ2F0ZWQgYmVoaW5kIHBheW1lbnQpLgoyLiBIYXNoIHRoZSBleGFjdCBieXRlcyByZWNlaXZlZCAoc2hhMjU2KSBhbmQgY29tcGFyZSB0byBgdHJhY2VfaGFzaGAuCjMuIE9ubHkgcmVuZGVyIHRoZSBjb250ZW50IGlmIHRoZSBoYXNoZXMgbWF0Y2gg4oCUIG5ldmVyIHRydXN0IGBpcGZzX2NpZGAgY29udGVudCB3aXRob3V0IHRoaXMgY2hlY2ssIHNpbmNlIElQRlMgZ2F0ZXdheXMgYXJlIG5vdCBhdXRoZW50aWNhdGVkLgoKYHg0MDIvdHJhY2UtdmVyaWZpY2F0aW9uLnRzYCBoYXMgdGhlIHJlZmVyZW5jZSBoYXNoLWNoZWNrIGltcGxlbWVudGF0aW9uIHRoZQpmcm9udGVuZCBjYW4gcG9ydC4KCiMjIE9mZi1jaGFpbiBtYXRoIG1pcnJvcnMKCmBgYHRzCmltcG9ydCB7IGNhbGNTZWxsU2hhcmVzIH0gZnJvbSAiLi4vYWdlbnRzL2NvcmUvZnBtbSI7CmBgYAoKVGhlIGV4YWN0IHNoYXJlLXRvLWNvbGxhdGVyYWwgaW52ZXJzZSBpcyBpbXBsZW1lbnRlZCBpbiB0aHJlZSBwbGFjZXMKdGhhdCBtdXN0IGFncmVlIGJpdC1mb3ItYml0OgoKLSAiY29udHJhY3RzL21hcmtldC1jb3JlL3NyYy9tYXRoLnJzYCDigJQgYGlzcXJ0YCBhbmQgYGNhbGNfc2VsbF9zaGFyZXNgCiAgKHRoZSBzb3VyY2Ugb2YgdHJ1dGgpCi0gIm1vZGVsL2ZwbW1fbW9kZWwucHlgIOKAlCBgY2FsY19zZWxsX3NoYXJlc2AKLSAiYWdlbnRzL2NvcmUvZnBtbS50cyIg4oCUIGBpc3FydGAgYW5kIGBjYWxjU2VsbFNoYXJlc2AKClRoZSBvbGRlciBgY29sbGF0ZXJhbE91dEZvclNoYXJlc2AgLyBgY29sbGF0ZXJhbF9vdXRfZm9yX3NoYXJlc2AgaW52ZXJzZXMKc3RpbGwgZXhpc3QgYnV0IGFyZSBkZXByZWNhdGVkOiB0aGV5IGRvIG5vdCBhcHBseSB0aGUgcG9vbC1mYXZvdXJpbmcKY29ycmVjdGlvbiBsb29wLCBzbyB0aGV5IGNhbiBkaXNhZ3JlZSB3aXRoIHRoZSBjb250cmFjdCBieSBhIGZldyB1bml0cy4KUHJlZmVyIGBzZWxsX3NoYXJlc2AgLyBgcXVvdGVfc2VsbF9zaGFyZXNgIG9uLWNoYWluLCBvciBgY2FsY1NlbGxTaGFyZXNgIC8KYGNhbGNfc2VsbF9zaGFyZXNgIG9mZi1jaGFpbi4K
+# Frontend integration
+
+The frontend itself lives in a separate repo (out of scope here). This is
+what it needs to know to talk to these contracts.
+
+## Wallet
+
+Use [Freighter](https://www.freighter.app/) (or any [SEP-43](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0043.md)-compatible
+wallet) to get the user's public key and sign transactions. The generated
+bindings' `AssembledTransaction` already does the simulate → sign → submit
+dance; you only need to plug in a `signTransaction` callback:
+
+```ts
+import { Client as MarketCoreClient } from "@oracledesk/market-core-bindings";
+import { isConnected, getAddress, signTransaction } from "@stellar/freighter-api";
+
+const contract = new MarketCoreClient({
+  contractId: "<MARKET_CORE_CONTRACT_ID>", // from deployments/testnet.json
+  networkPassphrase: "Test SDF Network ; September 2015",
+  rpcUrl: "https://soroban-testnet.stellar.org",
+});
+```
+
+## Generating / updating the bindings
+
+```bash
+./scripts/gen-bindings.sh   # writes packages/bindings/<contract-name>/
+```
+
+Regenerate and commit the result after any contract interface change — CI
+checks the committed bindings are not stale (`.github/workflows/ci.yml`).
+Each package's own `README.md` (written by the `stellar` CLI) has the
+generic usage notes; this doc covers the OracleDesk-specific parts.
+
+## Calling `buy` / `sell`
+
+`Outcome` and `Category` are generated as tagged unions matching the
+contract's Rust enums:
+
+```ts
+type Outcome = { tag: "Yes"; values: void } | { tag: "No"; values: void };
+```
+
+The resolver's `attest` / `attest_with_evidence` take its own
+`AttestedOutcome` instead, which adds `{ tag: "Invalid"; values: void }`
+(finalizing an `Invalid` proposal voids the market). `finalize_signers`
+returns `AttestedOutcome`. Indexers should decode `ResolutionProposedV2` /
+`ResolutionFinalizedV2` / `CommitteeVoided`; the `Outcome`-typed
+`ResolutionProposed` / `ResolutionFinalized` are no longer emitted.
+
+```ts
+const tx = await contract.buy({
+  trader: userAddress,
+  market_id: 0n,
+  outcome: { tag: "Yes", values: undefined },
+  collateral_in: 10_000_000n, // 1 USDC, 7 decimals
+  min_shares_out: 9_500_000n, // quote minus your slippage margin — see below
+});
+const { result } = await tx.signAndSend({ signTransaction });
+```
+
+For anything user-facing, prefer `buy_v2` / `sell_v2` (below): they add a
+deadline and a limit price on top of the share bound, and they are the only
+entrypoints that protect against a transaction being included long after it
+was signed.
+
+## Slippage on `buy`
+
+`quote_buy(market_id, outcome, collateral_in)` returns the exact shares a
+buy would receive *right now*. Call it immediately before building the
+`buy` transaction, then pass a `min_shares_out` a few bps below that quote
+(prices move between simulation and submission).
+
+Never pass `min_shares_out: 0` (the old example did): it accepts any
+execution price at all, which in a thin pool is how a sandwich takes your
+money.
+
+## Deadlines and limit prices
+
+`buy_v2` / `sell_v2` add two contract-enforced bounds to every trade:
+
+- `deadline: u64` — unix seconds, compared against the **ledger
+  timestamp** (network time, not the user's clock). Past it the trade
+  reverts with `DeadlineExpired` (#19).
+- `limit_price_bps: u32` — the **average execution price** bound,
+  fee included: for a buy, `collateral_in / shares_out <= limit`; for a
+  sell, `collateral_out / shares_in >= limit`. Worse than the limit
+  reverts with `LimitPriceExceeded` (#20). The limit is on the price of
+  *the outcome being traded* — a NO buy's limit is checked against NO
+  prices, i.e. the complement of the YES price. `0` means "no limit" for
+  buys; for sells it is trivially satisfied and buys you nothing. Values
+  above `10_000` are rejected (`InvalidAmount`).
+
+```ts
+const quote = (await contract.quote_buy({ market_id, outcome, collateral_in })).result;
+const tx = await contract.buy_v2({
+  trader: userAddress,
+  market_id,
+  outcome,
+  collateral_in,
+  min_shares_out: (quote * 9_950n) / 10_000n, // 50bps slippage
+  limit_price_bps: 6500,    // never pay more than 65¢ per share
+  deadline: BigInt(Math.floor(Date.now() / 1000) + 60),
+});
+```
+
+`buy` / `sell` remain for backward compatibility but carry no deadline or
+limit; the share-count bound alone does not stop a stale transaction.
+
+## Circuit breakers
+
+Markets can carry per-market breakers (snapshotted at creation): a maximum
+price impact for a **single trade** (`max_impact_bps`) and a **per-ledger
+band** (`band_bps`) around the price at the start of the ledger. A trade
+that would move the YES price more than the impact cap reverts with
+`PriceImpactTooHigh` (#21); one that would push it more than the band away
+from the ledger-open price reverts with `PriceBandExceeded` (#22). The
+band resets every ledger, so the worst case is ~5s of blocked trading, not
+a permanent lock.
+
+Read the config and the current band reference before quoting so your UI
+can size trades that will actually execute:
+
+- `breaker_config(market_id)` → `{ max_impact_bps, band_bps } | null`
+  (`null` = old market, no breakers)
+- `breaker_state(market_id)` → `{ ledger_seq, ref_price_bps } | null`
+- `would_trip(market_id, outcome, collateral_in)` → bool: whether a buy of
+  that size would trip either check right now. Use it to warn users before
+  they sign; `quote_buy` is not filtered by the breakers.
+
+There is deliberately no on-chain "breaker tripped" event (a reverted
+invocation's events are rolled back with it) — surface trips to users from
+the error codes above and the views here.
+
+## Selling an exact share count
+
+Use `sell_shares` to sell an exact number of outcome shares. The
+contract does the curve inversion on-chain (including an exact integer
+square root) and rounds in the pool's favour, so you never have to invert anything off-chain or pad the share bound.
+
+```ts
+const quote = (await contract.quote_sell_shares({
+  market_id,
+  outcome,
+  shares_in: 375_000_000n, // 37.5 YES shares
+})).result;
+
+const tx = await contract.sell_shares({
+  trader: userAddress,
+  market_id,
+  outcome,
+  shares_in: 375_000_000n,
+  min_collateral_out: (quote * 9_950n) / 10_000n, // 50bps slippage
+});
+```
+
+Behaviour and errors:
+
+- Returns the exact `collateral_out` transferred to the trader.
+- `SlippageExceeded` (#12) if `collateral_out < min_collateral_out`.
+- `InsufficientShares` (#13) if the trader holds fewer than `shares_in`.
+- `InsufficientLiquidity` (#11) if the pool cannot absorb the size.
+- `InvalidInput` (#2) for non-positive `shares_in`, or when the resulting
+  `collateral_out` floors to zero (a tiny sell will revert rather than
+  silently burn shares).
+- Publishes the same `Trade` event as `sell` with `is_buy: false`, so
+  indexers need no schema change.
+
+To close a position entirely, pass `shares_in == held` (read via
+`get_position(market_id, holder)`). Selling the whole position removes the
+`Position` storage entry when the other side is also zero, so a "Sell all"
+button leaves no dust behind.
+
+`quote_sell_shares(market_id, outcome, shares_in)` returns the collateral
+a sell would pay *right now*. Like `quote_sell`, it does not check the
+market is tradable — it is a pure pricing view. Call it immediately before
+building the `sell_shares` transaction and pass a `min_collateral_out` a
+few bps below the quote.
+
+`sell` / `quote_sell` still take an exact `collateral_out` and return
+how many shares it costs, for backward compatibility. New code should prefer
+`sell_shares`.
+
+## Moving shares between wallets
+
+`transfer_position(from, to, market_id, outcome, amount)` sends outcome
+shares to another wallet (the sender signs; `transfer_lp(market_id,
+new_creator)` does the same for the creator/LP role). It is allowed while
+the market is open and after resolution, up to the moment shares are
+redeemed, and emits `PositionTransferred`. If your UI tracks balances
+itself, handle that event (and `LpTransferred`); until your indexer does,
+read balances from `get_position(market_id, holder)` rather than from
+event-derived state.
+
+## Category enum
+
+`Category` is a plain enum (`Crypto | Macro | Geopolitics | Sports | Culture
+| Other`) generated from the contract spec — build any category picker off
+the bindings' `Category` type directly rather than hand-maintaining a
+separate list, so the UI can never drift from what the contract accepts.
+
+## Reading trace data
+
+`reasoning-registry`'s `get_trace(trace_id)` returns
+`{ market_id, agent, action, trace_hash, ipfs_cid, published_at }`. To show
+a verified reasoning trace in the UI:
+
+1. Fetch the trace content from `ipfs_cid` (via a gateway, or through the
+   x402 service in `x402/` if it's gated behind payment).
+2. Hash the exact bytes received (sha256) and compare to `trace_hash`.
+3. Only render the content if the hashes match — never trust `ipfs_cid`
+   content without this check, since IPFS gateways are not authenticated.
+
+`x402/trace-verification.ts` has the reference hash-check implementation the
+frontend can port.
+
+## Off-chain math mirrors
+
+```ts
+import { calcSellShares } from "../agents/core/fpmm";
+```
+
+The exact share-to-collateral inverse is implemented in three places
+that must agree bit-for-bit:
+
+- "contracts/market-core/src/math.rs" — `isqrt` and `calc_sell_shares`
+  (the source of truth)
+- "model/fpmm_model.py" — `calc_sell_shares`
+- "agents/core/fpmm.ts" — `isqrt` and `calcSellShares`
+
+The older `collateralOutForShares` / `collateral_out_for_shares` inverses
+still exist but are deprecated: they do not apply the pool-favouring
+correction loop, so they can disagree with the contract by a few units.
+Prefer `sell_shares` / `quote_sell_shares` on-chain, or `calcSellShares` /
+`calc_sell_shares` off-chain.
