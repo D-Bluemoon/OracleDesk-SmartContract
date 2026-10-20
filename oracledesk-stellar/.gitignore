@@ -39,6 +39,9 @@ deployments/traces-*/
 # Agent dry-run/local trace output (agents/core/trace.ts's LocalTraceStore)
 .traces/
 
+# Simulator output (agents/sim/cli.ts)
+agents/sim/results/
+
 # IDE / OS
 .vscode/
 .idea/

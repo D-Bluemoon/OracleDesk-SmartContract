@@ -298,7 +298,9 @@ markers in the files themselves:
 - **Agent-vs-agent liquidity** is unbounded: nothing stops multiple
   independent agent deployments from trading against the same
   `market-core` markets. The treasury's caps bound one deployment's own
-  risk, not systemic market behavior.
+  risk, not systemic market behavior. `agents/sim` now quantifies this
+  (see `docs/simulation.md`, experiment B): with k identical deployments,
+  capital at risk grows linearly in k while total profit does not.
 - **Expiry cannot help an oracle the creator controls.** `expire_market`
   voids unresolvable markets 30 days after close, but a creator who commits
   to a feed they control can still decide the outcome of a *resolvable*
