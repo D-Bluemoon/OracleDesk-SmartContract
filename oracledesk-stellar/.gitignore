@@ -39,6 +39,9 @@ deployments/traces-*/
 # Agent dry-run/local trace output (agents/core/trace.ts's LocalTraceStore)
 .traces/
 
+# Agent runtime state and single-instance lock (agents/runtime, docs/agent-runtime.md)
+.agent-state/
+
 # IDE / OS
 .vscode/
 .idea/

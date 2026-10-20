@@ -5,9 +5,10 @@
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit",
-    "test": "tsx --test core/*.test.ts stellar/*.test.ts bin/*.test.ts",
+    "test": "tsx --test core/*.test.ts stellar/*.test.ts bin/*.test.ts runtime/*.test.ts",
     "market-maker": "tsx bin/market-maker.ts",
-    "trader": "tsx bin/trader.ts"
+    "trader": "tsx bin/trader.ts",
+    "agentd": "tsx bin/agentd.ts"
   },
   "dependencies": {
     "@oracledesk/bindings-market-core": "file:../packages/bindings/market-core",
