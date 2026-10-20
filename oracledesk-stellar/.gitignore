@@ -41,6 +41,8 @@ deployments/traces-*/
 
 # Agent runtime state and single-instance lock (agents/runtime, docs/agent-runtime.md)
 .agent-state/
+# Simulator output (agents/sim/cli.ts)
+agents/sim/results/
 
 # IDE / OS
 .vscode/

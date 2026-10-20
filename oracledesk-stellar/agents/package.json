@@ -9,6 +9,10 @@
     "market-maker": "tsx bin/market-maker.ts",
     "trader": "tsx bin/trader.ts",
     "agentd": "tsx bin/agentd.ts"
+    "test": "tsx --test core/*.test.ts stellar/*.test.ts bin/*.test.ts sim/*.test.ts",
+    "market-maker": "tsx bin/market-maker.ts",
+    "trader": "tsx bin/trader.ts",
+    "sim": "tsx sim/cli.ts"
   },
   "dependencies": {
     "@oracledesk/bindings-market-core": "file:../packages/bindings/market-core",
