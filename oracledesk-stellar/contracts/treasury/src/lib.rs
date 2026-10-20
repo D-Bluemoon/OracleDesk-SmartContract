@@ -4816,6 +4816,57 @@ mod test {
         assert_eq!(f.treasury.daily_headroom(), 60 * USDC);
     }
 
+    /// Regression for I4 ("no `max_daily` in any 24h"), the shape of the
+    /// shortest counterexample the exhaustive explorer
+    /// (`contracts/integration-tests`, `treasury_caps_exhaustive`) reports when
+    /// the window is mutated to 24 buckets instead of 25: spend near the end of
+    /// an hour, then again 86_399s later. 24h earlier than the second trade is
+    /// still inside the window because the first trade's hour is only
+    /// partially covered. The original fixed daily window (reset to `now` at
+    /// the first call after 24h) allowed up to 2x `max_daily` here; the
+    /// sliding window allows exactly `max_daily`.
+    #[test]
+    fn explorer_i4_sequence_stays_within_max_daily() {
+        let u = 100 * USDC;
+        let f = fixture_with_caps(2 * u, 3 * u, 4 * u);
+        // A second market, so the daily cap binds before the per-market cap.
+        let creator = Address::generate(&f.env);
+        StellarAssetClient::new(&f.env, &f.token).mint(&creator, &(1_000 * USDC));
+        let second = f.market_core.create_market(
+            &creator,
+            &BytesN::from_array(&f.env, &[12u8; 32]),
+            &BytesN::from_array(&f.env, &[112u8; 32]),
+            &String::from_str(&f.env, "ipfs://second-market"),
+            &Category::Crypto,
+            &MARKET_CLOSE,
+            &(100 * USDC),
+            &5000u32,
+        );
+        let first = 24 * BUCKET_SECONDS + 3_599;
+        f.env.ledger().set_timestamp(first);
+        f.treasury
+            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &u, &0);
+        f.treasury
+            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(2 * u), &0);
+
+        // 86_399s later the first hour is still counted: 3u + 2u > 4u.
+        f.env.ledger().set_timestamp(first + 86_399);
+        assert_eq!(
+            f.treasury
+                .try_agent_buy(&f.agent, &second, &Outcome::Yes, &(2 * u), &0),
+            Err(Ok(Error::DailyCapExceeded))
+        );
+        // The failed call spent nothing; a buy that fits the remaining 1u does.
+        assert_eq!(f.treasury.daily_headroom(), u);
+        f.treasury
+            .agent_buy(&f.agent, &second, &Outcome::Yes, &u, &0);
+
+        // Once the first trade's hour has left the 25-bucket window (hour 49
+        // covers hours 25..=49) its 3u are free again.
+        f.env.ledger().set_timestamp(49 * BUCKET_SECONDS);
+        assert_eq!(f.treasury.daily_headroom(), 3 * u);
+    }
+
     #[test]
     fn same_hour_trades_accumulate() {
         let f = fixture();

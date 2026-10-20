@@ -6,6 +6,7 @@ members = [
     "contracts/treasury",
     "contracts/timelock",
     "contracts/router",
+    "contracts/integration-tests",
 ]
 resolver = "2"
 
@@ -22,3 +23,9 @@ lto = true
 [profile.release-with-logs]
 inherits = "release"
 debug-assertions = true
+
+# The Soroban host dominates test time; optimise dependencies (not the
+# workspace's own crates) so contract-heavy tests such as
+# contracts/integration-tests finish in seconds instead of minutes.
+[profile.dev.package."*"]
+opt-level = 3
