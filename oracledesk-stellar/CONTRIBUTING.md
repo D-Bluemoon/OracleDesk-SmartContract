@@ -15,7 +15,7 @@ make test    # cargo test + model/fpmm_model.py + x402 tests
 
 You'll need Rust (stable, with the `wasm32v1-none` target —
 `rust-toolchain.toml` handles this via `rustup`), the
-[Stellar CLI](https://developers.stellar.org/docs/tools/cli) v27+, Node 20+,
+[Stellar CLI](https://developers.stellar.org/docs/tools/cli) v27+, Node 22+,
 Python 3.10+, and `jq`.
 
 ## Branch and commit conventions
@@ -89,3 +89,46 @@ have one — not committing to a number without your input. -->
 
 Do not open a public issue for a security vulnerability — see
 [SECURITY.md](SECURITY.md).
+
+## Changing a contract interface
+
+Bindings now have meaningful, independent semantic versions and a canonical
+`interface.json` decoded from each built WASM's `contractspecv0` section.
+This applies to all six contracts, including the router and timelock.
+
+1. Change the contract and its tests, then run `make build`.
+2. Run `./scripts/gen-bindings.sh` (versions and changelogs survive regeneration).
+3. Inspect the semantic diff:
+   `git show upstream/develop:oracledesk-stellar/packages/bindings/resolver/interface.json > /tmp/resolver-old.json`,
+   then `CARGO_TARGET_DIR=target cargo run --manifest-path scripts/interface-manifest/Cargo.toml -- diff --old /tmp/resolver-old.json --new packages/bindings/resolver/interface.json`.
+   Add `--format json` for tools.
+4. Bump each affected package's `package.json`: breaking changes need a minor
+   bump before 1.0.0, or a major bump afterward. Additions need at least a patch.
+   Docs-only changes need no bump. Constructor changes are deploy-affecting
+   additions rather than breaks to existing instances.
+5. Add a nonempty `## VERSION` section to that package's `CHANGELOG.md`. Copy
+   **every breaking item's exact identifier** from the diff into its body.
+   Refresh the package lock (`npm install --package-lock-only`).
+6. Run `make interface-check`, `make lint`, `make test`, and
+   `CARGO_TARGET_DIR=target cargo test --locked --manifest-path scripts/interface-manifest/Cargo.toml`.
+   Override `INTERFACE_BASE_REF` when comparing to a different target.
+
+A named struct's field names determine its symbol-keyed XDR map; declaration
+order does not. Tuple positions and function argument order do matter. Union
+additions warn about exhaustive consumers. Renaming numeric error cases warns
+about generated TS messages. Types reachable from resolver `ResolutionSpec`
+**and** `ResolutionSpecV2` are hash-critical: a semantic change is breaking and
+carries the ADR 0001 flag. Review commitment migration before deploying it.
+
+The tool attributes imported types using `scripts/interface-manifest/imports.toml`
+(the WASM spec drops their library origin). Update that map when adding a public
+`contractimport!` type. Every package exporting a changed type needs its own
+version bump, including consumers; each package takes the maximum required bump,
+never one bump per inherited field/type. This avoids compounding shared changes
+while keeping downstream versions truthful. Hash roots live in `roots.toml`.
+
+An absent base manifest is an initial release and requires a nonzero version plus
+an initial changelog, not an artificial breaking-change report. CI compares
+against the PR base branch and also rejects stale generated manifests. GitHub
+runs the workflow at the repository root; the nested workflow is retained for
+standalone use of `oracledesk-stellar/`.

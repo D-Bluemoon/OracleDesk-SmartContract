@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [develop, main]
   pull_request:
 
 env:
@@ -14,6 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32v1-none
@@ -27,10 +29,14 @@ jobs:
         run: cargo install --locked stellar-cli --version ${{ vars.STELLAR_CLI_VERSION || '27.1.0' }}
 
       - name: cargo fmt --check
-        run: cargo fmt --check
+        run: |
+          cargo fmt --check
+          cargo fmt --manifest-path scripts/interface-manifest/Cargo.toml --check
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          CARGO_TARGET_DIR=target cargo clippy --locked --manifest-path scripts/interface-manifest/Cargo.toml --all-targets -- -D warnings
 
       - name: cargo test
         run: cargo test --workspace
@@ -68,6 +74,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -79,18 +87,34 @@ jobs:
     needs: rust
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
       - uses: actions/download-artifact@v4
         with:
           name: contract-wasm
           path: target/wasm32v1-none/release
 
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Stellar CLI
+        run: |
+          curl -fsSL https://github.com/stellar/stellar-cli/releases/download/v27.1.0/stellar-cli-27.1.0-x86_64-unknown-linux-gnu.tar.gz -o /tmp/stellar.tar.gz
+          mkdir -p "$RUNNER_TEMP/stellar-bin"
+          tar -xzf /tmp/stellar.tar.gz -C "$RUNNER_TEMP/stellar-bin" stellar
+          echo "$RUNNER_TEMP/stellar-bin" >> "$GITHUB_PATH"
+
       - name: Generate bindings from the built wasm
         run: |
           chmod +x scripts/gen-bindings.sh
           ./scripts/gen-bindings.sh
+
+      - name: Check interface compatibility and versions
+        env:
+          INTERFACE_BASE_REF: origin/${{ github.base_ref || 'develop' }}
+        run: make interface-check
 
       - name: Fail if committed bindings are stale
         run: git diff --exit-code -- packages/bindings
@@ -100,6 +124,9 @@ jobs:
           for pkg in market-core resolver treasury reasoning-registry timelock router; do
             (cd "packages/bindings/$pkg" && npm install && npm run build)
           done
+
+      - name: Interface tool tests
+        run: CARGO_TARGET_DIR=target cargo test --locked --manifest-path scripts/interface-manifest/Cargo.toml
 
       - name: x402 — install, typecheck, test
         run: |
