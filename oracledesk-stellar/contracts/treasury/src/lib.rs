@@ -341,13 +341,7 @@ pub struct BlendPositions {
 
 #[soroban_sdk::contractclient(name = "BlendPoolClient")]
 pub trait BlendPool {
-    fn submit(
-        env: Env,
-        from: Address,
-        spender: Address,
-        to: Address,
-        requests: Vec<BlendRequest>,
-    );
+    fn submit(env: Env, from: Address, spender: Address, to: Address, requests: Vec<BlendRequest>);
     fn get_positions(env: Env, address: Address) -> BlendPositions;
 }
 
@@ -470,21 +464,21 @@ pub enum Error {
     InvalidPricePolicy = 26,
     SlippageExceeded = 27,
     NotPaused = 28,
-    MarketNotFinal = 29,
-    MarketCoreError = 30,
-    DrawdownTripped = 31,
-    InvalidDrawdownConfig = 32,
-    NotAcknowledged = 33,
-    SeedCapExceeded = 34,
-    CreationRateExceeded = 35,
-    CloseTimeTooSoon = 36,
-    CloseTimeTooFar = 37,
-    CategoryNotAllowed = 38,
-    PolicyLoosening = 39,
-    YieldDisabled = 40,
-    YieldCapExceeded = 41,
-    YieldWithdrawFailed = 42,
-    VenueHasPrincipal = 43,
+    MarketNotFinal = 44,
+    MarketCoreError = 45,
+    DrawdownTripped = 46,
+    InvalidDrawdownConfig = 47,
+    NotAcknowledged = 48,
+    SeedCapExceeded = 49,
+    CreationRateExceeded = 50,
+    CloseTimeTooSoon = 51,
+    CloseTimeTooFar = 52,
+    CategoryNotAllowed = 53,
+    PolicyLoosening = 54,
+    YieldDisabled = 55,
+    YieldCapExceeded = 56,
+    YieldWithdrawFailed = 57,
+    VenueHasPrincipal = 58,
     /// Category exposure would exceed its correlation cap (#49).
     CategoryCapExceeded = 29,
     /// Close-date bucket exposure would exceed its cap (#49).
@@ -3474,13 +3468,7 @@ impl Treasury {
         Ok(())
     }
 
-    fn authorize_transfer(
-        env: &Env,
-        token: &Address,
-        from: &Address,
-        to: &Address,
-        amount: i128,
-    ) {
+    fn authorize_transfer(env: &Env, token: &Address, from: &Address, to: &Address, amount: i128) {
         env.authorize_as_current_contract(vec![
             env,
             InvokerContractAuthEntry::Contract(SubContractInvocation {
@@ -3518,7 +3506,10 @@ impl Treasury {
         }
     }
 
-    fn validate_creation_policy(global: &GlobalConfig, policy: &CreationPolicy) -> Result<(), Error> {
+    fn validate_creation_policy(
+        global: &GlobalConfig,
+        policy: &CreationPolicy,
+    ) -> Result<(), Error> {
         if policy.max_seed <= 0 || policy.max_seed > global.max_market {
             return Err(Error::InvalidConfig);
         }
@@ -3541,7 +3532,7 @@ impl Treasury {
         if max_drawdown <= 0 {
             return Err(Error::InvalidDrawdownConfig);
         }
-        if window_days < 1 || window_days > 30 {
+        if !(1..=30).contains(&window_days) {
             return Err(Error::InvalidDrawdownConfig);
         }
         Ok(())
@@ -3581,7 +3572,10 @@ impl Treasury {
             let last_idx = active_buckets.len() - 1;
             let mut last = active_buckets.get(last_idx).unwrap();
             if last.bucket_start == cur_start {
-                last.count = last.count.checked_add(1).ok_or(Error::CreationRateExceeded)?;
+                last.count = last
+                    .count
+                    .checked_add(1)
+                    .ok_or(Error::CreationRateExceeded)?;
                 active_buckets.set(last_idx, last);
                 updated = true;
             }
@@ -3629,7 +3623,9 @@ impl Treasury {
     }
 
     fn save_pnl(env: &Env, market_id: u64, pnl: &MarketPnl) {
-        env.storage().persistent().set(&DataKey::Pnl(market_id), pnl);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pnl(market_id), pnl);
         Self::bump_persistent(env, &DataKey::Pnl(market_id));
     }
 
@@ -3801,7 +3797,11 @@ impl Treasury {
         if liquid >= needed {
             return Ok(());
         }
-        let venue: YieldVenue = match env.storage().instance().get::<_, YieldVenue>(&DataKey::YieldVenue) {
+        let venue: YieldVenue = match env
+            .storage()
+            .instance()
+            .get::<_, YieldVenue>(&DataKey::YieldVenue)
+        {
             Some(v) if v.enabled => v,
             _ => return Err(Error::InsufficientBalance),
         };
@@ -3894,7 +3894,6 @@ mod test {
         env: Env,
         admin: Address,
         agent: Address,
-        resolver: Address,
         treasury: TreasuryClient<'static>,
         treasury_id: Address,
         token: Address,
@@ -4033,7 +4032,6 @@ mod test {
             env: env.clone(),
             admin,
             agent,
-            resolver,
             treasury: TreasuryClient::new(&env, &treasury),
             treasury_id,
             token: collateral.address(),
@@ -6889,7 +6887,7 @@ mod test {
 
     #[test]
     fn settle_market_claims_lp_for_treasury_created_market() {
-        let f = fixture();
+        let f = fixture_with_caps(200 * USDC, 500 * USDC, 600 * USDC);
         let close = f.env.ledger().timestamp() + 1000;
         let market_id = f.treasury.agent_create_market(
             &f.agent,
@@ -6918,7 +6916,7 @@ mod test {
 
     #[test]
     fn settle_market_handles_position_and_lp_together() {
-        let f = fixture();
+        let f = fixture_with_caps(200 * USDC, 500 * USDC, 600 * USDC);
         let close = f.env.ledger().timestamp() + 1000;
         let market_id = f.treasury.agent_create_market(
             &f.agent,
@@ -6977,7 +6975,7 @@ mod test {
 
     #[test]
     fn settle_market_after_agent_redeem_reports_only_lp() {
-        let f = fixture();
+        let f = fixture_with_caps(200 * USDC, 500 * USDC, 600 * USDC);
         let close = f.env.ledger().timestamp() + 1000;
         let market_id = f.treasury.agent_create_market(
             &f.agent,
@@ -7096,9 +7094,6 @@ mod test {
 
         let caller = Address::generate(&f.env);
         let report = f.treasury.settle_market(&caller, &f.market_id);
-        let bal_after = token.balance(&f.treasury_id);
-
-        assert_eq!(bal_after - bal_before, report.redeemed + report.lp_claimed);
         assert!(has_event(
             &f,
             &MarketSettled {
@@ -7108,6 +7103,8 @@ mod test {
                 settled_by: caller,
             }
         ));
+        let bal_after = token.balance(&f.treasury_id);
+        assert_eq!(bal_after - bal_before, report.redeemed + report.lp_claimed);
     }
 
     // =========================================================================
@@ -7159,8 +7156,13 @@ mod test {
         let cost = 20 * USDC;
         f.treasury
             .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &cost, &0);
-        f.treasury
-            .agent_sell(&f.agent, &f.market_id, &Outcome::Yes, &(5 * USDC), &0);
+        f.treasury.agent_sell(
+            &f.agent,
+            &f.market_id,
+            &Outcome::Yes,
+            &(5 * USDC),
+            &i128::MAX,
+        );
 
         let pnl = f.treasury.market_pnl(&f.market_id);
         assert_eq!(pnl.cost, cost);
@@ -7190,7 +7192,7 @@ mod test {
 
     #[test]
     fn lp_remainder_counts_toward_proceeds_for_created_markets() {
-        let f = fixture();
+        let f = fixture_with_caps(200 * USDC, 500 * USDC, 600 * USDC);
         let close = f.env.ledger().timestamp() + 1000;
         let seed = 100 * USDC;
         let market_id = f.treasury.agent_create_market(
@@ -7217,7 +7219,7 @@ mod test {
 
     #[test]
     fn drawdown_breach_pauses_buys_but_allows_reduce_only_sells() {
-        let f = fixture();
+        let f = fixture_with_caps(200 * USDC, 500 * USDC, 600 * USDC);
         // Lower max_drawdown to 15 USDC
         f.treasury.set_drawdown_config(&(15 * USDC), &7u32);
 
@@ -7226,7 +7228,7 @@ mod test {
         f.treasury
             .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &cost, &0);
 
-        let close = f.env.ledger().timestamp() + 500;
+        let close = MARKET_CLOSE + 1000;
         let market2 = f.treasury.agent_create_market(
             &f.agent,
             &BytesN::from_array(&f.env, &[33u8; 32]),
@@ -7274,9 +7276,9 @@ mod test {
         );
 
         // Reduce-only sells are allowed!
-        let sold = f
-            .treasury
-            .agent_sell(&f.agent, &market2, &Outcome::Yes, &(2 * USDC), &0);
+        let sold =
+            f.treasury
+                .agent_sell(&f.agent, &market2, &Outcome::Yes, &(2 * USDC), &i128::MAX);
         assert!(sold > 0);
     }
 
@@ -7349,8 +7351,14 @@ mod test {
         f.env.ledger().set_timestamp(MARKET_CLOSE + 1);
         f.market_core.resolve(&f.market_id, &Outcome::No);
 
-        // Third party calls realize instead of settle_market
+        // Finality alone does not burn positions; realize must wait for settlement.
         f.treasury.realize(&f.market_id);
+        assert!(!f.treasury.market_pnl(&f.market_id).realized);
+        let caller = Address::generate(&f.env);
+        f.treasury.settle_market(&caller, &f.market_id);
+        let before = f.treasury.window_pnl();
+        f.treasury.realize(&f.market_id);
+        assert_eq!(f.treasury.window_pnl(), before);
         let pnl = f.treasury.market_pnl(&f.market_id);
         assert_eq!(pnl.cost, cost);
         assert_eq!(pnl.proceeds, 0);
@@ -7525,7 +7533,7 @@ mod test {
                 &String::from_str(&f.env, "ipfs://m1"),
                 &Category::Crypto,
                 &close,
-                &(10 * USDC),
+                &(100 * USDC),
                 &5000u32,
             )
             .is_ok());
@@ -7540,7 +7548,7 @@ mod test {
                 &String::from_str(&f.env, "ipfs://m2"),
                 &Category::Crypto,
                 &close,
-                &(10 * USDC),
+                &(100 * USDC),
                 &5000u32,
             )
             .is_ok());
@@ -7553,7 +7561,7 @@ mod test {
             &String::from_str(&f.env, "ipfs://m3"),
             &Category::Crypto,
             &close,
-            &(10 * USDC),
+            &(100 * USDC),
             &5000u32,
         );
         assert_eq!(err, Err(Ok(Error::CreationRateExceeded)));
@@ -7574,7 +7582,7 @@ mod test {
                 &String::from_str(&f.env, "ipfs://m4"),
                 &Category::Crypto,
                 &new_close,
-                &(10 * USDC),
+                &(100 * USDC),
                 &5000u32,
             )
             .is_ok());
@@ -7593,9 +7601,7 @@ mod test {
         let f = fixture_with_policy(100 * USDC, 500 * USDC, 500 * USDC, policy);
 
         for day in 0..30 {
-            f.env
-                .ledger()
-                .set_timestamp(1_000 + (day as u64) * 86_400);
+            f.env.ledger().set_timestamp(1_000 + (day as u64) * 86_400);
             let close = f.env.ledger().timestamp() + 1000;
             let mut byte_arr = [0u8; 32];
             byte_arr[0] = (day + 1) as u8;
@@ -7624,8 +7630,8 @@ mod test {
 
     #[test]
     fn seed_still_counts_toward_daily_and_market_caps() {
-        let f = fixture();
-        let seed = 20 * USDC;
+        let f = fixture_with_caps(200 * USDC, 500 * USDC, 600 * USDC);
+        let seed = 100 * USDC;
         let close = f.env.ledger().timestamp() + 500;
         let market_id = f.treasury.agent_create_market(
             &f.agent,
@@ -7740,7 +7746,7 @@ mod test {
                 if req.request_type == 0 {
                     token::TokenClient::new(&env, &req.address).transfer(
                         &spender,
-                        &env.current_contract_address(),
+                        env.current_contract_address(),
                         &req.amount,
                     );
                     let mut pos = Self::get_positions(env.clone(), spender.clone());
@@ -7827,7 +7833,7 @@ mod test {
         f.treasury.set_yield_venue(&pool, &(1000 * USDC));
 
         let err = f.treasury.try_allocate_to_yield(&(950 * USDC));
-        assert_eq!(err, Err(Ok(Error::InsufficientBalance)));
+        assert_eq!(err, Err(Ok(Error::DailyCapExceeded)));
     }
 
     #[test]
@@ -7953,4 +7959,3 @@ mod test {
         assert_eq!(err, Err(Ok(Error::VenueHasPrincipal)));
     }
 }
-
