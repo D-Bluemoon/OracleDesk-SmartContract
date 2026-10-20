@@ -1,6 +1,8 @@
 #![no_std]
 
 mod math;
+#[cfg(kani)]
+mod math_proofs;
 
 use math::{MathError, Settlement, BPS, MAX_SETS};
 use soroban_sdk::{

@@ -24,6 +24,10 @@ build:
 	stellar contract build
 	./scripts/sync-vendored-wasm.sh
 	stellar contract build
+	cp target/wasm32v1-none/release/market_core.wasm contracts/integration-tests/wasm/
+	cp target/wasm32v1-none/release/resolver.wasm contracts/integration-tests/wasm/
+	cp target/wasm32v1-none/release/treasury.wasm contracts/integration-tests/wasm/
+	cp target/wasm32v1-none/release/reasoning_registry.wasm contracts/integration-tests/wasm/
 
 # Proves the contract build is bit-for-bit reproducible and that the vendored
 # wasm matches a clean build (issue #58). Slow: it compiles the workspace
@@ -45,12 +49,28 @@ test: build
 	cargo test --workspace
 	cargo test --manifest-path scripts/spec-hash/Cargo.toml
 	python3 model/fpmm_model.py
+	python3 model/system_model.py --selftest
 	cd x402 && npm test
 	cd agents && npm test
 
 lint:
+	./scripts/check-no-mock-all-auths.sh
 	cargo fmt --check
 	cargo clippy --workspace --all-targets -- -D warnings
+
+auth-matrix: build
+	cargo test -p integration-tests --test auth_matrix
+	./scripts/check-no-mock-all-auths.sh
+
+kani:
+	cargo kani -p market-core
+
+model-test:
+	python3 model/system_model.py --selftest
+	cargo test -p integration-tests --test system_model
+
+e2e-local:
+	./scripts/e2e-local.sh
 
 fmt:
 	cargo fmt

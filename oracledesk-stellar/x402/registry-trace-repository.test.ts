@@ -74,7 +74,66 @@ test("returns a TraceRecord translated from the on-chain trace", async () => {
     fakeReader({ byId: new Map([[0n, { trace_hash: hash, ipfs_cid: "ipfs://x" }]]) }),
   );
   const record = await repo.get("0");
-  assert.deepEqual(record, { traceId: "0", ipfsCid: "ipfs://x", traceHash: hash });
+  assert.deepEqual(record, {
+    traceId: "0",
+    ipfsCid: "ipfs://x",
+    traceHash: hash,
+    action: "create_market",
+    verdict: undefined,
+  });
+});
+
+test("maps verdict from reader", async () => {
+  const hash = "ab".repeat(32);
+  const reader: RegistryTraceReader = {
+    async get_trace() {
+      return {
+        result: {
+          market_id: 0n,
+          agent: "GAGENT",
+          action: "create_market",
+          trace_hash: Buffer.from(hash, "hex"),
+          ipfs_cid: "ipfs://x",
+          published_at: 0n,
+        },
+      };
+    },
+    async trace_verdict() {
+      return {
+        result: { tag: "Flagged", values: ["fraud"] },
+      };
+    },
+  };
+  const repo = new RegistryTraceRepository(reader);
+  const record = await repo.get("0");
+  assert.deepEqual(record, {
+    traceId: "0",
+    ipfsCid: "ipfs://x",
+    traceHash: hash,
+    action: "create_market",
+    verdict: { tag: "Flagged", values: ["fraud"] },
+  });
+});
+
+test("normalizes tagged action to string", async () => {
+  const hash = "ab".repeat(32);
+  const reader: RegistryTraceReader = {
+    async get_trace() {
+      return {
+        result: {
+          market_id: 0n,
+          agent: "GAGENT",
+          action: { tag: "Buy", values: undefined },
+          trace_hash: Buffer.from(hash, "hex"),
+          ipfs_cid: "ipfs://x",
+          published_at: 0n,
+        },
+      };
+    },
+  };
+  const repo = new RegistryTraceRepository(reader);
+  const record = await repo.get("0");
+  assert.equal(record?.action, "buy");
 });
 
 test("returns undefined for a trace id the registry does not know", async () => {

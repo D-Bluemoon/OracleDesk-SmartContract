@@ -478,6 +478,66 @@ trusting fetched trace content. Traces are also indexed per market
 (`market_trace_count` / `market_trace_at`) via a counter rather than an
 unbounded `Vec`, so the index never has an unbounded-growth storage cost.
 
+#### Agent Lifecycle and Trace Annotations (#56)
+
+The reasoning registry models an explicit lifecycle for agents and traces:
+- **Agent lifecycle**: Agents hold `AgentRecord { status: AgentStatus, registered_at: u64 }`.
+  - `Active`: Registered agent permitted to publish traces.
+  - `Retired(at)`: Agent gracefully retired by admin (`retire_agent`) or the agent itself (`retire_self`). Retired agents cannot publish new traces, but their existing traces remain valid. Admin may call `reactivate_agent` to return a retired agent to `Active`.
+  - `Revoked(effective_from, reason)`: Agent revoked by admin (`revoke_agent`) due to compromise or malfeasance. Revocations cannot be reversed or reactivated, preventing history laundering.
+- **Trace flagging**: The admin can annotate suspect traces via `flag_trace(trace_id, reason)` and `unflag_trace(trace_id, reason)`. Flags are annotations appended to a bounded history (max 16 entries) and never modify or erase the underlying trace data.
+- **Trace verdict**: `trace_verdict(trace_id, received_hash)` evaluates validity in strict precedence:
+  1. Not found -> `Err(TraceNotFound)`
+  2. Hash differs -> `TraceVerdict::HashMismatch`
+  3. Active flag -> `TraceVerdict::Flagged(reason)`
+  4. Agent revoked with `trace.published_at >= effective_from` -> `TraceVerdict::AgentRevokedAfter(effective_from)`
+  5. Otherwise -> `TraceVerdict::Valid`
+- **Semantic tightening of `verify_trace`**: `verify_trace` returns `true` only if `trace_verdict` evaluates to `TraceVerdict::Valid`. Clients wishing to perform bare hash comparison without status checks can query `get_trace`.
+
+#### Trace Action Validation and Market Reference Integrity (#55)
+
+Traces reference concrete market actions validated against `market-core`:
+- **Canonical Action Vocabulary**: `TraceAction` replaces free-form strings:
+  | Action | Target Market | Description |
+  | :--- | :--- | :--- |
+  | `CreateMarket` | Issued `market_id` | Creation of a new market on-chain |
+  | `ProposeMarket` | `NO_MARKET` (`u64::MAX`) | Off-chain market proposal prior to creation |
+  | `Buy` | Issued `market_id` | Purchase of YES or NO shares |
+  | `Sell` | Issued `market_id` | Sale of YES or NO shares |
+  | `Skip` | Issued `market_id` | Evaluated market but took no trade action |
+  | `Redeem` | Issued `market_id` | Redemption of winning or voided shares |
+  | `ClaimRemainder` | Issued `market_id` | LP reclamation of unredeemed collateral pool |
+  | `Resolve` | Issued `market_id` | Resolver or oracle resolution attestation |
+  | `Other(Symbol)` | Issued `market_id` or `NO_MARKET` | Forward-compatible custom action; cannot shadow canonical action names |
+- **Market Reference Validation**:
+  - `market_core.market_count()` is checked via cross-contract read.
+  - A referenced `market_id` must satisfy `market_id < market_count()`.
+  - `ProposeMarket` requires `NO_MARKET` (`u64::MAX`), returning `Error::ProposalMustUseNoMarket` if given an actual `market_id`.
+  - Canonical actions (`Buy`, `Sell`, etc.) reject `NO_MARKET` with `Error::MarketRequired`.
+  - View function calls to `market_count()` remain functional even when `market-core` is paused.
+
+#### Merkle-Batched Trace Anchoring (#54)
+
+To slash per-decision publishing costs for high-frequency trading or extensive skip auditing:
+- **Off-chain Batching**: Agents collect up to 4,096 trace hashes off-chain, compute a Merkle tree, and anchor the 32-byte root and manifest CID on-chain via `publish_trace_batch(agent, root, leaf_count, manifest_cid)`.
+- **Cryptographic Specifications**:
+  - **Second-Preimage Resistance**: RFC 6962 domain separation prefixes: leaves hash with `0x00 || trace_hash`, inner nodes hash with `0x01 || left || right`.
+  - **Odd Node Promotion**: An odd child at any tree layer is promoted unchanged to the next level without duplicating or hashing with itself. When verifying an odd node, no proof element is consumed for that layer.
+  - **Bounded Proof Length**: With `MAX_LEAVES = 4096`, proof length is strictly bounded to `MAX_PROOF_LEN = 12`. Any proof exceeding 12 elements is rejected with `Error::InvalidProof`.
+- **Verification**: `verify_trace_inclusion(batch_id, trace_hash, index, proof)` and `compute_merkle_root(leaf_count, trace_hash, index, proof)` enable on-chain and off-chain (x402 verifier, agents) verification against canonical golden test vectors (`docs/vectors/merkle-v1.json`).
+
+#### Ed25519-Signed Trace Attestations (#53)
+
+To enable independent verification of trace authenticity without trusting the registry admin:
+- **Dedicated Agent Signing Keys**: Agents bind dedicated Ed25519 public keys (`BytesN<32>`) to their on-chain identity via `add_signing_key(agent, public_key, proof_sig)`.
+  - **Proof of Possession**: `proof_sig` proves ownership of the secret key by signing `"oracledesk-agent-key-v1" || network_id || registry_id || agent_xdr || public_key`.
+  - **Key Binding & Lifecycle**: Keys are uniquely bound to agents (at most 4 active keys per agent) with full rotation history (`SigningKeyRecord { public_key, added_at, retired_at }`) tracked via `retire_signing_key`.
+- **Domain-Separated Trace Attestation**: `publish_trace_signed(agent, market_id, action, trace_hash, ipfs_cid, signing_key, signature)`:
+  - Message format: `"oracledesk-trace-v1" || network_id || registry_id || agent_xdr || market_id_be || action_tag || trace_hash`.
+  - On-chain verification via `env.crypto().ed25519_verify`.
+  - The attestation signature is stored under `TraceSignature(trace_id)` and queriable via `get_trace_signature` and `verify_trace_signature`.
+- **Zero-Trust Offline Verification**: Any consumer holding the trace JSON and public key (e.g., an x402 subscriber or frontend auditor) can verify authenticity offline without RPC access or reliance on contract admin honesty.
+
 **Known limitation**: Soroban RPC only retains a short window of historical
 events. An indexer (Soroban events → Postgres, replayable) is required for
 any UI that wants to list traces/trades older than that window — this is
