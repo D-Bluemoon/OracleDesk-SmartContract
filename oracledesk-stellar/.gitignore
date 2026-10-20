@@ -39,3 +39,8 @@ deployments/specs/
 .vscode/
 .idea/
 .DS_Store
+
+# Payment ledger, WAL and shared-memory files contain purchase records.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
