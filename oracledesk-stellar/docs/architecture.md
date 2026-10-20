@@ -86,6 +86,10 @@ emits `LpTransferred`. Both preserve the solvency invariant by
 construction; the position mapping is unchanged down to the "remove
 zero entries" rule.
 
+**Economics.** LP worst-case loss, the rounding argument and the no-arbitrage
+theorem for this exact integer math are in [fpmm-economics.md](fpmm-economics.md)
+(executable checks: `model/fpmm_bounds.py`).
+
 **Resolution commitment**: `resolution_hash` is fixed at `create_market`
 time — see [ADR 0001](adr/0001-resolution-commitment.md) for why.
 
