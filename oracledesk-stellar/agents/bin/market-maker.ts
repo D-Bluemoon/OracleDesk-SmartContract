@@ -11,7 +11,7 @@
  */
 import "dotenv/config";
 import { createHash } from "node:crypto";
-import { buildTrace, LocalTraceStore } from "../core/trace.js";
+import { buildTrace, LocalTraceStore, NO_MARKET } from "../core/trace.js";
 import { decideMarketProposal, type MarketSignal, type SignalSource } from "../core/strategy.js";
 import { agentCredentials, loadDeployments, StellarAdapter } from "../stellar/adapter.js";
 import { ChainStateReader } from "../core/state/reader.js";
@@ -105,14 +105,24 @@ async function main() {
     console.log("[market-maker] agent_create_market:", result);
 
     if (!result.dryRun) {
-      const traceResult = await adapter.publishTrace({
+      // Record proposal trace prior to creation using NO_MARKET sentinel (#55)
+      const proposalResult = await adapter.publishTrace({
         agent: adapter.agent,
-        market_id: result.value,
-        action: "create_market",
+        market_id: NO_MARKET,
+        action: { tag: "ProposeMarket", values: undefined },
         trace_hash: Buffer.from(built.hash, "hex"),
         ipfs_cid: cid,
       });
-      console.log("[market-maker] publish_trace:", traceResult);
+      console.log("[market-maker] publish_trace (propose_market):", proposalResult);
+
+      const traceResult = await adapter.publishTrace({
+        agent: adapter.agent,
+        market_id: result.value,
+        action: { tag: "CreateMarket", values: undefined },
+        trace_hash: Buffer.from(built.hash, "hex"),
+        ipfs_cid: cid,
+      });
+      console.log("[market-maker] publish_trace (create_market):", traceResult);
     }
   }
 }

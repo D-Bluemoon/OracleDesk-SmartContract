@@ -67,6 +67,32 @@ contracts and `deployments/testnet.json` predate these changes, so the new
 entrypoints have contract-level and off-chain tests only, not a real-ledger
 transaction.
 
+### Storage Migration: Reasoning Registry Agent Records (#56)
+
+Existing deployments store `true` under `Agent(addr)`. The registry reads both `AgentRecord` and legacy `bool` seamlessly (treating legacy bool records as `AgentStatus::Active` with `registered_at: 0`); newly registered agents write full `AgentRecord` structs.
+
+### Cross-Contract Market Reference Validation (#55)
+
+Traces published via reasoning registry now validate market references and actions:
+- `TraceAction` enum replaces free-form strings (`CreateMarket`, `ProposeMarket`, `Buy`, `Sell`, `Skip`, `Redeem`, `ClaimRemainder`, `Resolve`, `Other(Symbol)`).
+- Cross-contract read of `market-core`'s `market_count()` verifies `market_id < count`.
+- `ProposeMarket` requires `NO_MARKET` (`u64::MAX`) sentinel for proposals made before market creation.
+- Vendored `contracts/reasoning-registry/market_core.wasm` via `contractimport!` to support cross-contract calls without cyclic cargo dependencies.
+
+### Merkle-Batched Trace Anchoring (#54)
+
+High-frequency decision anchoring via Merkle roots:
+- `publish_trace_batch`, `get_batch`, `batch_count`, `agent_batch_count`, `agent_batch_at`, `verify_trace_inclusion`, `compute_merkle_root`.
+- Strict domain separation (0x00 leaf prefix, 0x01 node prefix), odd node promotion without hashing, capped at 4096 leaves (max proof length 12).
+- Golden test vectors in `docs/vectors/merkle-v1.json` verified across Rust contract, TypeScript agents, and x402 verifier.
+
+### Ed25519-Signed Trace Attestations (#53)
+
+Zero-trust trace authentication via agent-held signing keys:
+- `add_signing_key`, `retire_signing_key`, `get_signing_keys`, `get_key_agent`, `signing_key_history_count`, `signing_key_history`, `publish_trace_signed`, `publish_chained_trace_signed`, `get_trace_signature`, `verify_trace_signature`.
+- Cryptographic proof of possession over domain-separated bind message (`oracledesk-agent-key-v1`), at most 4 active keys per agent, immutable rotation history.
+- On-chain and off-chain (x402 verifier, agents) verification of domain-separated trace attestations (`oracledesk-trace-v1`) without trusting registry admin or RPC.
+
 ### Merge follow-up: 2026-10-17
 
 The work above landed on `develop` as merge commit `581a3ec` (PR #153,

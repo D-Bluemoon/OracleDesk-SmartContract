@@ -1,4 +1,10 @@
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey, verify } from "node:crypto";
+
+export type TraceVerdict =
+  | { tag: "Valid"; values?: void }
+  | { tag: "HashMismatch"; values?: void }
+  | { tag: "Flagged"; values: [string] | readonly [string] }
+  | { tag: "AgentRevokedAfter"; values: [bigint] | readonly [bigint] };
 
 export interface TraceRecord {
   traceId: string;
@@ -119,3 +125,26 @@ export function verifyChain(entries: ChainEntry[], fromGenesis: boolean): ChainV
   }
   return { ok: true };
 }
+
+// ─── Ed25519 trace attestations (#53) ───────────────────────────────────────
+
+/**
+ * Verifies an Ed25519 signature over a message using Node's standard crypto.
+ * Can be run completely offline with no network or registry access.
+ */
+export function verifyEd25519Signature(
+  publicKey: Uint8Array,
+  message: Uint8Array,
+  signature: Uint8Array,
+): boolean {
+  if (publicKey.length !== 32 || signature.length !== 64) return false;
+  try {
+    const spkiPrefix = Buffer.from("302a300506032b6570032100", "hex");
+    const der = Buffer.concat([spkiPrefix, Buffer.from(publicKey)]);
+    const key = createPublicKey({ key: der, format: "der", type: "spki" });
+    return verify(null, Buffer.from(message), key, Buffer.from(signature));
+  } catch {
+    return false;
+  }
+}
+
