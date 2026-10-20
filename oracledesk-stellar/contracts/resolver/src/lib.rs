@@ -2625,6 +2625,82 @@ mod test {
         BytesN, IntoVal,
     };
 
+    // ---- dual registration of market-core (coverage, issue #75) ---------------
+    //
+    // The wasm copy is what ships and what ADR 0002 requires the contract to be
+    // *built* against, but code running inside the wasm VM is invisible to
+    // `cargo llvm-cov`. A native `market-core` registration (a dev-dependency:
+    // the duplicate `__constructor` export that forbids this in the wasm build
+    // does not exist in a native test binary) runs the same scenarios as host
+    // code. `MARKET_CORE_IMPL=native cargo test` flips the whole suite;
+    // `both_modes!` pins individual scenarios to both.
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum McImpl {
+        Wasm,
+        Native,
+    }
+
+    std::thread_local! {
+        static MC_OVERRIDE: core::cell::Cell<Option<McImpl>> = const { core::cell::Cell::new(None) };
+    }
+
+    fn mc_impl() -> McImpl {
+        MC_OVERRIDE.with(|c| c.get()).unwrap_or_else(|| {
+            match std::env::var("MARKET_CORE_IMPL").as_deref() {
+                Ok("native") => McImpl::Native,
+                _ => McImpl::Wasm,
+            }
+        })
+    }
+
+    /// Runs `f` with market-core registered as `how`, restoring the previous
+    /// choice even if `f` panics.
+    fn with_market_core<R>(how: McImpl, f: impl FnOnce() -> R) -> R {
+        struct Restore(Option<McImpl>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                MC_OVERRIDE.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(MC_OVERRIDE.with(|c| c.replace(Some(how))));
+        f()
+    }
+
+    /// `(admin, collateral, treasury, resolver, default_fee_bps, protocol_share_bps)`.
+    fn register_market_core(
+        env: &Env,
+        args: (Address, Address, Address, Address, u32, u32),
+    ) -> Address {
+        match mc_impl() {
+            McImpl::Wasm => env.register(market_core::WASM, args),
+            McImpl::Native => env.register(
+                ::market_core_native::MarketCore,
+                ::market_core_native::MarketCoreArgs::__constructor(
+                    &args.0, &args.1, &args.2, &args.3, &args.4, &args.5,
+                ),
+            ),
+        }
+    }
+
+    /// Re-runs existing scenario tests (`#[test]` functions are plain functions
+    /// too) once per market-core registration, as `<name>::wasm` and
+    /// `<name>::native`.
+    macro_rules! both_modes {
+        ($($name:ident),+ $(,)?) => {$(
+            mod $name {
+                #[test]
+                fn wasm() {
+                    super::with_market_core(super::McImpl::Wasm, super::$name);
+                }
+                #[test]
+                fn native() {
+                    super::with_market_core(super::McImpl::Native, super::$name);
+                }
+            }
+        )+};
+    }
+
     #[contract]
     struct MockReflector;
 
@@ -2693,8 +2769,8 @@ mod test {
         token.mint(&creator, &(1_000 * 10_000_000_i128));
 
         let spec = spec_fn(&env, &reflector_id, &signer_a, &signer_b);
-        let market_core_id = env.register(
-            market_core::WASM,
+        let market_core_id = register_market_core(
+            &env,
             (
                 admin.clone(),
                 collateral.address(),
@@ -5208,6 +5284,86 @@ mod test {
         assert!(f.resolver.try_finalize_signers(&f.market_id).is_err());
         assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::No));
     }
+
+    /// Everything observable about market-core through a resolver scenario,
+    /// as text: trading maths, final status, payouts, balances.
+    fn market_core_trace() -> std::vec::Vec<std::string::String> {
+        use std::format;
+        let f = signer_fixture();
+        let id = f.market_id;
+        let creator = f.market_core.get_market(&id).creator;
+        let one = 10_000_000_i128;
+        let mut t = std::vec::Vec::new();
+        t.push(format!(
+            "price {}",
+            f.market_core.get_price(&id, &Outcome::Yes)
+        ));
+        t.push(format!(
+            "quote {}",
+            f.market_core.quote_buy(&id, &Outcome::Yes, &(10 * one))
+        ));
+        t.push(format!(
+            "buy {}",
+            f.market_core
+                .buy(&creator, &id, &Outcome::Yes, &(10 * one), &0)
+        ));
+        t.push(format!(
+            "price {}",
+            f.market_core.get_price(&id, &Outcome::Yes)
+        ));
+        t.push(format!(
+            "sell {}",
+            f.market_core
+                .sell(&creator, &id, &Outcome::Yes, &(3 * one), &(100 * one))
+        ));
+        t.push(format!(
+            "pos {:?}",
+            f.market_core.get_position(&id, &creator)
+        ));
+        f.env.ledger().set_timestamp(2_000);
+        attest_both(&f, AttestedOutcome::No);
+        t.push(format!("early {:?}", f.resolver.try_finalize_signers(&id)));
+        f.env.ledger().set_timestamp(2_100);
+        t.push(format!("finalize {:?}", f.resolver.finalize_signers(&id)));
+        t.push(format!("status {:?}", f.market_core.get_market(&id).status));
+        t.push(format!("again {:?}", f.resolver.try_finalize_signers(&id)));
+        t.push(format!("redeem {}", f.market_core.redeem(&creator, &id)));
+        t.push(format!("claim {}", f.market_core.claim_pool_remainder(&id)));
+        t.push(format!("sweep {}", f.market_core.sweep_fees(&id)));
+        t
+    }
+
+    /// The native registration (which coverage can see) must be a faithful
+    /// stand-in for the wasm that ships, and for the vendored copy drifting
+    /// from the source: identical observable behaviour, step by step.
+    #[test]
+    fn native_and_wasm_market_core_agree() {
+        let wasm = with_market_core(McImpl::Wasm, market_core_trace);
+        let native = with_market_core(McImpl::Native, market_core_trace);
+        assert_eq!(wasm, native);
+        assert!(wasm.len() > 10, "{wasm:?}");
+    }
+
+    both_modes!(
+        price_mode_resolves_from_historical_reflector_price,
+        signer_mode_requires_threshold_and_waits_for_dispute_window,
+        invalid_attestations_void_market_after_dispute_window,
+        guardian_cancel_of_invalid_proposal_then_yes_finalizes,
+        expire_voids_signer_market_once_proposal_is_cancelled,
+        attest_rejected_after_expiry,
+        guardian_void_rejected_after_expiry,
+        cancel_proposal_blocked_while_disputed,
+        guardian_void_while_disputed_refunds_bond,
+        model_trace_signers_happy_path_yes,
+        model_trace_price_happy_path_yes,
+        model_trace_cancel_strands_quorum_until_stalled_void,
+        model_trace_invalid_quorum_displaces_yes_and_restarts_window,
+        model_trace_other_outcome_quorum_does_not_reset_window,
+        model_trace_no_void_or_attestation_before_close,
+        model_trace_guardian_void_blocks_later_attest_and_finalize,
+        model_trace_expire_blocked_by_valid_proposal,
+        model_trace_admin_bypass_resolves_without_threshold,
+    );
 }
 
 #[cfg(test)]

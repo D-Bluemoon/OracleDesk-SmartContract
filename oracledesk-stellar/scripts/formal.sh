@@ -53,7 +53,7 @@ for row in "${CONFIGS[@]}"; do
   start=$(date +%s)
   set +e
   out=$(java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -config "$cfg.cfg" resolver.tla \
-        -workers auto -metadir "$META/$cfg" 2>&1)
+        -workers auto -noGenerateSpecTE -metadir "$META/$cfg" 2>&1)
   got=$?
   set -e
   states=$(grep -E "distinct states found" <<<"$out" | tail -1 | sed -E 's/.*, ([0-9,]+) distinct states found.*/\1/')

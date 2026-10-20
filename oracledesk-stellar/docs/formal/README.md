@@ -94,6 +94,9 @@ is finalized, and the guardian, expiry and bypass are off.
 | `resolver_bypass.cfg` (N=3) | `ResolvedOutcomeHadThreshold` fails | **violated** (exit 12) | 91 | ~1 s |
 | `resolver_live_invalid.cfg` (N=4, honest = 2) | `Liveness` fails | **violated** (exit 13) | 4,966 | ~1 s |
 
+State counts for the violated configs vary slightly from run to run (TLC stops
+at the first violation while several workers are exploring); the verdicts do not.
+
 The checks have teeth: dropping the window guard from `Finalize`, letting
 `Cancel` keep the proposal, dropping the `Open` guard from market-core, or
 allowing attestation before close each make one of the properties fail
