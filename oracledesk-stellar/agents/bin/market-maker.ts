@@ -11,7 +11,8 @@
  */
 import "dotenv/config";
 import { createHash } from "node:crypto";
-import { buildTrace, LocalTraceStore } from "../core/trace.js";
+import { buildTrace, canonicalize } from "../core/trace.js";
+import { createTraceStore } from "../core/trace-store-factory.js";
 import { decideMarketProposal, type MarketSignal, type SignalSource } from "../core/strategy.js";
 import { agentCredentials, loadDeployments, StellarAdapter } from "../stellar/adapter.js";
 import { ChainStateReader } from "../core/state/reader.js";
@@ -47,7 +48,7 @@ async function main() {
     ...agentCredentials("maker", process.env, deployments),
     deployments,
   });
-  const traceStore = new LocalTraceStore(process.env.TRACE_STORE_DIR ?? "./.traces");
+  const { store: traceStore, kind: traceStoreKind } = createTraceStore(process.env, mode);
 
   // Load chain state to check for duplicate question hashes
   const rpcUrl = process.env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org";
@@ -88,17 +89,43 @@ async function main() {
       reasoning: decision.reasoning,
       inputs: { signal, decision },
     });
-    const { cid } = await traceStore.put(built.hash, built.json);
-    console.log(`[market-maker] trace ${built.hash} -> ${cid}`);
+    const closeTime = BigInt(Math.floor(Date.now() / 1000) + 3600);
+
+    // The trace (and, with the IPFS store, the market metadata) must be
+    // pinned and verified before the create: never act without a
+    // publishable trace.
+    let cid: string;
+    let metaUri: string;
+    try {
+      ({ cid } = await traceStore.put(built.hash, built.json));
+      if (traceStoreKind === "ipfs") {
+        const metaJson = canonicalize({
+          question: decision.question,
+          category: "Macro",
+          closeTime,
+          source: signal.source,
+          traceHash: built.hash,
+          traceCid: cid,
+        });
+        const metaHash = createHash("sha256").update(metaJson).digest("hex");
+        metaUri = `ipfs://${(await traceStore.put(metaHash, metaJson)).cid}`;
+      } else {
+        metaUri = `local://${built.hash}`;
+      }
+    } catch (err) {
+      console.error(`[market-maker] skipped: trace ${built.hash} could not be stored:`, err);
+      continue;
+    }
+    console.log(`[market-maker] trace ${built.hash} -> ${cid}, meta_uri=${metaUri}`);
 
     const placeholderResolutionHash = createHash("sha256").update("unrevealed").digest();
 
     const result = await adapter.agentCreateMarket({
       question_hash: questionHash,
       resolution_hash: placeholderResolutionHash,
-      meta_uri: `local://${built.hash}`,
+      meta_uri: metaUri,
       category: { tag: "Macro", values: undefined },
-      close_time: BigInt(Math.floor(Date.now() / 1000) + 3600),
+      close_time: closeTime,
       seed_amount: decision.seedAmountStroops!,
       initial_yes_bps: decision.initialYesBps!,
     });

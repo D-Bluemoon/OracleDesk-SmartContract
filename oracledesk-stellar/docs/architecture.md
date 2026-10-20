@@ -535,6 +535,47 @@ no admin.
   `min_shares_out` / `limit_price_bps` bounds plus a deadline from it.
 - **packages/bindings/**: generated TypeScript clients (`scripts/gen-bindings.sh`).
 
+
+### IPFS trace storage
+
+In live mode the agents store traces with `IpfsTraceStore`
+(`agents/core/ipfs-store.ts`; selected by `TRACE_STORE`, see
+`agents/core/trace-store-factory.ts`). The CID that goes on-chain in
+`publish_trace(..., ipfs_cid)` is permanent, because `Trace` entries have no
+update path. So the agent computes the CID itself and does not trust any
+pinning provider to name the content:
+
+- **Raw CIDv1.** The CID is a CIDv1 with the `raw` codec (`0x55`) and a
+  sha2-256 multihash over the exact UTF-8 bytes `buildTrace` hashed
+  (base32 lowercase, `bafkrei…`, 59 characters). Its multihash digest is
+  therefore *equal to* `trace_hash`. A default `ipfs add` (dag-pb/UnixFS,
+  chunked) would hash a protobuf wrapper instead and break that property,
+  so kubo is called with `cid-version=1&raw-leaves=true&hash=sha2-256` and a
+  1 MiB chunker, and traces are limited to one 1 MiB block.
+- **Providers are verified, not trusted.** Any provider that reports a CID
+  different from the local one (compared by value with `CID.equals`, not by
+  string) fails the whole `put`. Pins go to a kubo RPC node and optionally an
+  IPFS Pinning Service API (`POST /pins`, polled until `pinned`). Each
+  provider is retried with jittered backoff, and at least `IPFS_MIN_PINS`
+  must *confirm* the pin. Queued pins count only with `IPFS_ACCEPT_QUEUED=1`.
+- **Retrievability is checked.** Before `put` resolves, the agent GETs
+  `${IPFS_GATEWAY_URL}/<cid>` (the gateway x402 also reads), following
+  redirects, with a byte cap and a timeout, and re-checks `sha256(body)`.
+  The trade or market creation is only submitted after this succeeds. If
+  pinning fails, the action is skipped and logged.
+- The market-maker also pins a small metadata document (question, category,
+  close time, trace hash and CID) and sets the market's `meta_uri` to
+  `ipfs://<cid>`. `local://` URIs remain only in dry-run, or in live mode with
+  `ALLOW_LOCAL_TRACE_STORE=1`.
+
+**Verifying without fetching.** A buyer holding `(trace_hash, ipfs_cid)` from
+the registry can decode the CID: version 1, codec `0x55`, multihash code
+`0x12` (sha2-256), length 32. The 32 digest bytes must equal `trace_hash`.
+With `multiformats`:
+`Buffer.from(CID.parse(cid).multihash.digest).toString("hex") === trace_hash`.
+After fetching, `sha256(body) === trace_hash`, as `x402/trace-verification.ts`
+checks, proves the bytes are the ones the agent committed to.
+
 ## Known limitations (see docs/STATUS.md for the full, current list)
 
 - Testnet only; unaudited.
