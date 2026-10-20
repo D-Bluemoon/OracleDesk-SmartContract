@@ -146,6 +146,10 @@ Independent resolution modes, all ultimately calling
   the fallback dispute window closes, `resolve_price` immediately supersedes the proposal
   and resolves the market.
 
+The resolution lifecycle (both modes, the guardian, expiry and market-core's
+status) is model-checked in TLA+; see [formal/README.md](formal/README.md) for
+the properties, the findings and the conformance tests that replay the traces.
+
 None of these modes can be configured until the revealed spec's hash matches the
 market's commitment (`register_price_spec`, `register_signer_spec`,
 `register_committee_spec`, or `register_hybrid_spec` — see ADR 0001).

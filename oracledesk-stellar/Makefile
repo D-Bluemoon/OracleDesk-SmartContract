@@ -1,4 +1,4 @@
-.PHONY: setup build test lint fmt deploy-testnet seed-market demo bindings clean
+.PHONY: setup build test lint fmt formal deploy-testnet seed-market demo bindings clean
 
 # Installs Node dependencies for the TypeScript packages. Rust toolchain,
 # the `stellar` CLI, and Python 3 are expected to already be on PATH — see
@@ -45,6 +45,11 @@ lint:
 
 fmt:
 	cargo fmt
+
+# TLC model check of the resolution lifecycle (docs/formal/). Skips with exit 0
+# when Java is not installed.
+formal:
+	./scripts/formal.sh
 
 deploy-testnet: build
 	./scripts/deploy-testnet.sh
