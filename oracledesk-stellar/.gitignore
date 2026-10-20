@@ -35,6 +35,10 @@ deployments/specs/
 # Agent dry-run/local trace output (agents/core/trace.ts's LocalTraceStore)
 .traces/
 
+# Market-maker resolution specs (agents/core/spec-store.ts). Losing one makes
+# its market unresolvable: keep AGENT_SPEC_DIR on backed-up storage, never in git.
+.specs/
+
 # IDE / OS
 .vscode/
 .idea/
