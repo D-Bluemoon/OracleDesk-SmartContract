@@ -762,3 +762,58 @@ checks, proves the bytes are the ones the agent committed to.
   deployments (this repo's or a fork's) from trading against the same
   market-core markets; the treasury's caps bound one agent deployment's own
   risk, not systemic market behavior.
+
+### x402 payment preparation, settlement and replay
+
+One HTTP resource server advertises all effective Stellar networks. Each
+facilitator client is scoped to its configured network even if `/supported`
+advertises others; API keys never cross those scopes. Startup defaults to
+requiring every configured network. `X402_REQUIRE_ALL_NETWORKS=false` probes
+and drops unavailable networks, logs structured warnings, and still refuses
+startup if none remain. The process awaits initialization before listening.
+
+For a fresh purchase the trace path is: registry lookup → bounded IPFS fetch →
+raw-byte hash verification → JSON parse and response encoding → durable ledger
+claim → facilitator verification → durable `settling` transition → settlement →
+durable receipt → delivery. No trace bytes are sent before settlement succeeds.
+`@x402/*` are pinned to 2.26.0; requirements and scheme capabilities support only
+`authorization`. Upfront payloads are rejected. `X402_TRACE_LOAD_TIMEOUT_MS`
+(default 10 seconds) bounds the entire preparation phase, including repository
+lookup and body reads, and must be less than half `X402_MAX_TIMEOUT_SECONDS`
+(default 60). An unpaid unknown trace gets 404 rather than a payment challenge;
+this permits enumeration of IDs that are already public in the registry.
+
+The default ledger is SQLite (`X402_LEDGER_PATH`, default `.x402-ledger.sqlite`),
+with WAL, FULL synchronous durability, a unique payment ID and compare-and-set
+state updates. `X402_LEDGER=memory` provides the same interface for tests or
+explicitly ephemeral sessions. A payment ID hashes the network plus the inner
+Stellar transaction hash; fee-bump wrappers and base64 whitespace do not create
+new purchases. A stored claim binds it to trace, recipient, network, amount,
+asset and requirement settings before verification. Concurrent duplicates get
+409 with `Retry-After: 2`; cross-resource or changed-price reuse gets 409.
+
+States are `verifying → settling → settled → delivered`, with `failed` for
+known failures and `indeterminate` for timeouts or interrupted settlement.
+The durable transition runs outside SDK hooks because 2.26.0 logs thrown hook
+errors and can continue. No ledger write means no settlement attempt. Startup
+marks interrupted verifying/settling rows indeterminate; it never retries them.
+Operators must inspect/reconcile these against the chain before taking action.
+A settlement timeout returns 502 without content. Other SDK failures retain
+standard HTTP instructions and payment challenge headers.
+
+Settled/delivered retries return the original stored body and PAYMENT-RESPONSE
+without another facilitator call or gateway fetch. The original raw bytes are
+stored and hash-checked again on replay, so a changed registry record cannot
+change what was purchased. Retries expire at the original persisted deadline,
+bounded by transaction time bounds or maxTimeoutSeconds; expired payments get
+402. Finite ledger bounds and Soroban authorization expirations are checked
+against a live ledger on both first use and replay, using the corresponding
+`STELLAR_TESTNET_RPC_URL` or `STELLAR_MAINNET_RPC_URL`. Failure to obtain that
+anchor fails closed. Database/state conflicts are never auto-settled again.
+
+`GET /admin/payments/:paymentId` requires `Authorization: Bearer X402_ADMIN_TOKEN`
+and is disabled if unset. It returns purchase state and transaction/payer fields,
+with raw trace bytes, response content and requirement keys redacted. The SQLite
+file is permissioned to its owner and git-ignored. Back it up as sensitive
+purchase history. This design supports one service process; shared multi-instance
+locking, refunds and automatic indeterminate reconciliation remain separate work.

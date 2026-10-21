@@ -52,11 +52,7 @@ agents/sim/results/
 .idea/
 .DS_Store
 
-# Coverage output (scripts/coverage.sh). The thresholds and README are the
-# only tracked files in coverage/.
-coverage/*
-!coverage/thresholds.json
-!coverage/README.md
-
-# Python bytecode from the scripts/ helpers
-__pycache__/
+# Payment ledger, WAL and shared-memory files contain purchase records.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

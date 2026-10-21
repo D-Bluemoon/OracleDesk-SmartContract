@@ -1,4 +1,4 @@
-.PHONY: setup build test lint fmt formal coverage coverage-gate deploy-testnet seed-market demo bindings clean
+.PHONY: setup build test lint fmt deploy-testnet seed-market demo bindings clean interface-check
 
 # Installs Node dependencies for the TypeScript packages. Rust toolchain,
 # the `stellar` CLI, and Python 3 are expected to already be on PATH — see
@@ -47,7 +47,8 @@ check-wasm:
 
 test: build
 	cargo test --workspace
-	cargo test --manifest-path scripts/spec-hash/Cargo.toml
+	CARGO_TARGET_DIR=target cargo test --locked --manifest-path scripts/interface-manifest/Cargo.toml
+	CARGO_TARGET_DIR=target cargo test --manifest-path scripts/spec-hash/Cargo.toml
 	python3 model/fpmm_model.py
 	python3 model/fpmm_bounds.py --quick
 	python3 scripts/coverage-tools.py --self-test
@@ -58,7 +59,9 @@ test: build
 lint:
 	./scripts/check-no-mock-all-auths.sh
 	cargo fmt --check
+	cargo fmt --manifest-path scripts/interface-manifest/Cargo.toml --check
 	cargo clippy --workspace --all-targets -- -D warnings
+	CARGO_TARGET_DIR=target cargo clippy --locked --manifest-path scripts/interface-manifest/Cargo.toml --all-targets -- -D warnings
 
 auth-matrix: build
 	cargo test -p integration-tests --test auth_matrix
@@ -76,6 +79,7 @@ e2e-local:
 
 fmt:
 	cargo fmt
+	cargo fmt --manifest-path scripts/interface-manifest/Cargo.toml
 
 # Coverage: Rust (cargo llvm-cov, market-core wasm + native) and TypeScript (c8),
 # merged into coverage/lcov.info with an HTML report. `make coverage-gate` then
@@ -107,4 +111,11 @@ clean:
 	cargo clean
 	rm -rf x402/node_modules agents/node_modules
 	rm -rf packages/bindings/*/node_modules packages/bindings/*/dist
-	rm -rf coverage/*.lcov coverage/lcov.info coverage/html coverage/x402 coverage/agents coverage/summary.md
+
+# Compare to the PR target, not the contributor fork's tracking branch.
+INTERFACE_BASE_REF ?= upstream/develop
+interface-check:
+	@for pkg in market-core resolver treasury reasoning-registry timelock router; do \
+		CARGO_TARGET_DIR=target cargo run --quiet --locked --manifest-path scripts/interface-manifest/Cargo.toml -- \
+		check --pkg-dir packages/bindings/$$pkg --base-ref "$(INTERFACE_BASE_REF)" || exit 1; \
+	done

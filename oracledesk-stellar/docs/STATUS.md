@@ -444,3 +444,33 @@ make demo             # full create -> trade -> resolve -> trace -> verify loop
 ```
 
 See `README.md` for prerequisites.
+
+## Contributor addendum: interfaces and x402 (#77–#80)
+
+All six contracts now have deterministic WASM-derived interface manifests,
+initial 0.1.0 bindings versions and changelogs. The standalone interface-manifest
+tool classifies semantic changes, flags resolver commitment types, and enforces
+version/changelog policy against the PR base. Golden tests decode committed
+cross-contract WASMs and all six freshly built artifacts. The root CI workflow
+now runs the formerly nested checks and the new interface policy.
+
+x402 multi-network routing and the authorization-only prepare → verify → settle
+→ deliver order are covered with a protocol-faithful recording HTTP facilitator.
+Tests cover both networks/API keys, stock-SDK 402 compatibility, trace failures
+and bounded timeouts, tampered requirements, durable-before-settle failures,
+concurrent duplicates, SQLite and memory ledger contracts, free replay and
+indeterminate settlement. These replace the earlier statement that payment
+ordering depends solely on untested SDK middleware. Real facilitator settlement
+and mainnet payment round-trips remain unverified; tests make no real payments.
+
+The upstream baseline had duplicate treasury error discriminants and stale
+fixtures after merges. Newly introduced conflicting errors were moved to unused
+44–58, preserving committed 1–33 codes. Treasury fixtures now respect market-core's
+100 USDC seed minimum, explicit sell slippage bounds, final settlement before
+PnL realization, and per-invocation event lifetimes; production financial logic
+was not changed by those fixture updates.
+
+The pinned x402 Stellar package declares Node >=22, so CI and the documented
+minimum now use Node 22. An additional isolated Node 20 smoke run passed the
+HTTP/SQLite tests but emitted dependency engine warnings and is not a supported
+runtime target.

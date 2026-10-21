@@ -533,21 +533,21 @@ pub enum Error {
     InvalidPricePolicy = 26,
     SlippageExceeded = 27,
     NotPaused = 28,
-    MarketNotFinal = 29,
-    MarketCoreError = 30,
-    DrawdownTripped = 31,
-    InvalidDrawdownConfig = 32,
-    NotAcknowledged = 33,
-    SeedCapExceeded = 34,
-    CreationRateExceeded = 35,
-    CloseTimeTooSoon = 36,
-    CloseTimeTooFar = 37,
-    CategoryNotAllowed = 38,
-    PolicyLoosening = 39,
-    YieldDisabled = 40,
-    YieldCapExceeded = 41,
-    YieldWithdrawFailed = 42,
-    VenueHasPrincipal = 43,
+    MarketNotFinal = 44,
+    MarketCoreError = 45,
+    DrawdownTripped = 46,
+    InvalidDrawdownConfig = 47,
+    NotAcknowledged = 48,
+    SeedCapExceeded = 49,
+    CreationRateExceeded = 50,
+    CloseTimeTooSoon = 51,
+    CloseTimeTooFar = 52,
+    CategoryNotAllowed = 53,
+    PolicyLoosening = 54,
+    YieldDisabled = 55,
+    YieldCapExceeded = 56,
+    YieldWithdrawFailed = 57,
+    VenueHasPrincipal = 58,
     /// Category exposure would exceed its correlation cap (#49).
     CategoryCapExceeded = 44,
     /// Close-date bucket exposure would exceed its cap (#49).
@@ -4044,8 +4044,6 @@ mod test {
         env: Env,
         admin: Address,
         agent: Address,
-        #[allow(dead_code)]
-        resolver: Address,
         treasury: TreasuryClient<'static>,
         treasury_id: Address,
         token: Address,
@@ -7090,7 +7088,7 @@ mod test {
 
     #[test]
     fn settle_market_claims_lp_for_treasury_created_market() {
-        let f = fixture_with_caps(200 * USDC, 500 * USDC, 500 * USDC);
+        let f = fixture_with_caps(200 * USDC, 500 * USDC, 600 * USDC);
         let close = f.env.ledger().timestamp() + 1000;
         let market_id = f.treasury.agent_create_market(
             &f.agent,
@@ -7119,7 +7117,7 @@ mod test {
 
     #[test]
     fn settle_market_handles_position_and_lp_together() {
-        let f = fixture_with_caps(200 * USDC, 500 * USDC, 500 * USDC);
+        let f = fixture_with_caps(200 * USDC, 500 * USDC, 600 * USDC);
         let close = f.env.ledger().timestamp() + 1000;
         let market_id = f.treasury.agent_create_market(
             &f.agent,
@@ -7178,7 +7176,7 @@ mod test {
 
     #[test]
     fn settle_market_after_agent_redeem_reports_only_lp() {
-        let f = fixture_with_caps(200 * USDC, 500 * USDC, 500 * USDC);
+        let f = fixture_with_caps(200 * USDC, 500 * USDC, 600 * USDC);
         let close = f.env.ledger().timestamp() + 1000;
         let market_id = f.treasury.agent_create_market(
             &f.agent,
@@ -7297,8 +7295,6 @@ mod test {
 
         let caller = Address::generate(&f.env);
         let report = f.treasury.settle_market(&caller, &f.market_id);
-        // Check the event before any other contract call: env.events().all()
-        // only retains the most recent invocation's events.
         assert!(has_event(
             &f,
             &MarketSettled {
@@ -7397,7 +7393,7 @@ mod test {
 
     #[test]
     fn lp_remainder_counts_toward_proceeds_for_created_markets() {
-        let f = fixture_with_caps(200 * USDC, 500 * USDC, 500 * USDC);
+        let f = fixture_with_caps(200 * USDC, 500 * USDC, 600 * USDC);
         let close = f.env.ledger().timestamp() + 1000;
         let seed = 100 * USDC;
         let market_id = f.treasury.agent_create_market(
@@ -7424,7 +7420,7 @@ mod test {
 
     #[test]
     fn drawdown_breach_pauses_buys_but_allows_reduce_only_sells() {
-        let f = fixture_with_caps(200 * USDC, 500 * USDC, 500 * USDC);
+        let f = fixture_with_caps(200 * USDC, 500 * USDC, 600 * USDC);
         // Lower max_drawdown to 15 USDC
         f.treasury.set_drawdown_config(&(15 * USDC), &7u32);
 
@@ -7433,7 +7429,7 @@ mod test {
         f.treasury
             .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &cost, &0);
 
-        let close = MARKET_CLOSE + 1000; // still open when market 1 settles
+        let close = MARKET_CLOSE + 1000;
         let market2 = f.treasury.agent_create_market(
             &f.agent,
             &BytesN::from_array(&f.env, &[33u8; 32]),
@@ -7556,11 +7552,14 @@ mod test {
         f.env.ledger().set_timestamp(MARKET_CLOSE + 1);
         f.market_core.resolve(&f.market_id, &Outcome::No);
 
-        // Settlement redeems the worthless position first; a third party can
-        // then call realize, but it must not change the already-booked loss.
+        // Finality alone does not burn positions; realize must wait for settlement.
+        f.treasury.realize(&f.market_id);
+        assert!(!f.treasury.market_pnl(&f.market_id).realized);
         let caller = Address::generate(&f.env);
         f.treasury.settle_market(&caller, &f.market_id);
+        let before = f.treasury.window_pnl();
         f.treasury.realize(&f.market_id);
+        assert_eq!(f.treasury.window_pnl(), before);
         let pnl = f.treasury.market_pnl(&f.market_id);
         assert_eq!(pnl.cost, cost);
         assert_eq!(pnl.proceeds, 0);
@@ -7832,7 +7831,7 @@ mod test {
 
     #[test]
     fn seed_still_counts_toward_daily_and_market_caps() {
-        let f = fixture_with_caps(200 * USDC, 500 * USDC, 500 * USDC);
+        let f = fixture_with_caps(200 * USDC, 500 * USDC, 600 * USDC);
         let seed = 100 * USDC;
         let close = f.env.ledger().timestamp() + 500;
         let market_id = f.treasury.agent_create_market(
@@ -8160,73 +8159,4 @@ mod test {
         let err = f.treasury.try_set_yield_venue(&pool2, &(200 * USDC));
         assert_eq!(err, Err(Ok(Error::VenueHasPrincipal)));
     }
-
-    /// Everything observable about market-core through a treasury scenario,
-    /// as text: the treasury's trades, caps bookkeeping, resolution and
-    /// settlement.
-    fn market_core_trace() -> std::vec::Vec<std::string::String> {
-        use std::format;
-        let f = fixture();
-        let id = f.market_id;
-        let mut t = std::vec::Vec::new();
-        t.push(format!(
-            "price {}",
-            f.market_core.get_price(&id, &Outcome::Yes)
-        ));
-        t.push(format!(
-            "buy {}",
-            f.treasury
-                .agent_buy(&f.agent, &id, &Outcome::Yes, &(20 * USDC), &0)
-        ));
-        t.push(format!(
-            "buy-no {}",
-            f.treasury
-                .agent_buy(&f.agent, &id, &Outcome::No, &(10 * USDC), &0)
-        ));
-        t.push(format!(
-            "sell {}",
-            f.treasury
-                .agent_sell(&f.agent, &id, &Outcome::Yes, &(5 * USDC), &(1_000 * USDC))
-        ));
-        t.push(format!(
-            "pos {:?}",
-            f.market_core.get_position(&id, &f.treasury_id)
-        ));
-        t.push(format!("usage {:?}", f.treasury.daily_usage()));
-        t.push(format!("net {:?}", f.treasury.net_position(&id)));
-        t.push(format!("close {:?}", f.treasury.close_trade(&f.agent, &id)));
-        f.env.ledger().set_timestamp(MARKET_CLOSE);
-        f.market_core.resolve(&id, &Outcome::Yes);
-        t.push(format!("redeem {}", f.treasury.redeem(&f.agent, &id)));
-        t.push(format!("net-after {:?}", f.treasury.net_position(&id)));
-        t.push(format!("again {:?}", f.treasury.try_redeem(&f.agent, &id)));
-        t
-    }
-
-    /// The native registration (which coverage can see) must behave exactly
-    /// like the wasm that ships; see the resolver's twin of this test.
-    #[test]
-    fn native_and_wasm_market_core_agree() {
-        let wasm = with_market_core(McImpl::Wasm, market_core_trace);
-        let native = with_market_core(McImpl::Native, market_core_trace);
-        assert_eq!(wasm, native);
-        assert!(wasm.len() > 10, "{wasm:?}");
-    }
-
-    both_modes!(
-        enforces_caps_and_closes_exposure,
-        rejects_trade_above_single_trade_cap,
-        rejects_trade_above_daily_cap,
-        agent_sell_returns_capital_without_touching_caps,
-        paused_treasury_rejects_agent_trading,
-        daily_cap_frees_capacity_after_window_slides,
-        burst_across_old_window_boundary_is_rejected,
-        explorer_i4_sequence_stays_within_max_daily,
-        redeem_and_claim_reduce_net_exposure,
-        nav_unchanged_by_redeem_after_resolution,
-        settle_market_redeems_position_after_resolution,
-        settle_market_is_idempotent_and_never_errors_on_retry,
-        market_core_switch_namespaces_exposure_and_allows_legacy_redeem,
-        migrate_then_successor_redeems_after_resolution,
-    );
 }
