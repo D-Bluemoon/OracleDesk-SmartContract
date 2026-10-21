@@ -5388,6 +5388,19 @@ mod golden {
         }
     }
 
+    /// `Vec` order is part of the XDR, so the same signer set in another
+    /// order is a different commitment. Off-chain tooling (the market-maker's
+    /// `agents/core/spec.ts`, `scripts/seed-market.sh`) must hash and reveal
+    /// one canonical order: lexicographic strkey.
+    #[test]
+    fn signer_spec_hash_depends_on_signer_order() {
+        let env = Env::default();
+        let declared = hex_of(&env, &signers(&env, &[G1, G2, G3], 2, 3_600));
+        let canonical = hex_of(&env, &signers(&env, &[G3, G1, G2], 2, 3_600));
+        assert_eq!(declared, "4373448f97b0dd998a70efd9a1bfd3b3b8639bebaf682d9fc083c11f248a99ee");
+        assert_ne!(declared, canonical);
+    }
+
     #[test]
     fn golden_legacy_price_spec_hashes() {
         let env = Env::default();
