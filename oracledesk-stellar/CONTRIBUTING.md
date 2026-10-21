@@ -34,6 +34,7 @@ cargo test --workspace                          # all 4 contracts
 cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
 python3 model/fpmm_model.py                      # FPMM math property tests
 cd x402 && npm test                              # x402 trace API
+make formal                                      # TLC model check (needs Java)
 cd agents && npm test                            # FPMM (BigInt), trace, strategy, adapter
 ```
 
@@ -54,6 +55,31 @@ Contract changes need:
   build against an old interface. `make verify-wasm` proves the build is
   reproducible and the pins match a clean build. See
   [docs/adr/0002-cross-contract-calls.md](docs/adr/0002-cross-contract-calls.md).
+
+## Coverage
+
+```bash
+cargo install --locked cargo-llvm-cov --version 0.9.1 && rustup component add llvm-tools-preview
+make setup && make coverage     # coverage/lcov.info + coverage/html/index.html
+make coverage-gate              # enforce coverage/thresholds.json
+```
+
+CI uploads the same report as the `coverage` artifact and fails a PR when a
+package falls below its minimum in `coverage/thresholds.json` or drops more than
+0.5 points against `develop`. If you add tests that raise a package well above
+its minimum, raise the minimum in the same PR. See [coverage/README.md](coverage/README.md)
+for what is measured, why market-core is registered both as wasm and natively in
+the resolver and treasury tests (`MARKET_CORE_IMPL`, `both_modes!`), and how to
+read the numbers. Node 20.19+ or 22.12+ is required (c8).
+
+## Formal checks and exhaustive tests
+
+`make formal` model-checks the resolution lifecycle ([docs/formal/](docs/formal/README.md)),
+`python3 model/fpmm_bounds.py --quick` checks the FPMM economics claims
+([docs/fpmm-economics.md](docs/fpmm-economics.md)), and
+`cargo test -p integration-tests treasury_caps_exhaustive` searches the treasury's
+spending caps ([architecture.md](docs/architecture.md#treasury-cap-guarantees);
+about 2 minutes on 8 cores, `TREASURY_SEARCH_DEPTH=5` for a quick run).
 
 ## Code style
 

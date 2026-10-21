@@ -123,6 +123,57 @@ Key additions:
 - **Creation Policy (#47)**: `CreationPolicy` bounding `max_seed` independently of `max_trade`, rolling window creation rate limits, horizon constraints (`min_close_horizon`, `max_close_horizon`), and allowed categories bitmask. Tighten-only admin configuration updates.
 - **Blend Lending & JIT Liquidity (#48)**: Idle capital deployment to Blend pool, atomic shortfall withdrawal in `agent_buy` and `agent_create_market` via `ensure_liquid`, fail-closed error handling with `YieldWithdrawFailed`, and comprehensive capital views (`available_capital`, `liquid_capital`, `capital_breakdown`). Documented in `docs/adr/0006-blend-integration.md`.
 
+## Contributor addendum: 2026-10-20
+
+Verification tooling, no behaviour change in any contract: a TLA+ model of the
+resolution lifecycle (#73), proofs and executable checks for the FPMM economics
+(#74), coverage instrumentation with a gated CI report (#75), and a
+bounded-exhaustive search of the treasury's spending caps (#76). Implemented on
+`feat/issues-73-74-75-76-verification-coverage`.
+
+- **#73** `docs/formal/` (`make formal`): `resolver.tla` plus seven TLC configs.
+  Safety and liveness hold on the default configs; four documented
+  counterexamples (a cancelled proposal can strand a quorum, an Invalid quorum
+  displaces a pending proposal, the admin resolver swap bypasses the threshold,
+  a dishonest Invalid quorum defeats liveness). Two of the issue's suspected
+  findings are refuted by the current code (a guardian void before close; later
+  attestations resetting `proposed_at`). Nine `model_trace_*` resolver tests
+  replay the traces. Not modelled: bonded disputes, weighted keys, committee
+  rotation, hybrid fallback.
+- **#74** `docs/fpmm-economics.md`, `model/fpmm_bounds.py`: LP loss under YES, NO
+  and Void, rounding conservativeness, a no-risk-free-profit theorem and path
+  splitting, all checked exhaustively on small reserves and randomly up to
+  `MAX_SETS`; wired into `make test` (`--quick`).
+- **#75** `make coverage` / `make coverage-gate`, `coverage/`: Rust via
+  `cargo llvm-cov` with market-core registered as wasm *and* natively (resolver
+  and treasury tests, `MARKET_CORE_IMPL`, `both_modes!`), TypeScript via c8.
+  Measured line coverage: market-core 94.3%, resolver 68.8%, treasury 91.5%,
+  reasoning-registry 96.8%, router 94.1%, timelock 84.6%, x402 38.7%, agents 82.8%.
+- **#76** `contracts/integration-tests`, `docs/architecture.md` ("Treasury cap
+  guarantees"): the daily window is already a sliding window on `develop`, so the
+  expected 2x violation (I4) does not occur; the explorer reports I1-I9 and
+  atomicity holding to depth 6.
+
+Fixed along the way because nothing else could build or lint: the treasury's
+`Error` enum assigned codes 29-33 twice (PRs #173 and #179 merged independently),
+so `treasury` did not compile; the five later variants are now 44-48 (the
+committed treasury bindings were patched by hand for those five codes only).
+`cargo fmt --check` and `cargo clippy -D warnings` now pass.
+
+Verified in the contributor session: `cargo fmt --check`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace` (all pass
+**except 11 treasury tests that already fail on `develop`**, listed in the PR:
+`allocate_rejects_leaving_less_than_daily_cap_liquid`, the `settle_market_*`
+group, the realized-PnL group, `creation_rate_limit_blocks_n_plus_one_*`,
+`seed_still_counts_toward_daily_and_market_caps`, `partial_sells_*`,
+`drawdown_breach_*`, `lp_remainder_*`, `third_party_realize_*`; they fail
+identically with market-core native and with freshly rebuilt wasm), `make formal`,
+`python3 model/fpmm_bounds.py --full`, `make coverage`, and the treasury search
+at depth 6. **Not** verified: the committed bindings were not regenerated with the
+pinned Stellar CLI (a different version is installed locally), the vendored wasm
+was not refreshed, no testnet redeploy, and the nightly/coverage/formal GitHub
+workflows were not run on GitHub.
+
 ## Phase 0: recon and safety
 
 **Toolchain** (as installed in the environment this was built in):

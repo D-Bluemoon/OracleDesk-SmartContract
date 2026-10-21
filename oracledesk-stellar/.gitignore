@@ -41,6 +41,9 @@ deployments/traces-*/
 
 # Agent runtime state and single-instance lock (agents/runtime, docs/agent-runtime.md)
 .agent-state/
+# Market-maker resolution specs (agents/core/spec-store.ts). Losing one makes
+# its market unresolvable: keep AGENT_SPEC_DIR on backed-up storage, never in git.
+.specs/
 # Simulator output (agents/sim/cli.ts)
 agents/sim/results/
 
@@ -48,4 +51,12 @@ agents/sim/results/
 .vscode/
 .idea/
 .DS_Store
+
+# Coverage output (scripts/coverage.sh). The thresholds and README are the
+# only tracked files in coverage/.
+coverage/*
+!coverage/thresholds.json
+!coverage/README.md
+
+# Python bytecode from the scripts/ helpers
 __pycache__/
