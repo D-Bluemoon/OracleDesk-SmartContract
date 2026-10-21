@@ -3,6 +3,7 @@
  * Market Maker agent: polls signal sources, decides whether a signal is
  * confident enough to seed a market, builds and records a reasoning trace,
  * and (in "live" mode) creates the market through the treasury.
+ * Skips markets whose question_hash already exists on-chain.
  *
  * Defaults to dry-run. Set AGENT_MODE=live and MAKER_SECRET_KEY (or the
  * shared AGENT_SECRET_KEY) to submit real testnet transactions — see
@@ -10,9 +11,13 @@
  */
 import "dotenv/config";
 import { createHash } from "node:crypto";
-import { buildTrace, LocalTraceStore } from "../core/trace.js";
+import { buildTrace, LocalTraceStore, NO_MARKET } from "../core/trace.js";
 import { decideMarketProposal, type MarketSignal, type SignalSource } from "../core/strategy.js";
 import { agentCredentials, loadDeployments, StellarAdapter } from "../stellar/adapter.js";
+import { ChainStateReader } from "../core/state/reader.js";
+import { SnapshotCache } from "../core/state/cache.js";
+import { existingQuestionHashes } from "../core/state/select.js";
+import { Server } from "@stellar/stellar-sdk/rpc";
 
 /** Placeholder signal source until a real one (news, an oracle feed, a
  * comparable market) is wired in — see docs/wave-issues for that as an
@@ -44,7 +49,20 @@ async function main() {
   });
   const traceStore = new LocalTraceStore(process.env.TRACE_STORE_DIR ?? "./.traces");
 
-  console.log(`[market-maker] mode=${mode}`);
+  // Load chain state to check for duplicate question hashes
+  const rpcUrl = process.env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org";
+  const server = new Server(rpcUrl);
+  const stateReader = new ChainStateReader({
+    marketContractId: deployments.market_contract ?? "",
+    portfolioContractId: deployments.portfolio_contract ?? "",
+    server,
+  });
+  const cache = new SnapshotCache();
+  const snapshot = await cache.get(() => stateReader.readSnapshot([]));
+  const knownHashes = existingQuestionHashes(snapshot);
+
+  console.log(`[market-maker] mode=${mode}, known markets=${knownHashes.size}`);
+
   const signals = await demoSignalSource.poll();
   for (const signal of signals) {
     const decision = decideMarketProposal(signal, {
@@ -53,6 +71,15 @@ async function main() {
     });
     console.log(`[market-maker] ${decision.action}: ${decision.reasoning}`);
     if (decision.action === "skip") continue;
+
+    const questionHash = createHash("sha256").update(decision.question!).digest();
+    const questionHashHex = questionHash.toString("hex");
+
+    // Skip if this question already has a market on-chain
+    if (knownHashes.has(questionHashHex)) {
+      console.log(`[market-maker] skipping duplicate question_hash=${questionHashHex}`);
+      continue;
+    }
 
     const built = buildTrace({
       agent: "market-maker",
@@ -64,12 +91,6 @@ async function main() {
     const { cid } = await traceStore.put(built.hash, built.json);
     console.log(`[market-maker] trace ${built.hash} -> ${cid}`);
 
-    const questionHash = createHash("sha256").update(decision.question!).digest();
-    // Resolution spec left to reveal later, once the maker decides how this
-    // market will actually be resolved — see scripts/seed-market.sh and
-    // docs/adr/0001-resolution-commitment.md for the real flow. This CLI
-    // stops short of that: it demonstrates the decision + trace-recording
-    // half of the loop.
     const placeholderResolutionHash = createHash("sha256").update("unrevealed").digest();
 
     const result = await adapter.agentCreateMarket({
@@ -84,14 +105,24 @@ async function main() {
     console.log("[market-maker] agent_create_market:", result);
 
     if (!result.dryRun) {
-      const traceResult = await adapter.publishTrace({
+      // Record proposal trace prior to creation using NO_MARKET sentinel (#55)
+      const proposalResult = await adapter.publishTrace({
         agent: adapter.agent,
-        market_id: result.value,
-        action: "create_market",
+        market_id: NO_MARKET,
+        action: { tag: "ProposeMarket", values: undefined },
         trace_hash: Buffer.from(built.hash, "hex"),
         ipfs_cid: cid,
       });
-      console.log("[market-maker] publish_trace:", traceResult);
+      console.log("[market-maker] publish_trace (propose_market):", proposalResult);
+
+      const traceResult = await adapter.publishTrace({
+        agent: adapter.agent,
+        market_id: result.value,
+        action: { tag: "CreateMarket", values: undefined },
+        trace_hash: Buffer.from(built.hash, "hex"),
+        ipfs_cid: cid,
+      });
+      console.log("[market-maker] publish_trace (create_market):", traceResult);
     }
   }
 }

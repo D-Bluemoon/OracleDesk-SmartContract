@@ -22,7 +22,18 @@ use soroban_sdk::{
 mod market_core {
     soroban_sdk::contractimport!(file = "market_core.wasm");
 }
-use market_core::{Client as MarketCoreClient, Outcome};
+use market_core::Client as MarketCoreClient;
+
+// The resolution-spec surface is XDR-consensus-critical (`resolution_hash =
+// sha256(spec.to_xdr())`), so its definitions now live in the shared
+// `oracledesk-types` crate rather than being duplicated per contract. Re-export
+// them so existing `resolver::PriceConfig` etc. paths (and `scripts/spec-hash`)
+// keep working.
+pub use oracledesk_types::{
+    CommitteeRef, DisputableSignerConfig, Escalation, HybridConfig, OracleAsset, Outcome,
+    PriceConfig, PriceData, PriceDirection, ResolutionSpec, ResolutionSpecV2, SignerConfig,
+    WeightedKey, WeightedKeyConfig,
+};
 
 #[allow(clippy::too_many_arguments)]
 mod reasoning_registry {
@@ -69,29 +80,6 @@ pub const SIGNER_GRACE_SECS: u64 = 7 * 86_400;
 pub const MAX_CANCELS_PER_MARKET: u32 = 2;
 
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OracleAsset {
-    Stellar(Address),
-    Other(Symbol),
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PriceData {
-    pub price: i128,
-    pub timestamp: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PriceDirection {
-    Above,
-    AtOrAbove,
-    Below,
-    AtOrBelow,
-}
-
-#[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolutionState {
     Unconfigured,
@@ -119,24 +107,6 @@ pub enum ExpiryMode {
     Unrevealed,
     Price,
     Signers,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PriceConfig {
-    pub reflector: Address,
-    pub asset: OracleAsset,
-    pub threshold: i128,
-    pub direction: PriceDirection,
-    pub max_staleness: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SignerConfig {
-    pub signers: Vec<Address>,
-    pub threshold: u32,
-    pub dispute_window: u64,
 }
 
 /// Legacy proposal shape, stored under [`DataKey::Proposal`]. Only read (as a
@@ -200,33 +170,6 @@ pub struct PriceSnapshot {
     pub taken_by: Address,
 }
 
-/// Who rules on a dispute.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Escalation {
-    /// The resolver admin, through `settle_dispute`.
-    Guardian,
-    /// `k` of these members, through `escalation_attest`. Must be disjoint
-    /// from the proposing signers.
-    Committee(Vec<Address>, u32),
-}
-
-/// Attested resolution whose proposal can be challenged with a bond during
-/// the dispute window. Hashed as `ResolutionSpec::SignersDisputable`, a
-/// separate variant, so existing `Signers` commitments are unaffected.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DisputableSignerConfig {
-    pub signers: Vec<Address>,
-    pub threshold: u32,
-    pub dispute_window: u64,
-    /// Collateral escrowed by `dispute`; must be positive.
-    pub dispute_bond: i128,
-    pub escalation: Escalation,
-    /// Seconds after a dispute opens before anyone may void it unresolved.
-    pub escalation_timeout: u64,
-}
-
 /// The escalation authority's ruling. `Invalid` voids the market.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -252,25 +195,6 @@ pub struct Dispute {
     pub payee: Option<Address>,
 }
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WeightedKey {
-    /// Raw Ed25519 public key. For a `G...` account address this is
-    /// `StrKey.decodeEd25519PublicKey(address)`; `C...` addresses have none.
-    pub pubkey: BytesN<32>,
-    pub weight: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WeightedKeyConfig {
-    pub signers: Vec<WeightedKey>,
-    /// Total weight that must sign one outcome. Choose it above half the total
-    /// weight so two outcomes can never both reach it.
-    pub weight_threshold: u32,
-    pub dispute_window: u64,
-}
-
 /// Reusable committee managed by an admin under time-locked rotation rules.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -289,25 +213,6 @@ pub struct PendingRotation {
     pub members: Vec<Address>,
     pub threshold: u32,
     pub executable_at: u64,
-}
-
-/// Binds a market to a reusable committee registry subject to rotation bounds.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommitteeRef {
-    pub committee_id: u64,
-    pub min_epoch: u32,
-    pub max_rotation_delta: u32,
-    pub dispute_window: u64,
-}
-
-/// Dual-path resolution mode: price feed first, falling back to signers.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HybridConfig {
-    pub price: PriceConfig,
-    pub fallback: SignerConfig,
-    pub fallback_after: u64,
 }
 
 /// Evidence policy governing whether attestation evidence is required.
@@ -354,41 +259,12 @@ pub enum GuardianActionKind {
     CancelProposal,
 }
 
-/// The full resolution rule a market's `resolution_hash` commits to. Hashing
-/// this (rather than the bare `PriceConfig`/`SignerConfig`) keeps the two
-/// modes in disjoint hash spaces even if their field encodings could
-/// otherwise collide. See `docs/adr/0001-resolution-commitment.md`.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ResolutionSpec {
-    Price(PriceConfig),
-    Signers(SignerConfig),
-    WeightedKeys(WeightedKeyConfig),
-    SignersDisputable(DisputableSignerConfig),
-    Committee(CommitteeRef),
-    Hybrid(HybridConfig),
-}
-
 /// Domain tag prepended to a [`ResolutionSpecV2`] before hashing. Every legacy
 /// preimage is the XDR of an `ScVal` and so starts with the bytes `00 00 00 10`
 /// (`ScValType::Vec`), never with ASCII, which keeps the two hash spaces
 /// disjoint. See `docs/adr/0004-spec-versioning.md`.
 pub const SPEC_DOMAIN: &str = "oracledesk:resolution-spec";
 const SPEC_V2_VERSION: u32 = 2;
-
-/// Versioned commitment envelope. Unlike a bare [`ResolutionSpec`] it binds the
-/// network and the market-core instance, and carries a creator-chosen `salt`
-/// that makes a pre-reveal brute-force of the (low-entropy) rule infeasible.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResolutionSpecV2 {
-    pub version: u32,
-    /// `sha256(network passphrase)`, i.e. `env.ledger().network_id()`.
-    pub network_id: BytesN<32>,
-    pub market_core: Address,
-    pub salt: BytesN<32>,
-    pub rule: ResolutionSpec,
-}
 
 /// Hash a legacy commitment is checked against: `sha256(XDR(rule))`.
 pub fn legacy_spec_hash(env: &Env, rule: &ResolutionSpec) -> BytesN<32> {
@@ -1050,7 +926,9 @@ impl Resolver {
             return Err(Error::AlreadyFinalized);
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
+        let market = core_call(
+            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
+        )?;
         let now = env.ledger().timestamp();
         let fallback_deadline = market.close_time.saturating_add(config.fallback_after);
         if now < fallback_deadline {
@@ -1066,7 +944,7 @@ impl Resolver {
                     &outcome,
                     &data,
                     from_snapshot,
-                );
+                )?;
                 Ok(())
             }
             Err(err) => {
@@ -1139,7 +1017,11 @@ impl Resolver {
         let Ok(market_core) = Self::instance_get::<Address>(&env, DataKey::MarketCore) else {
             return reasons;
         };
-        let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
+        let Ok(market) =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))
+        else {
+            return reasons;
+        };
         let now = env.ledger().timestamp();
         let storage = env.storage().persistent();
 
@@ -1255,7 +1137,7 @@ impl Resolver {
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
         let core = MarketCoreClient::new(&env, &market_core);
-        let market = core.get_market(&market_id);
+        let market = core_call(core.try_get_market(&market_id))?;
         let now = env.ledger().timestamp();
 
         if reason != GuardianReason::DisputeUpheld && now < market.close_time {
@@ -1318,7 +1200,7 @@ impl Resolver {
             }
         }
 
-        core.void_market(&market_id);
+        core_call(core.try_void_market(&market_id))?;
         Self::refund_open_dispute(&env, market_id);
         Self::set_state(&env, market_id, ResolutionState::Finalized);
         GuardianAction {
@@ -1342,7 +1224,9 @@ impl Resolver {
             return Err(Error::WrongMode);
         };
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
+        let market = core_call(
+            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
+        )?;
         if env.ledger().timestamp() < market.close_time {
             return Err(Error::MarketNotClosed);
         }
@@ -1370,7 +1254,7 @@ impl Resolver {
             &outcome,
             &data,
             from_snapshot,
-        );
+        )?;
         Ok(outcome)
     }
 
@@ -1391,7 +1275,9 @@ impl Resolver {
         caller.require_auth();
         let config = Self::price_config(&env, market_id)?;
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
+        let market = core_call(
+            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
+        )?;
         let now = env.ledger().timestamp();
         if now < market.close_time {
             return Err(Error::MarketNotClosed);
@@ -1435,7 +1321,9 @@ impl Resolver {
     /// is known before (and without) a spec reveal.
     pub fn resolution_deadline(env: Env, market_id: u64) -> Result<u64, Error> {
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
+        let market = core_call(
+            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
+        )?;
         Ok(Self::deadline(&market))
     }
 
@@ -1455,7 +1343,7 @@ impl Resolver {
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
         let core = MarketCoreClient::new(&env, &market_core);
-        let market = core.get_market(&market_id);
+        let market = core_call(core.try_get_market(&market_id))?;
         let deadline = Self::deadline(&market);
         if env.ledger().timestamp() < deadline {
             return Err(Error::DeadlineNotReached);
@@ -1474,7 +1362,7 @@ impl Resolver {
                             &outcome,
                             &data,
                             from_snapshot,
-                        );
+                        )?;
                         return Ok(());
                     }
                     // Only an unusable feed lets the market expire; any other
@@ -1489,7 +1377,7 @@ impl Resolver {
             ExpiryMode::Signers | ExpiryMode::Unrevealed => {}
         }
 
-        core.void_market(&market_id);
+        core_call(core.try_void_market(&market_id))?;
         Self::set_state(&env, market_id, ResolutionState::Expired);
         MarketExpired {
             market_id,
@@ -1563,7 +1451,9 @@ impl Resolver {
             return Err(Error::StaleRound);
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = MarketCoreClient::new(&env, &market_core).get_market(&market_id);
+        let market = core_call(
+            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
+        )?;
         if env.ledger().timestamp() < market.close_time {
             return Err(Error::MarketNotClosed);
         }
@@ -1628,9 +1518,9 @@ impl Resolver {
         let core = MarketCoreClient::new(&env, &market_core);
         let now = env.ledger().timestamp();
         match proposal.outcome.to_market() {
-            Some(outcome) => core.resolve(&market_id, &outcome),
+            Some(outcome) => core_call(core.try_resolve(&market_id, &to_core_outcome(&outcome)))?,
             None => {
-                core.void_market(&market_id);
+                core_call(core.try_void_market(&market_id))?;
                 CommitteeVoided {
                     market_id,
                     finalized_at: now,
@@ -1687,9 +1577,7 @@ impl Resolver {
         }
 
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let token = MarketCoreClient::new(&env, &market_core)
-            .get_config()
-            .collateral;
+        let token = core_call(MarketCoreClient::new(&env, &market_core).try_get_config())?.collateral;
         token::Client::new(&env, &token).transfer(
             &disputer,
             env.current_contract_address(),
@@ -1768,7 +1656,7 @@ impl Resolver {
             return Err(Error::DeadlineNotReached);
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        MarketCoreClient::new(&env, &market_core).void_market(&market_id);
+        core_call(MarketCoreClient::new(&env, &market_core).try_void_market(&market_id))?;
         Self::refund_open_dispute(&env, market_id);
         Self::set_state(&env, market_id, ResolutionState::Finalized);
         DisputeSettled {
@@ -1923,12 +1811,12 @@ impl Resolver {
                 Verdict::Invalid => AttestedOutcome::Invalid,
             };
         match verdict {
-            Verdict::Yes => core.resolve(&market_id, &Outcome::Yes),
-            Verdict::No => core.resolve(&market_id, &Outcome::No),
-            Verdict::Invalid => core.void_market(&market_id),
+            Verdict::Yes => core_call(core.try_resolve(&market_id, &market_core::Outcome::Yes))?,
+            Verdict::No => core_call(core.try_resolve(&market_id, &market_core::Outcome::No))?,
+            Verdict::Invalid => core_call(core.try_void_market(&market_id))?,
         }
         dispute.payee = Some(if upheld {
-            core.get_config().treasury
+            core_call(core.try_get_config())?.treasury
         } else {
             dispute.disputer.clone()
         });
@@ -2288,8 +2176,11 @@ impl Resolver {
         outcome: &Outcome,
         data: &PriceData,
         from_snapshot: bool,
-    ) {
-        MarketCoreClient::new(env, market_core).resolve(&market_id, outcome);
+    ) -> Result<(), Error> {
+        core_call(
+            MarketCoreClient::new(env, market_core)
+                .try_resolve(&market_id, &to_core_outcome(outcome)),
+        )?;
         Self::set_state(env, market_id, ResolutionState::Finalized);
         PriceResolution {
             market_id,
@@ -2306,6 +2197,7 @@ impl Resolver {
             from_snapshot,
         }
         .publish(env);
+        Ok(())
     }
 
     fn contains(list: &Vec<Address>, address: &Address) -> bool {
@@ -2500,7 +2392,9 @@ impl Resolver {
             .unwrap_or(EvidencePolicy::Disabled);
 
         let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
-        let market = MarketCoreClient::new(env, &market_core).get_market(&market_id);
+        let market = core_call(
+            MarketCoreClient::new(env, &market_core).try_get_market(&market_id),
+        )?;
         // Before any write: this is what keeps an `Invalid` proposal (and so
         // `void_market`, which has no close-time guard) from existing before
         // close.
@@ -2518,8 +2412,14 @@ impl Resolver {
             if storage.has(&DataKey::EvidenceUsed(trace_id)) {
                 return Err(Error::EvidenceAlreadyUsed);
             }
-            let Ok(Ok(trace)) = RegistryClient::new(env, &registry).try_get_trace(&trace_id) else {
-                return Err(Error::EvidenceNotFound);
+            let trace = match registry_call(
+                RegistryClient::new(env, &registry).try_get_trace(&trace_id),
+            ) {
+                Ok(trace) => trace,
+                // A missing trace (or a registry that cannot be read) is the
+                // same caller-facing condition: the cited evidence is not
+                // available. The registry's own numeric code is never leaked.
+                Err(_) => return Err(Error::EvidenceNotFound),
             };
             if trace.agent != signer {
                 return Err(Error::EvidenceAuthorMismatch);
@@ -2606,7 +2506,9 @@ impl Resolver {
         commitment: &BytesN<32>,
     ) -> Result<(), Error> {
         let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
-        let market = MarketCoreClient::new(env, &market_core).get_market(&market_id);
+        let market = core_call(
+            MarketCoreClient::new(env, &market_core).try_get_market(&market_id),
+        )?;
         if *commitment != market.resolution_hash {
             return Err(Error::SpecHashMismatch);
         }
@@ -5371,6 +5273,51 @@ fn bytes_to_vec(bytes: &Bytes) -> std::vec::Vec<u8> {
     let mut out = std::vec![0u8; bytes.len() as usize];
     bytes.copy_into_slice(&mut out);
     out
+}
+
+/// Proves the shared `oracledesk-types` definitions encode byte-for-byte the
+/// same as the types `contractimport!` generates from the vendored
+/// `market_core.wasm` spec. If a field or variant is ever renamed on one side
+/// only, this fails instead of silently changing the cross-contract ABI.
+#[cfg(test)]
+mod shared_types {
+    use super::*;
+    use soroban_sdk::xdr::ToXdr;
+
+    #[test]
+    fn shared_types_are_byte_identical_to_imported_wasm_types() {
+        let env = Env::default();
+        for (shared, imported) in [
+            (Outcome::Yes, market_core::Outcome::Yes),
+            (Outcome::No, market_core::Outcome::No),
+        ] {
+            assert_eq!(shared.to_xdr(&env), imported.to_xdr(&env));
+        }
+        for (shared, imported) in [
+            (oracledesk_types::Category::Crypto, market_core::Category::Crypto),
+            (oracledesk_types::Category::Macro, market_core::Category::Macro),
+            (
+                oracledesk_types::Category::Geopolitics,
+                market_core::Category::Geopolitics,
+            ),
+            (oracledesk_types::Category::Sports, market_core::Category::Sports),
+            (
+                oracledesk_types::Category::Culture,
+                market_core::Category::Culture,
+            ),
+            (oracledesk_types::Category::Other, market_core::Category::Other),
+        ] {
+            assert_eq!(shared.to_xdr(&env), imported.to_xdr(&env));
+        }
+        assert_eq!(
+            oracledesk_types::MarketStatus::Resolved(Outcome::Yes).to_xdr(&env),
+            market_core::MarketStatus::Resolved(market_core::Outcome::Yes).to_xdr(&env)
+        );
+        assert_eq!(
+            oracledesk_types::MarketStatus::Void.to_xdr(&env),
+            market_core::MarketStatus::Void.to_xdr(&env)
+        );
+    }
 }
 
 /// Pins the exact bytes behind every legacy `resolution_hash`. A change to

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "contracts/oracledesk-types",
     "contracts/market-core",
     "contracts/resolver",
     "contracts/reasoning-registry",

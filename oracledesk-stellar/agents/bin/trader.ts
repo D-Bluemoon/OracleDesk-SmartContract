@@ -1,6 +1,6 @@
 #!/usr/bin/env -S npx tsx
 /**
- * Trader agent: reads a market's current implied price, compares it to a
+ * Trader agent: reads live chain state, compares implied price to a
  * fair-value estimate, and trades the mispricing if the edge clears the
  * configured threshold. Every trade is preceded by a recorded trace.
  *
@@ -20,16 +20,11 @@ import { buildTrace, LocalTraceStore } from "../core/trace.js";
 import { BPS } from "../core/fpmm.js";
 import { decideTrade, type MarketState } from "../core/strategy.js";
 import { agentCredentials, loadDeployments, StellarAdapter } from "../stellar/adapter.js";
-
-/** Placeholder in place of a real market read + reference-price lookup —
- * see docs/wave-issues for wiring get_market/get_price and a
- * ReferencePriceSource as open issues. */
-async function fetchMarketAndFairValue(): Promise<{ market: MarketState; fairValueBps: number }> {
-  return {
-    market: { marketId: 0, question: "demo", yesBps: 4000, closeTime: Math.floor(Date.now() / 1000) + 3600 },
-    fairValueBps: 6000,
-  };
-}
+import { ChainStateReader } from "../core/state/reader.js";
+import { SnapshotCache } from "../core/state/cache.js";
+import { tradableMarkets, availableCapital } from "../core/state/select.js";
+import { toMarketState } from "../core/state/types.js";
+import { Server } from "@stellar/stellar-sdk/rpc";
 
 /**
  * Exported (and injectable) so tests can drive the whole trade flow with a
@@ -41,71 +36,97 @@ export async function main(
   now: () => number = () => Math.floor(Date.now() / 1000),
 ): Promise<void> {
   const traceStore = new LocalTraceStore(env.TRACE_STORE_DIR ?? "./.traces");
+  const deployments = adapter.deployments ?? {};
+
+  const rpcUrl = env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org";
+  const server = new Server(rpcUrl);
+  const stateReader = new ChainStateReader({
+    marketContractId: deployments.market_contract ?? "",
+    portfolioContractId: deployments.portfolio_contract ?? "",
+    server,
+  });
+  const cache = new SnapshotCache();
 
   console.log(`[trader] mode=${adapter.mode}`);
-  const { market, fairValueBps } = await fetchMarketAndFairValue();
-  const decision = decideTrade(market, fairValueBps, {
-    minEdgeBps: Number(env.MIN_EDGE_BPS ?? 500),
-    tradeSizeStroops: BigInt(env.TRADE_SIZE_STROOPS ?? "100000000"),
-  });
-  console.log(`[trader] ${decision.action}: ${decision.reasoning}`);
-  if (decision.action === "skip") return;
 
-  const built = buildTrace({
-    agent: "trader",
-    marketId: market.marketId,
-    action: "buy",
-    reasoning: decision.reasoning,
-    inputs: { market, fairValueBps, decision },
-  });
-  const { cid } = await traceStore.put(built.hash, built.json);
-  console.log(`[trader] trace ${built.hash} -> ${cid}`);
+  const snapshot = await cache.get(() => stateReader.readSnapshot([]));
 
-  const outcome = { tag: decision.outcome!, values: undefined } as {
-    tag: "Yes" | "No";
-    values: void;
-  };
-  const collateralInStroops = decision.collateralInStroops!;
+  if (!snapshot.consistent) {
+    console.warn(`[trader] ledger drift ${snapshot.ledgers.max - snapshot.ledgers.min} — snapshot may be inconsistent`);
+  }
 
-  // Fresh quote -> non-zero bounds. The quote is a read-only simulation,
-  // so this runs in dry-run mode too and the same code path is exercised
-  // before any real submission.
-  const quotedShares = await adapter.quoteBuy({
-    market_id: BigInt(market.marketId),
-    outcome,
-    collateral_in: collateralInStroops,
-  });
-  const slippageBps = BigInt(env.SLIPPAGE_BPS ?? 50);
-  const minSharesOut = (quotedShares * (BPS - slippageBps)) / BPS;
-  // Never pay more than fair for the outcome being bought: for a YES buy
-  // that is `fairValueBps`; for a NO buy it is the complement, since the
-  // contract compares the limit against the average price of the outcome
-  // being bought (the NO price).
-  const limitPriceBps = decision.outcome === "Yes" ? fairValueBps : Number(BPS) - fairValueBps;
-  const deadline = BigInt(now() + Number(env.DEADLINE_SECS ?? 60));
-  console.log(
-    `[trader] quote ${quotedShares} shares -> min_shares_out=${minSharesOut} limit_price_bps=${limitPriceBps} deadline=${deadline}`,
-  );
+  const markets = tradableMarkets(snapshot);
+  if (markets.length === 0) {
+    console.log("[trader] no tradable markets on-chain");
+    return;
+  }
 
-  const result = await adapter.agentBuyV2({
-    market_id: BigInt(market.marketId),
-    outcome,
-    collateral_in: collateralInStroops,
-    min_shares_out: minSharesOut,
-    limit_price_bps: limitPriceBps,
-    deadline,
-  });
-  console.log("[trader] agent_buy_v2:", result);
+  const capital = availableCapital(snapshot);
+  const tradeSizeStroops = BigInt(env.TRADE_SIZE_STROOPS ?? "100000000");
+  if (capital < tradeSizeStroops) {
+    console.log(`[trader] insufficient capital: ${capital} < ${tradeSizeStroops}`);
+    return;
+  }
 
-  if (!result.dryRun) {
-    const traceResult = await adapter.publishTrace({
-      agent: adapter.agent,
-      market_id: BigInt(market.marketId),
-      action: "buy",
-      trace_hash: Buffer.from(built.hash, "hex"),
-      ipfs_cid: cid,
+  for (const chainMarket of markets) {
+    const market: MarketState = toMarketState(chainMarket);
+    // Fair value: use env override or default to complement of current price
+    // (the agent holds no external oracle right now — strategy.ts decides edge)
+    const fairValueBps = Number(env.FAIR_VALUE_BPS ?? String(market.yesBps));
+
+    const decision = decideTrade(market, fairValueBps, {
+      minEdgeBps: Number(env.MIN_EDGE_BPS ?? 500),
+      tradeSizeStroops,
     });
-    console.log("[trader] publish_trace:", traceResult);
+    console.log(`[trader] market=${market.marketId} ${decision.action}: ${decision.reasoning}`);
+    if (decision.action === "skip") continue;
+
+    const built = buildTrace({
+      agent: "trader",
+      marketId: market.marketId,
+      action: "buy",
+      reasoning: decision.reasoning,
+      inputs: { market, fairValueBps, decision },
+    });
+    const { cid } = await traceStore.put(built.hash, built.json);
+    console.log(`[trader] trace ${built.hash} -> ${cid}`);
+
+    const outcome = decision.outcome as "Yes" | "No";
+    const collateralInStroops = decision.tradeSizeStroops!;
+
+    const quotedShares = await adapter.quoteBuy({
+      market_id: BigInt(market.marketId),
+      outcome,
+      collateral_in: collateralInStroops,
+    });
+    const slippageBps = BigInt(env.SLIPPAGE_BPS ?? 50);
+    const minSharesOut = (quotedShares * (BPS - slippageBps)) / BPS;
+    const limitPriceBps = decision.outcome === "Yes" ? fairValueBps : Number(BPS) - fairValueBps;
+    const deadline = BigInt(now() + Number(env.DEADLINE_SECS ?? 60));
+    console.log(
+      `[trader] quote ${quotedShares} shares -> min_shares_out=${minSharesOut} limit_price_bps=${limitPriceBps} deadline=${deadline}`,
+    );
+
+    const result = await adapter.agentBuyV2({
+      market_id: BigInt(market.marketId),
+      outcome,
+      collateral_in: collateralInStroops,
+      min_shares_out: minSharesOut,
+      limit_price_bps: limitPriceBps,
+      deadline,
+    });
+    console.log("[trader] agent_buy_v2:", result);
+
+    if (!result.dryRun) {
+      const traceResult = await adapter.publishTrace({
+        agent: adapter.agent,
+        market_id: BigInt(market.marketId),
+        action: "buy",
+        trace_hash: Buffer.from(built.hash, "hex"),
+        ipfs_cid: cid,
+      });
+      console.log("[trader] publish_trace:", traceResult);
+    }
   }
 }
 

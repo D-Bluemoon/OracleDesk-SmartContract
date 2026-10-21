@@ -14,8 +14,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+
+      # The toolchain is pinned in rust-toolchain.toml and the Stellar CLI in
+      # stellar-cli.version (#58); read both so there is one checked-in source
+      # of truth instead of a repo variable with a fallback.
+      - name: Read pinned toolchain versions
+        id: pinned
+        run: |
+          echo "rust=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "stellar_cli=$(tr -d '[:space:]' < stellar-cli.version)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.pinned.outputs.rust }}
           targets: wasm32v1-none
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -24,7 +35,7 @@ jobs:
       # (`cargo install stellar-cli` — verified against the actual crate
       # name behind the `stellar` binary, not a guessed GitHub Action).
       - name: Install stellar CLI
-        run: cargo install --locked stellar-cli --version ${{ vars.STELLAR_CLI_VERSION || '27.1.0' }}
+        run: cargo install --locked stellar-cli --version ${{ steps.pinned.outputs.stellar_cli }}
 
       - name: cargo fmt --check
         run: cargo fmt --check
@@ -38,30 +49,53 @@ jobs:
       - name: Build all contracts to wasm
         run: |
           stellar contract build
-          cp target/wasm32v1-none/release/market_core.wasm contracts/resolver/market_core.wasm
-          cp target/wasm32v1-none/release/market_core.wasm contracts/treasury/market_core.wasm
-          cp target/wasm32v1-none/release/reasoning_registry.wasm contracts/resolver/reasoning_registry.wasm
-          cp target/wasm32v1-none/release/market_core.wasm contracts/router/market_core.wasm
-          cp target/wasm32v1-none/release/resolver.wasm contracts/router/resolver.wasm
-          cp target/wasm32v1-none/release/reasoning_registry.wasm contracts/router/reasoning_registry.wasm
-          cp target/wasm32v1-none/release/resolver.wasm contracts/treasury/resolver.wasm
+          ./scripts/sync-vendored-wasm.sh
           stellar contract build
 
-      - name: Fail if vendored wasm drifted from the build
+      - name: Fail if vendored wasm or its hash pin drifted from the build
         run: |
           git diff --exit-code -- \
             contracts/resolver/market_core.wasm \
             contracts/treasury/market_core.wasm \
-            contracts/treasury/resolver.wasm \
             contracts/resolver/reasoning_registry.wasm \
-            contracts/router/market_core.wasm \
-            contracts/router/resolver.wasm \
-            contracts/router/reasoning_registry.wasm
+            contracts/resolver/market_core.wasm.sha256 \
+            contracts/treasury/market_core.wasm.sha256 \
+            contracts/resolver/reasoning_registry.wasm.sha256
+
+      - name: A stale vendored wasm is a compile error (#58 negative test)
+        run: ./scripts/ci/assert-stale-wasm-fails.sh
 
       - uses: actions/upload-artifact@v4
         with:
           name: contract-wasm
           path: target/wasm32v1-none/release/*.wasm
+
+  reproducible-wasm:
+    name: Reproducible wasm (two clean builds)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned toolchain versions
+        id: pinned
+        run: |
+          echo "rust=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "stellar_cli=$(tr -d '[:space:]' < stellar-cli.version)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pinned.outputs.rust }}
+          targets: wasm32v1-none
+
+      - name: Install stellar CLI
+        run: cargo install --locked stellar-cli --version ${{ steps.pinned.outputs.stellar_cli }}
+
+      # Builds the workspace twice into separate target directories, compares
+      # every wasm byte-for-byte, then checks the vendored copies against a
+      # clean build. This is what makes the "vendored wasm drifted" check
+      # meaningful: without reproducibility it would fail on noise (#58).
+      - name: Prove the build is deterministic
+        run: ./scripts/check-wasm-determinism.sh
 
   python-model:
     name: Python FPMM model

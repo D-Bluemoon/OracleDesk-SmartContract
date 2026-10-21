@@ -14,6 +14,7 @@ import { KeypairSigner } from "@stellar/stellar-sdk/contract";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { toTraceAction, type TraceActionType } from "../core/trace.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // HERE is agents/stellar/ — the repo root is two levels up.
@@ -36,7 +37,9 @@ export interface Deployments {
   };
 }
 
-export function loadDeployments(path = join(REPO_ROOT, "deployments", "testnet.json")): Deployments {
+export function loadDeployments(
+  path = process.env.DEPLOYMENTS_PATH ?? join(REPO_ROOT, "deployments", "testnet.json"),
+): Deployments {
   return JSON.parse(readFileSync(path, "utf8")) as Deployments;
 }
 
@@ -254,16 +257,81 @@ export class StellarAdapter {
   async publishTrace(args: {
     agent: string;
     market_id: bigint;
-    action: string;
+    action: TraceActionType | string;
     trace_hash: Buffer;
     ipfs_cid: string;
   }): Promise<AdapterResult<bigint>> {
+    const action = typeof args.action === "string" ? toTraceAction(args.action) : args.action;
+    const call = { ...args, action };
     return this.run(
       "reasoning_registry",
       "@oracledesk/bindings-reasoning-registry",
       "publish_trace",
+      call,
+      (client) => client.publish_trace(call),
+    );
+  }
+
+  async publishTraceBatch(args: {
+    agent: string;
+    root: Buffer;
+    leaf_count: number;
+    manifest_cid: string;
+  }): Promise<AdapterResult<bigint>> {
+    return this.run(
+      "reasoning_registry",
+      "@oracledesk/bindings-reasoning-registry",
+      "publish_trace_batch",
       args,
-      (client) => client.publish_trace(args),
+      (client) => client.publish_trace_batch(args),
+    );
+  }
+
+  async addSigningKey(args: {
+    agent: string;
+    public_key: Buffer;
+    proof_sig: Buffer;
+  }): Promise<AdapterResult<void>> {
+    return this.run(
+      "reasoning_registry",
+      "@oracledesk/bindings-reasoning-registry",
+      "add_signing_key",
+      args,
+      (client) => client.add_signing_key(args),
+    );
+  }
+
+  async retireSigningKey(args: {
+    agent: string;
+    public_key: Buffer;
+  }): Promise<AdapterResult<void>> {
+    return this.run(
+      "reasoning_registry",
+      "@oracledesk/bindings-reasoning-registry",
+      "retire_signing_key",
+      args,
+      (client) => client.retire_signing_key(args),
+    );
+  }
+
+  async publishTraceSigned(args: {
+    agent: string;
+    market_id: bigint;
+    action: TraceActionType | string;
+    trace_hash: Buffer;
+    ipfs_cid: string;
+    signing_key: Buffer;
+    signature: Buffer;
+  }): Promise<AdapterResult<bigint>> {
+    const action = typeof args.action === "string" ? toTraceAction(args.action) : args.action;
+    const call = { ...args, action };
+    return this.run(
+      "reasoning_registry",
+      "@oracledesk/bindings-reasoning-registry",
+      "publish_trace_signed",
+      call,
+      (client) => client.publish_trace_signed(call),
     );
   }
 }
+

@@ -23,12 +23,18 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-NETWORK=testnet
-NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
-DEPLOYER_KEY=oracledesk-deployer
-AGENT_KEY=oracledesk-agent
-DEPLOYMENTS=deployments/testnet.json
-SPECS_DIR=deployments/specs
+NETWORK=${NETWORK:-testnet}
+case "$NETWORK" in
+  testnet) NETWORK_PASSPHRASE="Test SDF Network ; September 2015" ;;
+  local) NETWORK_PASSPHRASE="Standalone Network ; February 2017" ;;
+  *) echo "error: NETWORK must be testnet or local (never mainnet)" >&2; exit 1 ;;
+esac
+
+IDENTITY_PREFIX=${IDENTITY_PREFIX:-oracledesk}
+DEPLOYER_KEY=${DEPLOYER_KEY:-${IDENTITY_PREFIX}-deployer}
+AGENT_KEY=${AGENT_KEY:-${IDENTITY_PREFIX}-agent}
+DEPLOYMENTS=${DEPLOYMENTS:-deployments/$NETWORK.json}
+SPECS_DIR=${SPECS_DIR:-deployments/specs-$NETWORK}
 ATOMIC=true
 
 # Allow --commit-only anywhere in the argument list.
@@ -43,11 +49,18 @@ set -- "${ARGS[@]:-}"
 
 SEED_AMOUNT=${1:-1500000000}   # 150 USDC, comfortably above the 100 USDC MIN_SEED
 INITIAL_YES_BPS=${2:-5000}     # 50/50
-CLOSE_IN_SECONDS=${3:-90}
-DISPUTE_WINDOW=${4:-5}
+if [ "$NETWORK" = "local" ]; then
+  DEFAULT_CLOSE_IN=10
+  DEFAULT_DISPUTE=3
+else
+  DEFAULT_CLOSE_IN=90
+  DEFAULT_DISPUTE=5
+fi
+CLOSE_IN_SECONDS=${3:-$DEFAULT_CLOSE_IN}
+DISPUTE_WINDOW=${4:-$DEFAULT_DISPUTE}
 QUESTION_TEXT=${5:-"Demo market seeded by scripts/seed-market.sh"}
 
-[ -f "$DEPLOYMENTS" ] || { echo "error: $DEPLOYMENTS not found — run scripts/deploy-testnet.sh first" >&2; exit 1; }
+[ -f "$DEPLOYMENTS" ] || { echo "error: $DEPLOYMENTS not found — run NETWORK=$NETWORK scripts/deploy-testnet.sh first" >&2; exit 1; }
 
 TREASURY=$(jq -r .contracts.treasury "$DEPLOYMENTS")
 RESOLVER=$(jq -r .contracts.resolver "$DEPLOYMENTS")

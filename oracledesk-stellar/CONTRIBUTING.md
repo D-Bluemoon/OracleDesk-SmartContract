@@ -13,10 +13,11 @@ make build   # cargo build + stellar contract build
 make test    # cargo test + model/fpmm_model.py + x402 tests
 ```
 
-You'll need Rust (stable, with the `wasm32v1-none` target —
-`rust-toolchain.toml` handles this via `rustup`), the
-[Stellar CLI](https://developers.stellar.org/docs/tools/cli) v27+, Node 20+,
-Python 3.10+, and `jq`.
+You'll need Rust at the version pinned in `rust-toolchain.toml` (exact, not
+`stable`) with the `wasm32v1-none` target — `rustup` reads that file
+automatically — the [Stellar CLI](https://developers.stellar.org/docs/tools/cli)
+at the version pinned in `stellar-cli.version`, Node 20+, Python 3.10+, and
+`jq`.
 
 ## Branch and commit conventions
 
@@ -45,12 +46,14 @@ Contract changes need:
   `contracts/*/src/lib.rs` for the pattern — `env.set_auths(&[])` plus
   `mock_auths` for a specific *other* address, not `mock_all_auths`, which
   would hide a missing `require_auth`).
-- If the change touches `market-core`, rebuild its wasm and re-copy it into
-  `contracts/resolver/market_core.wasm` and
-  `contracts/treasury/market_core.wasm` before those crates will see the
-  change — `make build` does this in the right order automatically; running
-  `cargo build -p resolver` on its own after touching market-core will
-  silently build against the stale copy. See
+- If the change touches `market-core` or `reasoning-registry`, refresh the
+  vendored copies and their committed `.sha256` pins with
+  `./scripts/sync-vendored-wasm.sh` (or just `make build`, which does it in
+  the right order) before those crates will see the change. A stale copy is a
+  **compile error** now: each dependent crate's `build.rs` verifies the
+  vendored bytes against `<name>.wasm.sha256`, so you can no longer silently
+  build against an old interface. `make verify-wasm` proves the build is
+  reproducible and the pins match a clean build. See
   [docs/adr/0002-cross-contract-calls.md](docs/adr/0002-cross-contract-calls.md).
 
 ## Coverage
@@ -94,8 +97,9 @@ about 2 minutes on 8 cores, `TREASURY_SEARCH_DEPTH=5` for a quick run).
 - [ ] `cargo test --workspace` passes.
 - [ ] If you touched contract interfaces, bindings were regenerated
       (`make bindings`) and the diff is included.
-- [ ] If you touched `market-core`'s interface, `resolver`'s and
-      `treasury`'s vendored `market_core.wasm` copies were refreshed.
+- [ ] If you touched `market-core` or `reasoning-registry`, the vendored wasm
+      copies and their `.sha256` pins were refreshed (`make build` /
+      `./scripts/sync-vendored-wasm.sh`), and `make verify-wasm` passes.
 - [ ] New behavior has a test; changed behavior's existing test was updated,
       not deleted.
 - [ ] `docs/STATUS.md` updated if this changes what's verified/unverified.

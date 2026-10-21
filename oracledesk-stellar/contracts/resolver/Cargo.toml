@@ -9,6 +9,10 @@ crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]
+# Shared #[contracttype] definitions (Outcome/Category and the resolution
+# spec surface). Types-only crate: no #[contract]/#[contractimpl], so it
+# cannot reintroduce the __constructor collision (ADR 0002).
+oracledesk-types = { path = "../oracledesk-types" }
 # experimental_spec_shaking_v2 re-exports types pulled in via contractimport!
 # (Outcome, Category) into this contract's own spec, so generated TS bindings
 # see them instead of an opaque/missing type. See docs/adr/0002-cross-contract-calls.md.
