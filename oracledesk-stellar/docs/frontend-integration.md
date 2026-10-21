@@ -41,6 +41,13 @@ contract's Rust enums:
 type Outcome = { tag: "Yes"; values: void } | { tag: "No"; values: void };
 ```
 
+The resolver's `attest` / `attest_with_evidence` take its own
+`AttestedOutcome` instead, which adds `{ tag: "Invalid"; values: void }`
+(finalizing an `Invalid` proposal voids the market). `finalize_signers`
+returns `AttestedOutcome`. Indexers should decode `ResolutionProposedV2` /
+`ResolutionFinalizedV2` / `CommitteeVoided`; the `Outcome`-typed
+`ResolutionProposed` / `ResolutionFinalized` are no longer emitted.
+
 ```ts
 const tx = await contract.buy({
   trader: userAddress,
@@ -277,3 +284,12 @@ a verified reasoning trace in the UI:
 
 `x402/trace-verification.ts` has the reference hash-check implementation the
 frontend's check should match.
+
+### Bindings interface versions
+
+`packages/bindings/*` start at `0.1.0`. A breaking interface change requires a
+minor bump while the major is zero, then a major bump after 1.0.0; additions need
+at least a patch. Read each package's `CHANGELOG.md` and `interface.json` before
+syncing. The manifest describes functions, named/tuple types, numeric errors and
+event payloads directly from the built WASM. Hash-critical resolver types carry
+ADR 0001 compatibility implications. See CONTRIBUTING's interface workflow.
