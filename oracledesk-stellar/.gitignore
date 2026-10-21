@@ -39,8 +39,22 @@ deployments/traces-*/
 # Agent dry-run/local trace output (agents/core/trace.ts's LocalTraceStore)
 .traces/
 
+# Market-maker resolution specs (agents/core/spec-store.ts). Losing one makes
+# its market unresolvable: keep AGENT_SPEC_DIR on backed-up storage, never in git.
+.specs/
+# Simulator output (agents/sim/cli.ts)
+agents/sim/results/
+
 # IDE / OS
 .vscode/
 .idea/
 .DS_Store
+
+# Coverage output (scripts/coverage.sh). The thresholds and README are the
+# only tracked files in coverage/.
+coverage/*
+!coverage/thresholds.json
+!coverage/README.md
+
+# Python bytecode from the scripts/ helpers
 __pycache__/

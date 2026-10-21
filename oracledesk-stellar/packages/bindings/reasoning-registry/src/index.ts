@@ -63,9 +63,55 @@ export const Errors = {
   12: {message:"PendingAdminExpired"}
 }
 
+export interface SigningKeyRecord {
+  added_at: u64;
+  public_key: Buffer;
+  retired_at: Option<u64>;
+}
+
+export interface TraceBatch {
+  agent: string;
+  leaf_count: u32;
+  manifest_cid: string;
+  published_at: u64;
+  root: Buffer;
+}
+
+export type TraceAction =
+  | { tag: "CreateMarket", values: void }
+  | { tag: "ProposeMarket", values: void }
+  | { tag: "Buy", values: void }
+  | { tag: "Sell", values: void }
+  | { tag: "Skip", values: void }
+  | { tag: "Redeem", values: void }
+  | { tag: "ClaimRemainder", values: void }
+  | { tag: "Resolve", values: void }
+  | { tag: "Other", values: readonly [string] };
+
+export type AgentStatus =
+  | { tag: "Active", values: void }
+  | { tag: "Retired", values: readonly [u64] }
+  | { tag: "Revoked", values: readonly [u64, string] };
+
+export interface AgentRecord {
+  registered_at: u64;
+  status: AgentStatus;
+}
+
+export interface TraceFlag {
+  active: boolean;
+  flagged_at: u64;
+  reason: string;
+}
+
+export type TraceVerdict =
+  | { tag: "Valid", values: void }
+  | { tag: "HashMismatch", values: void }
+  | { tag: "Flagged", values: readonly [string] }
+  | { tag: "AgentRevokedAfter", values: readonly [u64] };
 
 export interface Trace {
-  action: string;
+  action: TraceAction;
   agent: string;
   ipfs_cid: string;
   market_id: u64;
@@ -194,11 +240,14 @@ export interface Client {
    * Construct and simulate a register_agent transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    */
   register_agent: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
-
-  /**
-   * Construct and simulate a market_trace_at transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   * The `index`-th (0-based, publish order) trace id for `market_id`.
-   */
+  retire_agent: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+  retire_self: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+  reactivate_agent: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+  revoke_agent: ({agent, effective_from, reason}: {agent: string, effective_from: u64, reason: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+  flag_trace: ({trace_id, reason}: {trace_id: u64, reason: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+  unflag_trace: ({trace_id, reason}: {trace_id: u64, reason: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+  trace_flags: ({trace_id, start, limit}: {trace_id: u64, start: u32, limit: u32}, options?: MethodOptions) => Promise<AssembledTransaction<Result<Array<TraceFlag>>>>
+  get_trace_flag: ({trace_id}: {trace_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Option<TraceFlag>>>
   market_trace_at: ({market_id, index}: {market_id: u64, index: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>
 
   /**
@@ -261,7 +310,7 @@ export interface Client {
 export class Client extends ContractClient {
   static async deploy<T = Client>(
         /** Constructor/Initialization Args for the contract's `__constructor` method */
-        {admin}: {admin: string},
+        {admin, market_core}: {admin: string, market_core: string},
     /** Options for initializing a Client as well as for calling a method, with extras specific to deploying. */
     options: MethodOptions &
       Omit<ContractClientOptions, "contractId"> & {
@@ -273,7 +322,7 @@ export class Client extends ContractClient {
         format?: "hex" | "base64";
       }
   ): Promise<AssembledTransaction<T>> {
-    return ContractClient.deploy({admin}, options)
+    return ContractClient.deploy({admin, market_core}, options)
   }
   constructor(public readonly options: ContractClientOptions) {
     super(

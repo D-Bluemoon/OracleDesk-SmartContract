@@ -22,7 +22,7 @@ import type {
 export interface RegistryTrace {
   market_id: bigint;
   agent: string;
-  action: string;
+  action: RegistryAction;
   trace_hash: Buffer;
   ipfs_cid: string;
   published_at: bigint;
@@ -105,10 +105,24 @@ export class RegistryTraceRepository implements TraceRepository, TraceListReposi
     }
     try {
       const { result } = await this.reader.get_trace({ trace_id: id });
+      let verdict: TraceVerdict | undefined = undefined;
+      if (typeof this.reader.trace_verdict === "function") {
+        try {
+          const verdictRes = await this.reader.trace_verdict({
+            trace_id: id,
+            received_hash: result.trace_hash,
+          });
+          verdict = verdictRes.result;
+        } catch {
+          // Contract-level error or method unavailable
+        }
+      }
       return {
         traceId,
         ipfsCid: result.ipfs_cid,
         traceHash: result.trace_hash.toString("hex"),
+        action: normalizeAction(result.action),
+        verdict,
       };
     } catch {
       // Contract-level TraceNotFound, or any RPC failure: treat as "no

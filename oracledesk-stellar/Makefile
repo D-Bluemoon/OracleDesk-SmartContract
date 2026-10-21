@@ -1,4 +1,4 @@
-.PHONY: setup build test lint fmt deploy-testnet seed-market demo bindings verify-wasm check-wasm clean
+.PHONY: setup build test lint fmt formal coverage coverage-gate deploy-testnet seed-market demo bindings clean
 
 # Installs Node dependencies for the TypeScript packages. Rust toolchain,
 # the `stellar` CLI, and Python 3 are expected to already be on PATH — see
@@ -49,7 +49,9 @@ test: build
 	cargo test --workspace
 	cargo test --manifest-path scripts/spec-hash/Cargo.toml
 	python3 model/fpmm_model.py
-	python3 model/system_model.py --selftest
+	python3 model/fpmm_bounds.py --quick
+	python3 scripts/coverage-tools.py --self-test
+	python3 scripts/coverage-gate.py --self-test
 	cd x402 && npm test
 	cd agents && npm test
 
@@ -75,6 +77,20 @@ e2e-local:
 fmt:
 	cargo fmt
 
+# Coverage: Rust (cargo llvm-cov, market-core wasm + native) and TypeScript (c8),
+# merged into coverage/lcov.info with an HTML report. `make coverage-gate` then
+# enforces coverage/thresholds.json. Needs `make setup` first; see coverage/README.md.
+coverage:
+	./scripts/coverage.sh
+
+coverage-gate:
+	python3 scripts/coverage-gate.py $(if $(BASE),--base $(BASE),)
+
+# TLC model check of the resolution lifecycle (docs/formal/). Skips with exit 0
+# when Java is not installed.
+formal:
+	./scripts/formal.sh
+
 deploy-testnet: build
 	./scripts/deploy-testnet.sh
 
@@ -91,3 +107,4 @@ clean:
 	cargo clean
 	rm -rf x402/node_modules agents/node_modules
 	rm -rf packages/bindings/*/node_modules packages/bindings/*/dist
+	rm -rf coverage/*.lcov coverage/lcov.info coverage/html coverage/x402 coverage/agents coverage/summary.md

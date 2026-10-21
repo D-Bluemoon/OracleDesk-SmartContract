@@ -101,20 +101,6 @@ export const Errors = {
 }
 
 
-export interface Realized {
-  lp_proceeds: i128;
-  position_proceeds: i128;
-  settled: boolean;
-}
-
-
-export interface MarketPnl {
-  cost: i128;
-  proceeds: i128;
-  realized: boolean;
-}
-
-
 /**
  * `market_valuation` result. Only `cost_basis` is enforced (by
  * `max_net_exposure`); the others are informational.

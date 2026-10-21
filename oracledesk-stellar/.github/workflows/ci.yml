@@ -106,6 +106,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python3 model/fpmm_model.py
+      - run: python3 model/fpmm_bounds.py --quick
 
   node:
     name: Node (x402, agents)

@@ -67,6 +67,32 @@ contracts and `deployments/testnet.json` predate these changes, so the new
 entrypoints have contract-level and off-chain tests only, not a real-ledger
 transaction.
 
+### Storage Migration: Reasoning Registry Agent Records (#56)
+
+Existing deployments store `true` under `Agent(addr)`. The registry reads both `AgentRecord` and legacy `bool` seamlessly (treating legacy bool records as `AgentStatus::Active` with `registered_at: 0`); newly registered agents write full `AgentRecord` structs.
+
+### Cross-Contract Market Reference Validation (#55)
+
+Traces published via reasoning registry now validate market references and actions:
+- `TraceAction` enum replaces free-form strings (`CreateMarket`, `ProposeMarket`, `Buy`, `Sell`, `Skip`, `Redeem`, `ClaimRemainder`, `Resolve`, `Other(Symbol)`).
+- Cross-contract read of `market-core`'s `market_count()` verifies `market_id < count`.
+- `ProposeMarket` requires `NO_MARKET` (`u64::MAX`) sentinel for proposals made before market creation.
+- Vendored `contracts/reasoning-registry/market_core.wasm` via `contractimport!` to support cross-contract calls without cyclic cargo dependencies.
+
+### Merkle-Batched Trace Anchoring (#54)
+
+High-frequency decision anchoring via Merkle roots:
+- `publish_trace_batch`, `get_batch`, `batch_count`, `agent_batch_count`, `agent_batch_at`, `verify_trace_inclusion`, `compute_merkle_root`.
+- Strict domain separation (0x00 leaf prefix, 0x01 node prefix), odd node promotion without hashing, capped at 4096 leaves (max proof length 12).
+- Golden test vectors in `docs/vectors/merkle-v1.json` verified across Rust contract, TypeScript agents, and x402 verifier.
+
+### Ed25519-Signed Trace Attestations (#53)
+
+Zero-trust trace authentication via agent-held signing keys:
+- `add_signing_key`, `retire_signing_key`, `get_signing_keys`, `get_key_agent`, `signing_key_history_count`, `signing_key_history`, `publish_trace_signed`, `publish_chained_trace_signed`, `get_trace_signature`, `verify_trace_signature`.
+- Cryptographic proof of possession over domain-separated bind message (`oracledesk-agent-key-v1`), at most 4 active keys per agent, immutable rotation history.
+- On-chain and off-chain (x402 verifier, agents) verification of domain-separated trace attestations (`oracledesk-trace-v1`) without trusting registry admin or RPC.
+
 ### Merge follow-up: 2026-10-17
 
 The work above landed on `develop` as merge commit `581a3ec` (PR #153,
@@ -96,6 +122,57 @@ Key additions:
 - **Realized PnL & Drawdown Guard (#46)**: Full ledger tracking of cost and proceeds (`MarketPnl`), daily rolling window (`window_pnl`), and automatic `DrawdownPause` when losses exceed `max_drawdown`. Protects open positions by allowing reduce-only `agent_sell` in drawdown mode. Requires admin acknowledgement to resume.
 - **Creation Policy (#47)**: `CreationPolicy` bounding `max_seed` independently of `max_trade`, rolling window creation rate limits, horizon constraints (`min_close_horizon`, `max_close_horizon`), and allowed categories bitmask. Tighten-only admin configuration updates.
 - **Blend Lending & JIT Liquidity (#48)**: Idle capital deployment to Blend pool, atomic shortfall withdrawal in `agent_buy` and `agent_create_market` via `ensure_liquid`, fail-closed error handling with `YieldWithdrawFailed`, and comprehensive capital views (`available_capital`, `liquid_capital`, `capital_breakdown`). Documented in `docs/adr/0006-blend-integration.md`.
+
+## Contributor addendum: 2026-10-20
+
+Verification tooling, no behaviour change in any contract: a TLA+ model of the
+resolution lifecycle (#73), proofs and executable checks for the FPMM economics
+(#74), coverage instrumentation with a gated CI report (#75), and a
+bounded-exhaustive search of the treasury's spending caps (#76). Implemented on
+`feat/issues-73-74-75-76-verification-coverage`.
+
+- **#73** `docs/formal/` (`make formal`): `resolver.tla` plus seven TLC configs.
+  Safety and liveness hold on the default configs; four documented
+  counterexamples (a cancelled proposal can strand a quorum, an Invalid quorum
+  displaces a pending proposal, the admin resolver swap bypasses the threshold,
+  a dishonest Invalid quorum defeats liveness). Two of the issue's suspected
+  findings are refuted by the current code (a guardian void before close; later
+  attestations resetting `proposed_at`). Nine `model_trace_*` resolver tests
+  replay the traces. Not modelled: bonded disputes, weighted keys, committee
+  rotation, hybrid fallback.
+- **#74** `docs/fpmm-economics.md`, `model/fpmm_bounds.py`: LP loss under YES, NO
+  and Void, rounding conservativeness, a no-risk-free-profit theorem and path
+  splitting, all checked exhaustively on small reserves and randomly up to
+  `MAX_SETS`; wired into `make test` (`--quick`).
+- **#75** `make coverage` / `make coverage-gate`, `coverage/`: Rust via
+  `cargo llvm-cov` with market-core registered as wasm *and* natively (resolver
+  and treasury tests, `MARKET_CORE_IMPL`, `both_modes!`), TypeScript via c8.
+  Measured line coverage: market-core 94.3%, resolver 68.8%, treasury 91.5%,
+  reasoning-registry 96.8%, router 94.1%, timelock 84.6%, x402 38.7%, agents 82.8%.
+- **#76** `contracts/integration-tests`, `docs/architecture.md` ("Treasury cap
+  guarantees"): the daily window is already a sliding window on `develop`, so the
+  expected 2x violation (I4) does not occur; the explorer reports I1-I9 and
+  atomicity holding to depth 6.
+
+Fixed along the way because nothing else could build or lint: the treasury's
+`Error` enum assigned codes 29-33 twice (PRs #173 and #179 merged independently),
+so `treasury` did not compile; the five later variants are now 44-48 (the
+committed treasury bindings were patched by hand for those five codes only).
+`cargo fmt --check` and `cargo clippy -D warnings` now pass.
+
+Verified in the contributor session: `cargo fmt --check`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace` (all pass
+**except 11 treasury tests that already fail on `develop`**, listed in the PR:
+`allocate_rejects_leaving_less_than_daily_cap_liquid`, the `settle_market_*`
+group, the realized-PnL group, `creation_rate_limit_blocks_n_plus_one_*`,
+`seed_still_counts_toward_daily_and_market_caps`, `partial_sells_*`,
+`drawdown_breach_*`, `lp_remainder_*`, `third_party_realize_*`; they fail
+identically with market-core native and with freshly rebuilt wasm), `make formal`,
+`python3 model/fpmm_bounds.py --full`, `make coverage`, and the treasury search
+at depth 6. **Not** verified: the committed bindings were not regenerated with the
+pinned Stellar CLI (a different version is installed locally), the vendored wasm
+was not refreshed, no testnet redeploy, and the nightly/coverage/formal GitHub
+workflows were not run on GitHub.
 
 ## Phase 0: recon and safety
 
@@ -298,7 +375,9 @@ markers in the files themselves:
 - **Agent-vs-agent liquidity** is unbounded: nothing stops multiple
   independent agent deployments from trading against the same
   `market-core` markets. The treasury's caps bound one deployment's own
-  risk, not systemic market behavior.
+  risk, not systemic market behavior. `agents/sim` now quantifies this
+  (see `docs/simulation.md`, experiment B): with k identical deployments,
+  capital at risk grows linearly in k while total profit does not.
 - **Expiry cannot help an oracle the creator controls.** `expire_market`
   voids unresolvable markets 30 days after close, but a creator who commits
   to a feed they control can still decide the outcome of a *resolvable*

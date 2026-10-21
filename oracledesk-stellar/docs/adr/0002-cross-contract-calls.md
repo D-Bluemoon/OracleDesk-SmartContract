@@ -34,10 +34,10 @@ impl` (not just the types/client we wanted) into `resolver`'s and
 
 ## Decision
 
-`resolver` and `treasury` do not depend on the `market-core` crate at all.
+`resolver`, `treasury`, and `reasoning-registry` do not depend on the `market-core` crate at all.
 Instead, each vendors a copy of the *compiled* `contracts/market-core/target/.../market_core.wasm`
 into its own directory (`contracts/resolver/market_core.wasm`,
-`contracts/treasury/market_core.wasm`) and generates bindings from it:
+`contracts/treasury/market_core.wasm`, `contracts/reasoning-registry/market_core.wasm`) and generates bindings from it:
 
 ```rust
 mod market_core {
