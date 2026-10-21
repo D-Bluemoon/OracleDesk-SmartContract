@@ -135,6 +135,11 @@ export class StellarAdapter {
     return this.publicKey ?? this.opts.agentAddress ?? this.opts.deployments.agent;
   }
 
+  /** The deployment this adapter is bound to. */
+  get deployments(): Deployments {
+    return this.opts.deployments;
+  }
+
   /**
    * Loads a generated Client for one of the four contracts. Imported
    * dynamically so `mode: "dry-run"` usage (e.g. unit tests) never requires
