@@ -152,6 +152,8 @@ export class StellarAdapter {
       contractId,
       networkPassphrase: this.opts.networkPassphrase,
       rpcUrl: this.opts.rpcUrl,
+      // A local network (http://localhost:8000/soroban/rpc) has no TLS.
+      allowHttp: this.opts.rpcUrl.startsWith("http://"),
       publicKey: this.publicKey,
       signTransaction: this.signer,
     });
@@ -345,7 +347,7 @@ export class StellarAdapter {
         durability: xdr.ContractDataDurability.persistent(),
       }),
     );
-    const { entries } = await new rpc.Server(this.opts.rpcUrl).getLedgerEntries(key);
+    const { entries } = await new rpc.Server(this.opts.rpcUrl, { allowHttp: this.opts.rpcUrl.startsWith("http://") }).getLedgerEntries(key);
     return entries.length > 0;
   }
 
