@@ -131,6 +131,13 @@ export const EnvSchema = z.object({
   MARKET_CLOSE_IN_SECS: intField(3600, 1, 365 * 86_400),
   AGENT_STARTUP_PROBE_TIMEOUT_MS: intField(DEFAULT_PROBE_TIMEOUT_MS, 1, 600_000),
   AGENT_ALLOW_MAINNET: z.string().optional(),
+  EVENTS_STATE_DIR: nonEmptyPath,
+  EVENTS_TRADE_THRESHOLD: stroopsField(500_000_000n),
+  EVENTS_POLL_INTERVAL_MS: intField(10_000, 100, 3_600_000),
+  EVENTS_PAGE_LIMIT: intField(100, 1, 10_000),
+  EVENTS_CONCURRENCY: intField(4, 1, 64),
+  EVENTS_MAX_ATTEMPTS: intField(5, 1, 100),
+  EVENTS_DISPUTE_WINDOW_SECS: intField(600, 0, 30 * 86_400),
   USDC_CONTRACT_ID: contractIdField,
   MARKET_CORE_CONTRACT_ID: contractIdField,
   RESOLVER_CONTRACT_ID: contractIdField,
@@ -238,6 +245,18 @@ export interface TradingConfig {
   fairValueBps?: number;
 }
 
+/** Event-driven triggers (#105), used by `trader --follow`. */
+export interface EventsConfig {
+  stateDir: string;
+  tradeThresholdStroops: bigint;
+  pollIntervalMs: number;
+  pageLimit: number;
+  concurrency: number;
+  maxAttempts: number;
+  /** Dispute window assumed for alerts, seconds. */
+  disputeWindowSecs: number;
+}
+
 export interface MakerConfig {
   confidenceThresholdBps: number;
   defaultSeedStroops: bigint;
@@ -250,6 +269,7 @@ export interface Tunables {
   traceStoreDir: string;
   trading: TradingConfig;
   maker: MakerConfig;
+  events: EventsConfig;
   /** Runtime knobs (lease, state file, backoff, trace store selection) still
    * read by runtime/wiring.ts. Never printed: it may hold secrets. */
   env: NodeJS.ProcessEnv;
@@ -308,6 +328,15 @@ function tunablesFrom(e: ParsedEnv, env: NodeJS.ProcessEnv): Tunables {
       confidenceThresholdBps: e.CONFIDENCE_THRESHOLD_BPS!,
       defaultSeedStroops: e.DEFAULT_SEED_STROOPS,
       closeInSecs: e.MARKET_CLOSE_IN_SECS!,
+    },
+    events: {
+      stateDir: e.EVENTS_STATE_DIR ?? "./.events",
+      tradeThresholdStroops: e.EVENTS_TRADE_THRESHOLD,
+      pollIntervalMs: e.EVENTS_POLL_INTERVAL_MS!,
+      pageLimit: e.EVENTS_PAGE_LIMIT!,
+      concurrency: e.EVENTS_CONCURRENCY!,
+      maxAttempts: e.EVENTS_MAX_ATTEMPTS!,
+      disputeWindowSecs: e.EVENTS_DISPUTE_WINDOW_SECS!,
     },
     env,
   };
@@ -461,9 +490,10 @@ async function verifyNetwork(cfg: AgentConfig, probe: NetworkProbe, log: (m: str
 /** A printable copy of the config. The secret becomes its public key; the raw
  * environment is dropped entirely. */
 export function describeConfig(cfg: AgentConfig): Record<string, unknown> {
-  const { env: _env, agentSecret, trading, maker, ...rest } = cfg;
+  const { env: _env, agentSecret, trading, maker, events, ...rest } = cfg;
   return {
     ...rest,
+    events: { ...events, tradeThresholdStroops: events.tradeThresholdStroops.toString() },
     agentSecret: agentSecret ? { publicKey: Keypair.fromSecret(agentSecret).publicKey(), redacted: true } : null,
     trading: { ...trading, tradeSizeStroops: trading.tradeSizeStroops.toString() },
     maker: { ...maker, defaultSeedStroops: maker.defaultSeedStroops.toString() },

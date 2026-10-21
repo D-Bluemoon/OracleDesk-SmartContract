@@ -5,11 +5,11 @@
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit",
-    "test": "tsx --test core/*.test.ts stellar/*.test.ts bin/*.test.ts runtime/*.test.ts sim/*.test.ts",
+    "test": "tsx --test core/*.test.ts core/events/*.test.ts stellar/*.test.ts bin/*.test.ts runtime/*.test.ts sim/*.test.ts",
     "market-maker": "tsx bin/market-maker.ts",
     "trader": "tsx bin/trader.ts",
     "agentd": "tsx bin/agentd.ts",
-    "coverage": "c8 --all --src . --reporter=lcovonly --reporter=text-summary --report-dir ../coverage/agents --exclude '**/*.test.ts' --exclude 'node_modules/**' --exclude 'dist/**' --exclude '**/*.d.ts' tsx --test core/*.test.ts stellar/*.test.ts bin/*.test.ts runtime/*.test.ts sim/*.test.ts",
+    "coverage": "c8 --all --src . --reporter=lcovonly --reporter=text-summary --report-dir ../coverage/agents --exclude '**/*.test.ts' --exclude 'node_modules/**' --exclude 'dist/**' --exclude '**/*.d.ts' tsx --test core/*.test.ts core/events/*.test.ts stellar/*.test.ts bin/*.test.ts runtime/*.test.ts sim/*.test.ts",
     "test:chaos": "tsx --test test/chaos/*.test.ts"
   },
   "dependencies": {

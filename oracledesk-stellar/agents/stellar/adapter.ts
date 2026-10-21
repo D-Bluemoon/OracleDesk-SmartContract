@@ -331,9 +331,18 @@ export class StellarAdapter {
   }
 
   /** market-core `get_market` (read-only), or `undefined` if it does not exist. */
-  async getMarket(
-    marketId: bigint,
-  ): Promise<{ creator: string; questionHash: string; resolutionHash: string; closeTime: bigint } | undefined> {
+  async getMarket(marketId: bigint): Promise<
+    | {
+        creator: string;
+        questionHash: string;
+        resolutionHash: string;
+        closeTime: bigint;
+        status: "Open" | "Resolved" | "Void";
+        reserveYes: bigint;
+        reserveNo: bigint;
+      }
+    | undefined
+  > {
     const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
     const { result } = await client.get_market({ market_id: marketId });
     if (result?.isErr?.()) return undefined;
@@ -343,7 +352,34 @@ export class StellarAdapter {
       questionHash: Buffer.from(m.question_hash).toString("hex"),
       resolutionHash: Buffer.from(m.resolution_hash).toString("hex"),
       closeTime: BigInt(m.close_time),
+      status: m.status.tag,
+      reserveYes: BigInt(m.reserve_yes),
+      reserveNo: BigInt(m.reserve_no),
     };
+  }
+
+  /** An RPC client for this adapter's network (event polling, ledger reads). */
+  rpcServer(): rpc.Server {
+    return new rpc.Server(this.opts.rpcUrl, { allowHttp: this.opts.rpcUrl.startsWith("http://") });
+  }
+
+  /** The deployment's contract ids. A copy: callers cannot rebind the adapter. */
+  contractIds(): Deployments["contracts"] {
+    return { ...this.opts.deployments.contracts };
+  }
+
+  /** The treasury's YES/NO shares in `marketId` (zero when it holds none). */
+  async treasuryPosition(marketId: bigint): Promise<{ yes: bigint; no: bigint }> {
+    const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
+    const { result } = await client.get_position({ market_id: marketId, holder: this.opts.deployments.contracts.treasury });
+    return { yes: BigInt(result.yes), no: BigInt(result.no) };
+  }
+
+  /** The resolver's state tag for `marketId`, e.g. "SignersPending". */
+  async resolutionState(marketId: bigint): Promise<string> {
+    const client = await this.client<any>("resolver", "@oracledesk/bindings-resolver");
+    const { result } = await client.state({ market_id: marketId });
+    return (result as { tag: string }).tag;
   }
 
   /**

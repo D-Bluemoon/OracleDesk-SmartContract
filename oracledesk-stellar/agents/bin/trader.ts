@@ -16,11 +16,14 @@
  * TRADER_SECRET_KEY (or the shared AGENT_SECRET_KEY) to submit real testnet
  * transactions — see .env.example. Configuration is validated by
  * core/config.ts first; `--print-config` prints it (secret redacted) and
- * exits, `--offline` skips the network probes in dry-run.
+ * exits, `--offline` skips the network probes in dry-run. `--follow` keeps
+ * running and reacts to contract events instead (see runtime/follow.ts).
  */
 import "dotenv/config";
 import { pathToFileURL } from "node:url";
-import { describeConfig, loadAgentConfig, type Tunables } from "../core/config.js";
+import { describeConfig, loadAgentConfig, type AgentConfig, type Tunables } from "../core/config.js";
+import { followTask } from "../runtime/follow.js";
+import { jsonLogger } from "../runtime/log.js";
 import { ConfigError, EXIT_CONFIG, EXIT_TEMPFAIL } from "../runtime/config.js";
 import { LeaseHeldError } from "../runtime/lease.js";
 import { Runtime } from "../runtime/runtime.js";
@@ -50,6 +53,34 @@ export async function main(
   await runtime.runOnce();
 }
 
+/**
+ * `--follow`: runs until stopped (SIGINT/SIGTERM), re-evaluating only the
+ * markets that contract events point at (#105). Without the flag, behaviour
+ * is unchanged: one evaluation of every market, then exit.
+ */
+export async function follow(cfg: AgentConfig, adapter: StellarAdapter, now: () => number = () => Math.floor(Date.now() / 1000)): Promise<number> {
+  const log = jsonLogger();
+  const task = await followTask({
+    cfg,
+    adapter,
+    trader: traderDeps(cfg, adapter, cfg.deployments, now),
+    nowSecs: now,
+    log: (event, fields) => log.info(event, fields),
+  });
+  const runtime = new Runtime({
+    tasks: [task],
+    state: await createStateStore(cfg.mode, cfg.env, cfg.deployments.contracts.treasury),
+    lease: createLease(cfg.env),
+    log,
+    ...runtimeOptions(cfg.env),
+  });
+  const stop = (signal: NodeJS.Signals) => void runtime.stop(signal);
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  await runtime.start();
+  return runtime.exitCode;
+}
+
 const isMain =
   process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
@@ -59,7 +90,12 @@ if (isMain) {
         console.log(JSON.stringify(describeConfig(cfg), null, 2));
         return;
       }
-      console.log(`[trader] mode=${cfg.mode} network=${cfg.network}`);
+      console.log(`[trader] mode=${cfg.mode} network=${cfg.network}${process.argv.includes("--follow") ? " follow" : ""}`);
+      if (process.argv.includes("--follow")) {
+        return follow(cfg, buildAdapter(cfg)).then((code) => {
+          process.exitCode = code;
+        });
+      }
       return main(buildAdapter(cfg), cfg);
     })
     .catch((err) => {
