@@ -281,7 +281,8 @@ export class StellarAdapter {
   }): Promise<bigint> {
     const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
     const { result } = await client.quote_buy(args);
-    return result as bigint;
+    // quote_buy returns Result<i128, Error>: unwrap it, and surface an Err.
+    return BigInt(unwrapContractResult("quote_buy", result) as bigint);
   }
 
   /**
