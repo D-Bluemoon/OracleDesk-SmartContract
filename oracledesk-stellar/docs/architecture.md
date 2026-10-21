@@ -753,6 +753,50 @@ With `multiformats`:
 After fetching, `sha256(body) === trace_hash`, as `x402/trace-verification.ts`
 checks, proves the bytes are the ones the agent committed to.
 
+### Event triggers (agents) vs. the event indexer
+
+`agents/core/events/` (#105) lets agents react to contract events instead
+of waiting for their next scheduled run. It is a **trigger system, not an
+indexer**, and the two must not be confused:
+
+| | Event triggers (`agents/core/events`) | Event indexer (`docs/wave-issues/06-event-indexer.md`) |
+| --- | --- | --- |
+| Purpose | Wake an agent when something it cares about happens | Durable, queryable history for UIs and analytics |
+| Storage | One checkpoint per network and contract set: `{cursor, lastLedger}` plus recently processed event ids, in `EVENTS_STATE_DIR` | Every event, in Postgres |
+| History | None. Starts at the latest ledger; never replays | Replayable from any ledger it has stored |
+| Retention gap | Detected; triggers a full state resync from chain reads | Is the thing it exists to cover |
+| Source of truth | Chain state, re-read before every action | Its own tables |
+
+Flow: `EventSubscriber` polls `getEvents` (cursor pagination, filters
+checked against the RPC's limits, failed contract calls dropped) and hands
+each page to the `Dispatcher`. Events are decoded with the binding specs
+(`decode.ts`, via the SDK's `Spec.parseEvent`) into a typed
+`OracleDeskEvent`, with an `Unknown` variant for anything else.
+
+- **At-least-once delivery.** A page's checkpoint is written only after
+  every handler finished (or the event was dead-lettered). A crash in
+  between redelivers the page, so handlers are idempotent and an LRU of
+  processed ids, saved with the checkpoint, drops repeats.
+- **Ordering.** One market's events run in order; different markets run
+  concurrently up to `EVENTS_CONCURRENCY`.
+- **Failures.** A handler is retried with exponential backoff up to
+  `EVENTS_MAX_ATTEMPTS`, then the event goes to
+  `<EVENTS_STATE_DIR>/dead-letter.jsonl` and the page moves on.
+- **Idle polls** still advance `lastLedger`, so a quiet stretch is not
+  mistaken for a retention gap.
+
+Handlers (`handlers.ts`): `TradeReevaluate` queues a market for the trader
+after a trade of at least `EVENTS_TRADE_THRESHOLD` stroops (re-reading the
+market first); `ProposalWatch` alerts on a `ResolutionProposed` where the
+treasury holds a position and the resolver still reports the proposal as
+standing (cancellations emit no event), with the dispute deadline computed
+from the proposal's ledger timestamp; `FinalityTracker` marks markets final
+on `MarketResolved`, `ResolutionFinalized` or `PriceResolution`; and the
+resync handler re-evaluates every tradable market after a gap.
+
+`npm run trader -- --follow` runs this loop (`runtime/follow.ts`); without
+`--follow` the trader behaves exactly as before.
+
 ## Known limitations (see docs/STATUS.md for the full, current list)
 
 - Testnet only; unaudited.
