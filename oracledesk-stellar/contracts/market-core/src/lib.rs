@@ -1,9 +1,9 @@
 #![no_std]
 
 mod math;
-pub mod ttl;
 #[cfg(kani)]
 mod math_proofs;
+pub mod ttl;
 
 use math::{MathError, Settlement, BPS, MAX_SETS};
 use soroban_sdk::{
@@ -3809,7 +3809,7 @@ mod test {
         client.transfer_lp(&market_id, &Address::generate(&env));
     }
 
-// ----- TTL policy ------------------------------------------------------
+    // ----- TTL policy ------------------------------------------------------
 
     /// Advances both clocks together, as they move on a real network
     /// (one ledger per `ttl::LEDGER_SECS`).

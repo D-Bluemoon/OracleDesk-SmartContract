@@ -935,9 +935,8 @@ impl Resolver {
             return Err(Error::AlreadyFinalized);
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
         let now = env.ledger().timestamp();
         let fallback_deadline = market.close_time.saturating_add(config.fallback_after);
         if now < fallback_deadline {
@@ -1236,9 +1235,8 @@ impl Resolver {
             return Err(Error::WrongMode);
         };
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
         if env.ledger().timestamp() < market.close_time {
             return Err(Error::MarketNotClosed);
         }
@@ -1287,9 +1285,8 @@ impl Resolver {
         caller.require_auth();
         let config = Self::price_config(&env, market_id)?;
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
         let now = env.ledger().timestamp();
         if now < market.close_time {
             return Err(Error::MarketNotClosed);
@@ -1333,9 +1330,8 @@ impl Resolver {
     /// is known before (and without) a spec reveal.
     pub fn resolution_deadline(env: Env, market_id: u64) -> Result<u64, Error> {
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
         Ok(Self::deadline(&market))
     }
 
@@ -1464,9 +1460,8 @@ impl Resolver {
             return Err(Error::StaleRound);
         }
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(&env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
         if env.ledger().timestamp() < market.close_time {
             return Err(Error::MarketNotClosed);
         }
@@ -1591,7 +1586,8 @@ impl Resolver {
         }
 
         let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
-        let token = core_call(MarketCoreClient::new(&env, &market_core).try_get_config())?.collateral;
+        let token =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_config())?.collateral;
         token::Client::new(&env, &token).transfer(
             &disputer,
             env.current_contract_address(),
@@ -2410,9 +2406,8 @@ impl Resolver {
             .unwrap_or(EvidencePolicy::Disabled);
 
         let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(env, &market_core).try_get_market(&market_id))?;
         // Before any write: this is what keeps an `Invalid` proposal (and so
         // `void_market`, which has no close-time guard) from existing before
         // close.
@@ -2430,15 +2425,14 @@ impl Resolver {
             if storage.has(&DataKey::EvidenceUsed(trace_id)) {
                 return Err(Error::EvidenceAlreadyUsed);
             }
-            let trace = match registry_call(
-                RegistryClient::new(env, &registry).try_get_trace(&trace_id),
-            ) {
-                Ok(trace) => trace,
-                // A missing trace (or a registry that cannot be read) is the
-                // same caller-facing condition: the cited evidence is not
-                // available. The registry's own numeric code is never leaked.
-                Err(_) => return Err(Error::EvidenceNotFound),
-            };
+            let trace =
+                match registry_call(RegistryClient::new(env, &registry).try_get_trace(&trace_id)) {
+                    Ok(trace) => trace,
+                    // A missing trace (or a registry that cannot be read) is the
+                    // same caller-facing condition: the cited evidence is not
+                    // available. The registry's own numeric code is never leaked.
+                    Err(_) => return Err(Error::EvidenceNotFound),
+                };
             if trace.agent != signer {
                 return Err(Error::EvidenceAuthorMismatch);
             }
@@ -2532,9 +2526,8 @@ impl Resolver {
         commitment: &BytesN<32>,
     ) -> Result<u64, Error> {
         let market_core: Address = Self::instance_get(env, DataKey::MarketCore)?;
-        let market = core_call(
-            MarketCoreClient::new(env, &market_core).try_get_market(&market_id),
-        )?;
+        let market =
+            core_call(MarketCoreClient::new(env, &market_core).try_get_market(&market_id))?;
         if *commitment != market.resolution_hash {
             return Err(Error::SpecHashMismatch);
         }
@@ -4272,7 +4265,8 @@ mod test {
         };
         f.resolver.register_signer_spec(&f.market_id, &spec);
         f.env.ledger().set_timestamp(2_000);
-        f.resolver.attest(&f.market_id, &f.signer_a, &AttestedOutcome::No);
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::No);
 
         // 61 days of silence — past the old 60-day cap and past any default
         // persistent TTL. Without the write-time extension the tally would be
@@ -4284,7 +4278,8 @@ mod test {
             "vote tally archived during the dispute period"
         );
 
-        f.resolver.attest(&f.market_id, &f.signer_b, &AttestedOutcome::No);
+        f.resolver
+            .attest(&f.market_id, &f.signer_b, &AttestedOutcome::No);
         let count: Option<u32> = f.env.as_contract(&f.resolver_id, || {
             f.env.storage().persistent().get(&count_key)
         });
@@ -4293,7 +4288,10 @@ mod test {
         f.env
             .ledger()
             .set_timestamp(f.env.ledger().timestamp() + 200);
-        assert_eq!(f.resolver.finalize_signers(&f.market_id), AttestedOutcome::No);
+        assert_eq!(
+            f.resolver.finalize_signers(&f.market_id),
+            AttestedOutcome::No
+        );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
             MarketStatus::Resolved(Outcome::No)
@@ -4316,7 +4314,8 @@ mod test {
         assert!(instance_ttl(&f.env, &f.resolver_id) < ttl::INSTANCE_THRESHOLD);
 
         // ...and the next entrypoint call re-extends it.
-        f.resolver.attest(&f.market_id, &f.signer_a, &AttestedOutcome::No);
+        f.resolver
+            .attest(&f.market_id, &f.signer_a, &AttestedOutcome::No);
         assert_eq!(instance_ttl(&f.env, &f.resolver_id), ttl::INSTANCE_TARGET);
     }
 
@@ -5477,18 +5476,30 @@ mod shared_types {
             assert_eq!(shared.to_xdr(&env), imported.to_xdr(&env));
         }
         for (shared, imported) in [
-            (oracledesk_types::Category::Crypto, market_core::Category::Crypto),
-            (oracledesk_types::Category::Macro, market_core::Category::Macro),
+            (
+                oracledesk_types::Category::Crypto,
+                market_core::Category::Crypto,
+            ),
+            (
+                oracledesk_types::Category::Macro,
+                market_core::Category::Macro,
+            ),
             (
                 oracledesk_types::Category::Geopolitics,
                 market_core::Category::Geopolitics,
             ),
-            (oracledesk_types::Category::Sports, market_core::Category::Sports),
+            (
+                oracledesk_types::Category::Sports,
+                market_core::Category::Sports,
+            ),
             (
                 oracledesk_types::Category::Culture,
                 market_core::Category::Culture,
             ),
-            (oracledesk_types::Category::Other, market_core::Category::Other),
+            (
+                oracledesk_types::Category::Other,
+                market_core::Category::Other,
+            ),
         ] {
             assert_eq!(shared.to_xdr(&env), imported.to_xdr(&env));
         }
@@ -5580,7 +5591,10 @@ mod golden {
         let env = Env::default();
         let declared = hex_of(&env, &signers(&env, &[G1, G2, G3], 2, 3_600));
         let canonical = hex_of(&env, &signers(&env, &[G3, G1, G2], 2, 3_600));
-        assert_eq!(declared, "4373448f97b0dd998a70efd9a1bfd3b3b8639bebaf682d9fc083c11f248a99ee");
+        assert_eq!(
+            declared,
+            "4373448f97b0dd998a70efd9a1bfd3b3b8639bebaf682d9fc083c11f248a99ee"
+        );
         assert_ne!(declared, canonical);
     }
 

@@ -117,7 +117,10 @@ fn map_market_core_code(error: soroban_sdk::Error) -> Error {
 /// name-dispatched trade calls); the panicking generated methods are never
 /// used.
 fn core_call<T>(
-    result: Result<Result<T, market_core::Error>, Result<soroban_sdk::Error, soroban_sdk::InvokeError>>,
+    result: Result<
+        Result<T, market_core::Error>,
+        Result<soroban_sdk::Error, soroban_sdk::InvokeError>,
+    >,
 ) -> Result<T, Error> {
     match result {
         Ok(Ok(value)) => Ok(value),
@@ -1770,16 +1773,18 @@ impl Treasury {
 
         let treasury_addr = env.current_contract_address();
         Self::authorize_token_pull(&env, &global, &treasury_addr, seed_amount);
-        let market_id = core_call(MarketCoreClient::new(&env, &global.market_core).try_create_market(
-            &treasury_addr,
-            &question_hash,
-            &resolution_hash,
-            &meta_uri,
-            &category,
-            &close_time,
-            &seed_amount,
-            &initial_yes_bps,
-        ))?;
+        let market_id = core_call(
+            MarketCoreClient::new(&env, &global.market_core).try_create_market(
+                &treasury_addr,
+                &question_hash,
+                &resolution_hash,
+                &meta_uri,
+                &category,
+                &close_time,
+                &seed_amount,
+                &initial_yes_bps,
+            ),
+        )?;
         Self::reserve_capacity(&env, &global, &agent, &policy, market_id, seed_amount)?;
         Self::reserve_net(&env, &global, market_id, seed_amount)?;
         Self::record_cost(&env, market_id, seed_amount)?;
