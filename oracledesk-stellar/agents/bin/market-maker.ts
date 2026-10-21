@@ -10,30 +10,36 @@
  * exactly once under the single-instance lease; `npm run agentd` runs the
  * same task continuously. Defaults to dry-run. Set AGENT_MODE=live and
  * MAKER_SECRET_KEY (or the shared AGENT_SECRET_KEY) to submit real testnet
- * transactions — see .env.example.
+ * transactions — see .env.example. Configuration is validated by
+ * core/config.ts first; `--print-config` prints it (secret redacted) and
+ * exits, `--offline` skips the network probes in dry-run.
  */
 import "dotenv/config";
-import { EXIT_CONFIG, EXIT_TEMPFAIL, parseAgentMode } from "../runtime/config.js";
+import { describeConfig, loadAgentConfig } from "../core/config.js";
+import { ConfigError, EXIT_CONFIG, EXIT_TEMPFAIL } from "../runtime/config.js";
 import { LeaseHeldError } from "../runtime/lease.js";
 import { Runtime } from "../runtime/runtime.js";
 import { makerTask } from "../runtime/tasks/maker.js";
-import { buildAdapter, createLease, createStateStore, loadDeployments, makerDeps, runtimeOptions } from "../runtime/wiring.js";
+import { buildAdapter, createLease, createStateStore, makerDeps, runtimeOptions } from "../runtime/wiring.js";
 
 async function main() {
-  const mode = parseAgentMode(process.env);
-  const deployments = loadDeployments();
-  const adapter = buildAdapter("maker", mode, process.env, deployments);
-  console.log(`[market-maker] mode=${mode}`);
+  const cfg = await loadAgentConfig({ role: "maker" });
+  if (cfg.printConfig) {
+    console.log(JSON.stringify(describeConfig(cfg), null, 2));
+    return;
+  }
+  const adapter = buildAdapter(cfg);
+  console.log(`[market-maker] mode=${cfg.mode} network=${cfg.network}`);
   const runtime = new Runtime({
-    tasks: [makerTask(makerDeps(process.env, adapter, deployments), { intervalMs: 0 })],
-    state: await createStateStore(mode, process.env, deployments.contracts.treasury),
-    lease: createLease(process.env),
-    ...runtimeOptions(process.env),
+    tasks: [makerTask(makerDeps(cfg, adapter, cfg.deployments), { intervalMs: 0 })],
+    state: await createStateStore(cfg.mode, cfg.env, cfg.deployments.contracts.treasury),
+    lease: createLease(cfg.env),
+    ...runtimeOptions(cfg.env),
   });
   await runtime.runOnce();
 }
 
 main().catch((err) => {
-  console.error(err);
-  process.exit(err instanceof LeaseHeldError ? EXIT_TEMPFAIL : err?.name === "ConfigError" ? EXIT_CONFIG : 1);
+  console.error(err instanceof ConfigError ? err.message : err);
+  process.exit(err instanceof LeaseHeldError ? EXIT_TEMPFAIL : err instanceof ConfigError ? EXIT_CONFIG : 1);
 });

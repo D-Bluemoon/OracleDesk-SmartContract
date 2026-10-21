@@ -16,6 +16,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { toTraceAction, type TraceActionType } from "../core/trace.js";
+import { assertNever, type AgentMode } from "../runtime/config.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // HERE is agents/stellar/ — the repo root is two levels up.
@@ -64,20 +65,22 @@ export function agentCredentials(
   };
 }
 
-export interface StellarAdapterOptions {
-  /** "dry-run" (default): builds and logs what would be submitted, never
-   * signs or sends. "live": actually submits real testnet transactions. */
-  mode: "dry-run" | "live";
+interface CommonAdapterOptions {
   networkPassphrase: string;
   rpcUrl: string;
-  /** The agent's secret key (`S...`). Required for `mode: "live"`; ignored
-   * (and may be omitted) in dry-run. */
-  agentSecret?: string;
   /** The acting agent's address for dry-run descriptions (live mode always
    * uses the secret key's public key). Defaults to `deployments.agent`. */
   agentAddress?: string;
   deployments: Deployments;
 }
+
+/**
+ * "dry-run": builds and logs what would be submitted, never signs or sends,
+ * and must not be handed a secret at all. "live": submits real transactions
+ * signed with `agentSecret` (`S...`), which it requires.
+ */
+export type StellarAdapterOptions = CommonAdapterOptions &
+  ({ mode: "dry-run"; agentSecret?: undefined } | { mode: "live"; agentSecret?: string });
 
 export interface DryRunResult {
   dryRun: true;
@@ -114,18 +117,24 @@ export class StellarAdapter {
   private readonly publicKey?: string;
 
   constructor(private readonly opts: StellarAdapterOptions) {
-    if (opts.mode !== "dry-run" && opts.mode !== "live") {
-      throw new Error(`unknown mode ${JSON.stringify(opts.mode)}: expected "dry-run" or "live"`);
-    }
-    if (opts.mode === "live") {
-      if (!opts.agentSecret) throw new Error("live mode requires agentSecret");
-      const keypair = Keypair.fromSecret(opts.agentSecret);
-      this.signer = new KeypairSigner(keypair, opts.networkPassphrase);
-      this.publicKey = keypair.publicKey();
+    switch (opts.mode) {
+      case "dry-run":
+        if (opts.agentSecret !== undefined) throw new Error("dry-run mode must not be given agentSecret");
+        break;
+      case "live": {
+        if (!opts.agentSecret) throw new Error("live mode requires agentSecret");
+        const keypair = Keypair.fromSecret(opts.agentSecret);
+        this.signer = new KeypairSigner(keypair, opts.networkPassphrase);
+        this.publicKey = keypair.publicKey();
+        break;
+      }
+      default:
+        // Only the mode is printed: opts may carry a secret.
+        assertNever(opts, "mode", (opts as { mode?: unknown }).mode);
     }
   }
 
-  get mode(): "dry-run" | "live" {
+  get mode(): AgentMode {
     return this.opts.mode;
   }
 
@@ -170,8 +179,13 @@ export class StellarAdapter {
     call: (client: any) => Promise<{ signAndSend: () => Promise<{ result: T }> }>,
   ): Promise<AdapterResult<T>> {
     const contractId = this.opts.deployments.contracts[pkg];
-    if (this.opts.mode === "dry-run") {
-      return { dryRun: true, contractId, method: methodName, args };
+    switch (this.opts.mode) {
+      case "dry-run":
+        return { dryRun: true, contractId, method: methodName, args };
+      case "live":
+        break;
+      default:
+        assertNever(this.opts, "mode", (this.opts as { mode?: unknown }).mode);
     }
     let assembled: Awaited<ReturnType<typeof call>>;
     try {
