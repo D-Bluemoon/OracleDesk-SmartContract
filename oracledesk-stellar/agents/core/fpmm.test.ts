@@ -142,7 +142,8 @@ test("committed cross-language vectors match", () => {
   const lines = readFileSync(vectorsPath, "utf8").trim().split("\n");
   for (const [i, line] of lines.entries()) {
     const c = JSON.parse(line) as { fn: string; args: string[]; ok: Record<string, string> };
-    const a = c.args.map((x) => BigInt(x));
+    // settle_value's first arg is an outcome name, not a number.
+    const a = c.args.map((x) => (/^-?\d+$/.test(x) ? BigInt(x) : 0n));
     let actual: Record<string, string>;
     switch (c.fn) {
       case "calc_buy": {
