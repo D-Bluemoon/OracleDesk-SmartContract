@@ -5,15 +5,13 @@
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit",
-    "test": "tsx --test core/*.test.ts stellar/*.test.ts bin/*.test.ts runtime/*.test.ts",
+    "test": "tsx --test core/*.test.ts stellar/*.test.ts bin/*.test.ts runtime/*.test.ts sim/*.test.ts",
     "market-maker": "tsx bin/market-maker.ts",
     "trader": "tsx bin/trader.ts",
-    "agentd": "tsx bin/agentd.ts"
-    "test": "tsx --test core/*.test.ts stellar/*.test.ts bin/*.test.ts sim/*.test.ts",
-    "market-maker": "tsx bin/market-maker.ts",
-    "trader": "tsx bin/trader.ts",
-    "coverage": "c8 --all --src . --reporter=lcovonly --reporter=text-summary --report-dir ../coverage/agents --exclude '**/*.test.ts' --exclude 'node_modules/**' --exclude 'dist/**' --exclude '**/*.d.ts' tsx --test core/*.test.ts stellar/*.test.ts bin/*.test.ts"
+    "agentd": "tsx bin/agentd.ts",
+    "coverage": "c8 --all --src . --reporter=lcovonly --reporter=text-summary --report-dir ../coverage/agents --exclude '**/*.test.ts' --exclude 'node_modules/**' --exclude 'dist/**' --exclude '**/*.d.ts' tsx --test core/*.test.ts stellar/*.test.ts bin/*.test.ts runtime/*.test.ts sim/*.test.ts"
   },
+
   "dependencies": {
     "@oracledesk/bindings-market-core": "file:../packages/bindings/market-core",
     "@oracledesk/bindings-reasoning-registry": "file:../packages/bindings/reasoning-registry",
