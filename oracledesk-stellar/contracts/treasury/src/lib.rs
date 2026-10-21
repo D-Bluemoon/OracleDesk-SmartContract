@@ -549,7 +549,7 @@ pub enum Error {
     YieldWithdrawFailed = 42,
     VenueHasPrincipal = 43,
     /// Category exposure would exceed its correlation cap (#49).
-    CategoryCapExceeded = 2029,
+    CategoryCapExceeded = 44,
     /// Close-date bucket exposure would exceed its cap (#49).
     BucketCapExceeded = 45,
     /// `accept_admin`/`cancel_admin_transfer` called with nothing proposed.
@@ -3945,6 +3945,82 @@ mod test {
         BytesN, String,
     };
 
+    // ---- dual registration of market-core (coverage, issue #75) ---------------
+    //
+    // The wasm copy is what ships and what ADR 0002 requires the contract to be
+    // *built* against, but code running inside the wasm VM is invisible to
+    // `cargo llvm-cov`. A native `market-core` registration (a dev-dependency:
+    // the duplicate `__constructor` export that forbids this in the wasm build
+    // does not exist in a native test binary) runs the same scenarios as host
+    // code. `MARKET_CORE_IMPL=native cargo test` flips the whole suite;
+    // `both_modes!` pins individual scenarios to both.
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum McImpl {
+        Wasm,
+        Native,
+    }
+
+    std::thread_local! {
+        static MC_OVERRIDE: core::cell::Cell<Option<McImpl>> = const { core::cell::Cell::new(None) };
+    }
+
+    fn mc_impl() -> McImpl {
+        MC_OVERRIDE.with(|c| c.get()).unwrap_or_else(|| {
+            match std::env::var("MARKET_CORE_IMPL").as_deref() {
+                Ok("native") => McImpl::Native,
+                _ => McImpl::Wasm,
+            }
+        })
+    }
+
+    /// Runs `f` with market-core registered as `how`, restoring the previous
+    /// choice even if `f` panics.
+    fn with_market_core<R>(how: McImpl, f: impl FnOnce() -> R) -> R {
+        struct Restore(Option<McImpl>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                MC_OVERRIDE.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(MC_OVERRIDE.with(|c| c.replace(Some(how))));
+        f()
+    }
+
+    /// `(admin, collateral, treasury, resolver, default_fee_bps, protocol_share_bps)`.
+    fn register_market_core(
+        env: &Env,
+        args: (Address, Address, Address, Address, u32, u32),
+    ) -> Address {
+        match mc_impl() {
+            McImpl::Wasm => env.register(market_core::WASM, args),
+            McImpl::Native => env.register(
+                ::market_core_native::MarketCore,
+                ::market_core_native::MarketCoreArgs::__constructor(
+                    &args.0, &args.1, &args.2, &args.3, &args.4, &args.5,
+                ),
+            ),
+        }
+    }
+
+    /// Re-runs existing scenario tests (`#[test]` functions are plain functions
+    /// too) once per market-core registration, as `<name>::wasm` and
+    /// `<name>::native`.
+    macro_rules! both_modes {
+        ($($name:ident),+ $(,)?) => {$(
+            mod $name {
+                #[test]
+                fn wasm() {
+                    super::with_market_core(super::McImpl::Wasm, super::$name);
+                }
+                #[test]
+                fn native() {
+                    super::with_market_core(super::McImpl::Native, super::$name);
+                }
+            }
+        )+};
+    }
+
     // Comfortably past every timestamp advance the tests make, so a market
     // never closes out from under a trade mid-test.
     const MARKET_CLOSE: u64 = 1_000 + 30 * DAY_SECONDS;
@@ -3968,6 +4044,8 @@ mod test {
         env: Env,
         admin: Address,
         agent: Address,
+        #[allow(dead_code)]
+        resolver: Address,
         treasury: TreasuryClient<'static>,
         treasury_id: Address,
         token: Address,
@@ -4055,8 +4133,8 @@ mod test {
         }
 
         let resolver = Address::generate(&env);
-        let market_core_id = env.register(
-            market_core::WASM,
+        let market_core_id = register_market_core(
+            &env,
             (
                 admin.clone(),
                 collateral.address(),
@@ -4885,6 +4963,57 @@ mod test {
         // ...and gone from hour 25's.
         f.env.ledger().set_timestamp(25 * BUCKET_SECONDS);
         assert_eq!(f.treasury.daily_headroom(), 60 * USDC);
+    }
+
+    /// Regression for I4 ("no `max_daily` in any 24h"), the shape of the
+    /// shortest counterexample the exhaustive explorer
+    /// (`contracts/integration-tests`, `treasury_caps_exhaustive`) reports when
+    /// the window is mutated to 24 buckets instead of 25: spend near the end of
+    /// an hour, then again 86_399s later. 24h earlier than the second trade is
+    /// still inside the window because the first trade's hour is only
+    /// partially covered. The original fixed daily window (reset to `now` at
+    /// the first call after 24h) allowed up to 2x `max_daily` here; the
+    /// sliding window allows exactly `max_daily`.
+    #[test]
+    fn explorer_i4_sequence_stays_within_max_daily() {
+        let u = 100 * USDC;
+        let f = fixture_with_caps(2 * u, 3 * u, 4 * u);
+        // A second market, so the daily cap binds before the per-market cap.
+        let creator = Address::generate(&f.env);
+        StellarAssetClient::new(&f.env, &f.token).mint(&creator, &(1_000 * USDC));
+        let second = f.market_core.create_market(
+            &creator,
+            &BytesN::from_array(&f.env, &[12u8; 32]),
+            &BytesN::from_array(&f.env, &[112u8; 32]),
+            &String::from_str(&f.env, "ipfs://second-market"),
+            &Category::Crypto,
+            &MARKET_CLOSE,
+            &(100 * USDC),
+            &5000u32,
+        );
+        let first = 24 * BUCKET_SECONDS + 3_599;
+        f.env.ledger().set_timestamp(first);
+        f.treasury
+            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &u, &0);
+        f.treasury
+            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(2 * u), &0);
+
+        // 86_399s later the first hour is still counted: 3u + 2u > 4u.
+        f.env.ledger().set_timestamp(first + 86_399);
+        assert_eq!(
+            f.treasury
+                .try_agent_buy(&f.agent, &second, &Outcome::Yes, &(2 * u), &0),
+            Err(Ok(Error::DailyCapExceeded))
+        );
+        // The failed call spent nothing; a buy that fits the remaining 1u does.
+        assert_eq!(f.treasury.daily_headroom(), u);
+        f.treasury
+            .agent_buy(&f.agent, &second, &Outcome::Yes, &u, &0);
+
+        // Once the first trade's hour has left the 25-bucket window (hour 49
+        // covers hours 25..=49) its 3u are free again.
+        f.env.ledger().set_timestamp(49 * BUCKET_SECONDS);
+        assert_eq!(f.treasury.daily_headroom(), 3 * u);
     }
 
     #[test]
@@ -6052,8 +6181,8 @@ mod test {
             .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(20 * USDC), &0);
 
         let creator = f.market_core.get_market(&f.market_id).creator;
-        let new_core_id = f.env.register(
-            market_core::WASM,
+        let new_core_id = register_market_core(
+            &f.env,
             (
                 f.admin.clone(),
                 f.token.clone(),
@@ -8031,4 +8160,73 @@ mod test {
         let err = f.treasury.try_set_yield_venue(&pool2, &(200 * USDC));
         assert_eq!(err, Err(Ok(Error::VenueHasPrincipal)));
     }
+
+    /// Everything observable about market-core through a treasury scenario,
+    /// as text: the treasury's trades, caps bookkeeping, resolution and
+    /// settlement.
+    fn market_core_trace() -> std::vec::Vec<std::string::String> {
+        use std::format;
+        let f = fixture();
+        let id = f.market_id;
+        let mut t = std::vec::Vec::new();
+        t.push(format!(
+            "price {}",
+            f.market_core.get_price(&id, &Outcome::Yes)
+        ));
+        t.push(format!(
+            "buy {}",
+            f.treasury
+                .agent_buy(&f.agent, &id, &Outcome::Yes, &(20 * USDC), &0)
+        ));
+        t.push(format!(
+            "buy-no {}",
+            f.treasury
+                .agent_buy(&f.agent, &id, &Outcome::No, &(10 * USDC), &0)
+        ));
+        t.push(format!(
+            "sell {}",
+            f.treasury
+                .agent_sell(&f.agent, &id, &Outcome::Yes, &(5 * USDC), &(1_000 * USDC))
+        ));
+        t.push(format!(
+            "pos {:?}",
+            f.market_core.get_position(&id, &f.treasury_id)
+        ));
+        t.push(format!("usage {:?}", f.treasury.daily_usage()));
+        t.push(format!("net {:?}", f.treasury.net_position(&id)));
+        t.push(format!("close {:?}", f.treasury.close_trade(&f.agent, &id)));
+        f.env.ledger().set_timestamp(MARKET_CLOSE);
+        f.market_core.resolve(&id, &Outcome::Yes);
+        t.push(format!("redeem {}", f.treasury.redeem(&f.agent, &id)));
+        t.push(format!("net-after {:?}", f.treasury.net_position(&id)));
+        t.push(format!("again {:?}", f.treasury.try_redeem(&f.agent, &id)));
+        t
+    }
+
+    /// The native registration (which coverage can see) must behave exactly
+    /// like the wasm that ships; see the resolver's twin of this test.
+    #[test]
+    fn native_and_wasm_market_core_agree() {
+        let wasm = with_market_core(McImpl::Wasm, market_core_trace);
+        let native = with_market_core(McImpl::Native, market_core_trace);
+        assert_eq!(wasm, native);
+        assert!(wasm.len() > 10, "{wasm:?}");
+    }
+
+    both_modes!(
+        enforces_caps_and_closes_exposure,
+        rejects_trade_above_single_trade_cap,
+        rejects_trade_above_daily_cap,
+        agent_sell_returns_capital_without_touching_caps,
+        paused_treasury_rejects_agent_trading,
+        daily_cap_frees_capacity_after_window_slides,
+        burst_across_old_window_boundary_is_rejected,
+        explorer_i4_sequence_stays_within_max_daily,
+        redeem_and_claim_reduce_net_exposure,
+        nav_unchanged_by_redeem_after_resolution,
+        settle_market_redeems_position_after_resolution,
+        settle_market_is_idempotent_and_never_errors_on_retry,
+        market_core_switch_namespaces_exposure_and_allows_legacy_redeem,
+        migrate_then_successor_redeems_after_resolution,
+    );
 }

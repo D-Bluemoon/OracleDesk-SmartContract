@@ -46,4 +46,12 @@ agents/sim/results/
 .vscode/
 .idea/
 .DS_Store
+
+# Coverage output (scripts/coverage.sh). The thresholds and README are the
+# only tracked files in coverage/.
+coverage/*
+!coverage/thresholds.json
+!coverage/README.md
+
+# Python bytecode from the scripts/ helpers
 __pycache__/
