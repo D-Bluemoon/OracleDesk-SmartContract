@@ -16,7 +16,8 @@
  */
 import "dotenv/config";
 import { pathToFileURL } from "node:url";
-import { buildTrace, LocalTraceStore } from "../core/trace.js";
+import { buildTrace, type TraceStore } from "../core/trace.js";
+import { createTraceStore } from "../core/trace-store-factory.js";
 import { BPS } from "../core/fpmm.js";
 import { decideTrade, type MarketState } from "../core/strategy.js";
 import { agentCredentials, loadDeployments, StellarAdapter } from "../stellar/adapter.js";
@@ -28,14 +29,15 @@ import { Server } from "@stellar/stellar-sdk/rpc";
 
 /**
  * Exported (and injectable) so tests can drive the whole trade flow with a
- * fake adapter and clock. `now` returns unix seconds.
+ * fake adapter and clock. `now` returns unix seconds. The trace store
+ * defaults to `createTraceStore(env, adapter.mode)` (TRACE_STORE=local|ipfs).
  */
 export async function main(
   adapter: StellarAdapter,
   env: NodeJS.ProcessEnv = process.env,
   now: () => number = () => Math.floor(Date.now() / 1000),
+  traceStore: TraceStore = createTraceStore(env, adapter.mode).store,
 ): Promise<void> {
-  const traceStore = new LocalTraceStore(env.TRACE_STORE_DIR ?? "./.traces");
   const deployments = adapter.deployments ?? {};
 
   const rpcUrl = env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org";
@@ -88,7 +90,15 @@ export async function main(
       reasoning: decision.reasoning,
       inputs: { market, fairValueBps, decision },
     });
-    const { cid } = await traceStore.put(built.hash, built.json);
+    // The trace must be pinned and verified before the trade: never trade
+    // without a publishable trace.
+    let cid: string;
+    try {
+      ({ cid } = await traceStore.put(built.hash, built.json));
+    } catch (err) {
+      console.error(`[trader] market=${market.marketId} skipped: trace ${built.hash} could not be stored:`, err);
+      continue;
+    }
     console.log(`[trader] trace ${built.hash} -> ${cid}`);
 
     const outcome = decision.outcome as "Yes" | "No";
