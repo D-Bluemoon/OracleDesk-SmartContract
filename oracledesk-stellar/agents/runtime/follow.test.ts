@@ -21,7 +21,7 @@ function fakeAdapter(buys: bigint[], exposure: Record<string, bigint>): FollowAd
       throw new Error("tests inject the RPC");
     },
     contractIds: () => ({ ...IDS, usdc: IDS.treasury }),
-    getMarket: async () => ({ creator: "G", questionHash: "", resolutionHash: "", closeTime: BigInt(NOW + 3600), status: "Open", reserveYes: 600n, reserveNo: 400n }),
+    getMarket: async () => ({ creator: "G", questionHash: "", resolutionHash: "", closeTime: BigInt(NOW + 3600), status: "Open", reserveYes: 600n, reserveNo: 400n, feeBps: 100n }),
     treasuryPosition: async (id) => ({ yes: exposure[String(id)] ?? 0n, no: 0n }),
     resolutionState: async () => "SignersPending",
     quoteBuy: async () => 1_000n,

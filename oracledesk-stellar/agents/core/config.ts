@@ -138,6 +138,17 @@ export const EnvSchema = z.object({
   EVENTS_CONCURRENCY: intField(4, 1, 64),
   EVENTS_MAX_ATTEMPTS: intField(5, 1, 100),
   EVENTS_DISPUTE_WINDOW_SECS: intField(600, 0, 30 * 86_400),
+  ARB_ENABLED: z.enum(["0", "1", "false", "true"], { error: (i) => `must be 0, 1, false or true, got ${JSON.stringify(i.input)}` }).default("0"),
+  ARB_RELATIONS_FILE: nonEmptyPath,
+  ARB_JOURNAL_FILE: nonEmptyPath,
+  ARB_MAX_NOTIONAL: stroopsField(1_000_000_000n),
+  ARB_MIN_PROFIT_STROOPS: stroopsField(1_000_000n, 0n),
+  ARB_MIN_PROFIT_BPS: bpsField(50),
+  ARB_MAX_UNHEDGED_STROOPS: stroopsField(500_000_000n),
+  ARB_MARKET_HEADROOM_BPS: intField(2_000, 0, 9_999),
+  ARB_MAX_LEG_LOSS: stroopsField(10_000_000n, 0n),
+  ARB_MAX_OPEN_LEGS: intField(2, 2, 64),
+  ARB_MAX_UNWIND_RETRIES: intField(3, 1, 20),
   USDC_CONTRACT_ID: contractIdField,
   MARKET_CORE_CONTRACT_ID: contractIdField,
   RESOLVER_CONTRACT_ID: contractIdField,
@@ -257,6 +268,21 @@ export interface EventsConfig {
   disputeWindowSecs: number;
 }
 
+/** Cross-market arbitrage (#108); off unless ARB_ENABLED. */
+export interface ArbConfig {
+  enabled: boolean;
+  relationsFile?: string;
+  journalFile: string;
+  maxNotional: bigint;
+  minProfit: bigint;
+  minProfitBps: bigint;
+  maxUnhedged: bigint;
+  marketHeadroomBps: bigint;
+  maxLegLoss: bigint;
+  maxOpenLegs: number;
+  maxUnwindRetries: number;
+}
+
 export interface MakerConfig {
   confidenceThresholdBps: number;
   defaultSeedStroops: bigint;
@@ -270,6 +296,7 @@ export interface Tunables {
   trading: TradingConfig;
   maker: MakerConfig;
   events: EventsConfig;
+  arb: ArbConfig;
   /** Runtime knobs (lease, state file, backoff, trace store selection) still
    * read by runtime/wiring.ts. Never printed: it may hold secrets. */
   env: NodeJS.ProcessEnv;
@@ -338,6 +365,19 @@ function tunablesFrom(e: ParsedEnv, env: NodeJS.ProcessEnv): Tunables {
       maxAttempts: e.EVENTS_MAX_ATTEMPTS!,
       disputeWindowSecs: e.EVENTS_DISPUTE_WINDOW_SECS!,
     },
+    arb: {
+      enabled: e.ARB_ENABLED === "1" || e.ARB_ENABLED === "true",
+      relationsFile: e.ARB_RELATIONS_FILE,
+      journalFile: e.ARB_JOURNAL_FILE ?? "./.arb/journal.jsonl",
+      maxNotional: e.ARB_MAX_NOTIONAL,
+      minProfit: e.ARB_MIN_PROFIT_STROOPS,
+      minProfitBps: BigInt(e.ARB_MIN_PROFIT_BPS!),
+      maxUnhedged: e.ARB_MAX_UNHEDGED_STROOPS,
+      marketHeadroomBps: BigInt(e.ARB_MARKET_HEADROOM_BPS!),
+      maxLegLoss: e.ARB_MAX_LEG_LOSS,
+      maxOpenLegs: e.ARB_MAX_OPEN_LEGS!,
+      maxUnwindRetries: e.ARB_MAX_UNWIND_RETRIES!,
+    },
     env,
   };
 }
@@ -373,6 +413,7 @@ export async function loadAgentConfig(o: LoadAgentConfigOptions): Promise<AgentC
     issues.push(`STELLAR_NETWORK_PASSPHRASE "${e.STELLAR_NETWORK_PASSPHRASE}" does not match STELLAR_NETWORK=${network} ("${canonical}")`);
   }
   if (offline && mode === "live") issues.push("--offline is only allowed in dry-run: live mode must verify the network first");
+  if ((e.ARB_ENABLED === "1" || e.ARB_ENABLED === "true") && !e.ARB_RELATIONS_FILE) issues.push("ARB_ENABLED needs ARB_RELATIONS_FILE");
 
   // Deployment record.
   if (e.DEPLOYMENTS_FILE && e.DEPLOYMENTS_PATH && e.DEPLOYMENTS_FILE !== e.DEPLOYMENTS_PATH) {
@@ -490,9 +531,11 @@ async function verifyNetwork(cfg: AgentConfig, probe: NetworkProbe, log: (m: str
 /** A printable copy of the config. The secret becomes its public key; the raw
  * environment is dropped entirely. */
 export function describeConfig(cfg: AgentConfig): Record<string, unknown> {
-  const { env: _env, agentSecret, trading, maker, events, ...rest } = cfg;
+  const { env: _env, agentSecret, trading, maker, events, arb, ...rest } = cfg;
+  const strings = (o: object) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, typeof v === "bigint" ? v.toString() : v]));
   return {
     ...rest,
+    arb: strings(arb),
     events: { ...events, tradeThresholdStroops: events.tradeThresholdStroops.toString() },
     agentSecret: agentSecret ? { publicKey: Keypair.fromSecret(agentSecret).publicKey(), redacted: true } : null,
     trading: { ...trading, tradeSizeStroops: trading.tradeSizeStroops.toString() },

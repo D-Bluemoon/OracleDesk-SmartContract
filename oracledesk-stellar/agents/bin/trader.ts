@@ -22,7 +22,9 @@
 import "dotenv/config";
 import { pathToFileURL } from "node:url";
 import { describeConfig, loadAgentConfig, type AgentConfig, type Tunables } from "../core/config.js";
+import { LocalTraceStore } from "../core/trace.js";
 import { followTask } from "../runtime/follow.js";
+import { arbitrageTask } from "../runtime/tasks/arbitrage.js";
 import { jsonLogger } from "../runtime/log.js";
 import { ConfigError, EXIT_CONFIG, EXIT_TEMPFAIL } from "../runtime/config.js";
 import { LeaseHeldError } from "../runtime/lease.js";
@@ -45,12 +47,18 @@ export async function main(
 ): Promise<void> {
   const deployments = (adapter as Partial<StellarAdapter>).deployments;
   const runtime = new Runtime({
-    tasks: [traderTask(traderDeps(run, adapter, deployments, now), { intervalMs: 0 })],
+    tasks: [traderTask(traderDeps(run, adapter, deployments, now), { intervalMs: 0 }), ...arbTasks(run, adapter, now, 0)],
     state: await createStateStore(adapter.mode, run.env, deployments?.contracts.treasury ?? "unbound"),
     lease: createLease(run.env),
     ...runtimeOptions(run.env),
   });
   await runtime.runOnce();
+}
+
+/** The arbitrage task when ARB_ENABLED (#108); see runtime/tasks/arbitrage.ts. */
+function arbTasks(run: Tunables, adapter: StellarAdapter, now: () => number, intervalMs: number) {
+  if (!run.arb.enabled) return [];
+  return [arbitrageTask({ adapter, cfg: run.arb, traceStore: new LocalTraceStore(run.traceStoreDir), nowSecs: now }, { intervalMs })];
 }
 
 /**
@@ -68,7 +76,7 @@ export async function follow(cfg: AgentConfig, adapter: StellarAdapter, now: () 
     log: (event, fields) => log.info(event, fields),
   });
   const runtime = new Runtime({
-    tasks: [task],
+    tasks: [task, ...arbTasks(cfg, adapter, now, cfg.events.pollIntervalMs)],
     state: await createStateStore(cfg.mode, cfg.env, cfg.deployments.contracts.treasury),
     lease: createLease(cfg.env),
     log,

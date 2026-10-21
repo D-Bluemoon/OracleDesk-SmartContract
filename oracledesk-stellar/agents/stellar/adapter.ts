@@ -340,6 +340,7 @@ export class StellarAdapter {
         status: "Open" | "Resolved" | "Void";
         reserveYes: bigint;
         reserveNo: bigint;
+        feeBps: bigint;
       }
     | undefined
   > {
@@ -355,7 +356,33 @@ export class StellarAdapter {
       status: m.status.tag,
       reserveYes: BigInt(m.reserve_yes),
       reserveNo: BigInt(m.reserve_no),
+      feeBps: BigInt(m.fee_bps),
     };
+  }
+
+  /**
+   * The treasury caps that bound this agent: the stricter of the global
+   * config and the agent's own policy, plus what it has spent today.
+   */
+  async riskCaps(): Promise<{ maxTrade: bigint; maxMarket: bigint; maxDaily: bigint; dailyUsed: bigint }> {
+    const client = await this.client<any>("treasury", "@oracledesk/bindings-treasury");
+    const config = unwrapContractResult("get_config", (await client.get_config()).result) as { max_trade: bigint; max_market: bigint; max_daily: bigint };
+    const policy = (await client.get_agent({ agent: this.agent })).result as { max_trade: bigint; max_daily: bigint } | undefined;
+    const usage = unwrapContractResult("agent_daily_usage", (await client.agent_daily_usage({ agent: this.agent })).result) as { amount: bigint };
+    const min = (a: bigint, b?: bigint) => (b !== undefined && BigInt(b) < BigInt(a) ? BigInt(b) : BigInt(a));
+    return {
+      maxTrade: min(config.max_trade, policy?.max_trade),
+      maxMarket: BigInt(config.max_market),
+      maxDaily: min(config.max_daily, policy?.max_daily),
+      dailyUsed: BigInt(usage.amount),
+    };
+  }
+
+  /** What the treasury has committed to `marketId` (its cost basis). */
+  async marketSpent(marketId: bigint): Promise<bigint> {
+    const client = await this.client<any>("treasury", "@oracledesk/bindings-treasury");
+    const v = unwrapContractResult("market_valuation", (await client.market_valuation({ market_id: marketId })).result) as { cost_basis: bigint };
+    return BigInt(v.cost_basis);
   }
 
   /** An RPC client for this adapter's network (event polling, ledger reads). */
