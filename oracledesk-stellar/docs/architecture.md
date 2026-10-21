@@ -797,6 +797,58 @@ resync handler re-evaluates every tradable market after a gap.
 `npm run trader -- --follow` runs this loop (`runtime/follow.ts`); without
 `--follow` the trader behaves exactly as before.
 
+### Cross-market arbitrage (agents, #108)
+
+Independent FPMM pools can price related markets inconsistently. With
+`ARB_ENABLED=1` the trader runs an `arbitrage` task
+(`runtime/tasks/arbitrage.ts`) over the relations in `ARB_RELATIONS_FILE`:
+
+```json
+{ "relations": [ { "id": "btc-100k-implies-90k", "type": "implies", "a": 12, "b": 7,
+    "resolution": { "a": { "mechanism": "price", "source": "reflector:BTC/USD" },
+                    "b": { "mechanism": "price", "source": "reflector:BTC/USD" } },
+    "voidCorrelation": "joint", "maxCloseSkewSecs": 0 } ] }
+```
+
+- **Relations** (`core/strategies/arbitrage.ts`): `implies` (P(A) <= P(B)),
+  `complement` (P(A) + P(B) = 1) and `exclusive` (P(A) + P(B) <= 1). A
+  relation is rejected unless both markets exist and are open, their close
+  times are within `maxCloseSkewSecs`, and both declare the *same*
+  resolution mechanism and source; a declared `resolutionHash` must equal
+  the market's on-chain commitment. The file's canonical sha256 (the graph
+  hash) is recorded in every trace.
+- **Planning**: for each pair of legs, a payoff table over every outcome the
+  relation allows, plus void scenarios (`joint`: both void together;
+  `independent`: either may void alone, paying half per share), gives the
+  worst-case payout, measured on top of existing treasury holdings. Costs
+  are exact integer FPMM collateral (`collateralForShares`: fees, price
+  impact and rounding). The share count is found by integer ternary search
+  and a +/-64 verification scan, inside `max_trade`, remaining `max_market`
+  headroom, the rolling `max_daily` and `ARB_MAX_NOTIONAL`, and must clear
+  `ARB_MIN_PROFIT_STROOPS` and `ARB_MIN_PROFIT_BPS`.
+- **Risk** (`core/risk.ts`, `checkArbPlan`): treasury caps and existing
+  exposure; `ARB_MARKET_HEADROOM_BPS` of each market's `max_market` kept free
+  for later hedges; `ARB_MAX_UNHEDGED_STROOPS` caps the first leg, which is
+  the exposure left if the second never fills; `ARB_MAX_OPEN_LEGS` and
+  `ARB_MAX_UNWIND_RETRIES` bound concurrent legs and unwind attempts.
+- **Execution** (`core/strategies/arb-executor.ts`): treasury calls are not
+  atomic, so the legs are sequential. The less liquid market goes first,
+  re-quoted and bought with `min_shares_out` = the planned shares. The second
+  market is then re-read; if its cost rose by more than `ARB_MAX_LEG_LOSS`
+  the first leg is sold back with `agent_sell`, otherwise the second leg is
+  bought. Every step is journaled before and after submission in
+  `ARB_JOURNAL_FILE`, and the next run finishes or unwinds any plan a crash
+  interrupted, settling ambiguous submissions from the treasury's positions.
+  A trace with the relation, graph hash, snapshots, plan and leg results is
+  published when a plan completes or is unwound. Dry-run only plans and logs.
+
+**Residual risks.** Between the legs the treasury holds one side naked: a
+fast move can cost up to `ARB_MAX_LEG_LOSS` plus the unwind's price impact,
+and if every unwind attempt fails the leg stays open (`ARB_UNHEDGED` is
+logged and the plan closes as `unwind-failed`). The relation file is
+trusted: a wrong relation produces confident, wrong trades, which is why
+compatibility must be declared and is checked against the chain.
+
 ## Known limitations (see docs/STATUS.md for the full, current list)
 
 - Testnet only; unaudited.
