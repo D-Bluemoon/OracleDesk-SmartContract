@@ -213,7 +213,7 @@ test("a chaos seed reproduces the same faults and the same outcome", async () =>
   assert.notDeepEqual(c.faults, a.faults);
 });
 
-for (const seed of [1n, 2n, 3n]) {
+for (const seed of [1n, 2n, 3n, 7n, 9n]) {
   test(`chaos seed ${seed}: no trade is left without a trace unless its outcome was ambiguous`, async () => {
     const r = await chaosRun(seed);
     // Each traceless trade must be explained by an ambiguous "intent" left

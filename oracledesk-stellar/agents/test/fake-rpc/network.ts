@@ -6,6 +6,11 @@
  * `blockRealNetwork()` replaces global fetch (the SDK's HTTP transport) with
  * one that refuses anything but the loopback fake, so a test can never reach
  * a real network by accident.
+ *
+ * While a fake network runs, `Date.now()` follows its ledger clock. The SDK
+ * stamps transaction time bounds and `buildTrace` stamps traces from
+ * `Date.now()`, so without this a run's hashes, and whether two ticks share a
+ * second, would depend on the wall clock.
  */
 import { Keypair, StrKey } from "@stellar/stellar-sdk";
 import { toTraceAction } from "../../core/trace.js";
@@ -111,6 +116,8 @@ export async function startFakeNetwork(opts: { plan?: FaultPlan; maxTrade?: bigi
     creator: StrKey.encodeContract(Buffer.alloc(32, 0x0e)),
   });
   const url = await rpc.start();
+  const realNow = Date.now;
+  Date.now = () => rpc.clock.closeTime * 1000;
   return {
     rpc,
     url,
@@ -119,7 +126,10 @@ export async function startFakeNetwork(opts: { plan?: FaultPlan; maxTrade?: bigi
     market,
     adapter: () =>
       new StellarAdapter({ mode: "live", agentSecret: AGENT.secret(), networkPassphrase: NETWORK_PASSPHRASE, rpcUrl: url, deployments }),
-    stop: () => rpc.stop(),
+    stop: async () => {
+      Date.now = realNow;
+      await rpc.stop();
+    },
   };
 }
 
