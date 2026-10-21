@@ -29,6 +29,49 @@ import {
 export type { TraceRecord };
 export interface TraceRepository {
   get(traceId: string): Promise<TraceRecord | undefined>;
+  getFull?(traceId: string): Promise<(TraceRecord & { marketId?: bigint; agent?: string }) | undefined>;
+  market_trace_count?(args: { market_id: bigint }): Promise<bigint>;
+  market_trace_at?(args: { market_id: bigint; index: bigint }): Promise<bigint | null>;
+  trace_count?(): Promise<bigint>;
+}
+
+/**
+ * A trace row as returned by the reasoning-registry's paginated secondary
+ * indexes (#57). Unlike {@link TraceRecord} it is metadata only: the IPFS
+ * body is fetched and hash-verified only by the *paid* `GET /traces/:traceId`.
+ *
+ * Deliberately carries **no `ipfsCid`**: the listing routes are unpaid, and
+ * returning the CID would let a caller fetch the content straight from the
+ * gateway and bypass the paywall.
+ */
+export interface TraceListEntry {
+  traceId: string;
+  traceHash: string;
+  marketId: string;
+  agent: string;
+  action: string;
+  publishedAt: string;
+}
+
+export interface TraceListPage {
+  items: TraceListEntry[];
+  /** Index of the first entry the next page would return. */
+  next: string;
+  total: string;
+}
+
+/**
+ * Optional listing surface backed by the reasoning-registry's #57 indexes:
+ * "everything agent X published" and "every Buy decision on market 7".
+ */
+export interface TraceListRepository {
+  listByAgent(agent: string, cursor?: string, limit?: number): Promise<TraceListPage>;
+  listByMarketAction(
+    marketId: string,
+    action: string,
+    cursor?: string,
+    limit?: number,
+  ): Promise<TraceListPage>;
 }
 export interface TracePaymentNetwork {
   network: "stellar:testnet" | "stellar:pubnet";
@@ -38,6 +81,8 @@ export interface TracePaymentNetwork {
 }
 export interface TraceApiOptions {
   repository: TraceRepository;
+  /** Present only when the deployment has a reasoning-registry configured. */
+  listRepository?: TraceListRepository;
   ipfsGateway: string;
   price: string;
   networks: TracePaymentNetwork[];
