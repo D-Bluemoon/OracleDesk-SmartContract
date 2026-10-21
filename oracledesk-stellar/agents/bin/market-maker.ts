@@ -37,6 +37,9 @@ import { buildAdapter, createLease, createStateStore, loadDeployments, makerDeps
  * against the Rust CLI.
  */
 import "dotenv/config";
+import { createHash } from "node:crypto";
+import { buildTrace, canonicalize } from "../core/trace.js";
+import { createTraceStore } from "../core/trace-store-factory.js";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildTrace, LocalTraceStore } from "../core/trace.js";
@@ -109,6 +112,7 @@ async function main() {
     ...agentCredentials("maker", process.env, deployments),
     deployments,
   });
+  const { store: traceStore, kind: traceStoreKind } = createTraceStore(process.env, mode);
   const traceStore = new LocalTraceStore(process.env.TRACE_STORE_DIR ?? "./.traces");
   // Dry-run never creates a market, so it must not leave pending specs
   // behind for a later live run to chase.
@@ -171,6 +175,41 @@ async function main() {
       continue;
     }
 
+    const built = buildTrace({
+      agent: "market-maker",
+      marketId: null,
+      action: "propose_market",
+      reasoning: decision.reasoning,
+      inputs: { signal, decision },
+    });
+    const closeTime = BigInt(Math.floor(Date.now() / 1000) + 3600);
+
+    // The trace (and, with the IPFS store, the market metadata) must be
+    // pinned and verified before the create: never act without a
+    // publishable trace.
+    let cid: string;
+    let metaUri: string;
+    try {
+      ({ cid } = await traceStore.put(built.hash, built.json));
+      if (traceStoreKind === "ipfs") {
+        const metaJson = canonicalize({
+          question: decision.question,
+          category: "Macro",
+          closeTime,
+          source: signal.source,
+          traceHash: built.hash,
+          traceCid: cid,
+        });
+        const metaHash = createHash("sha256").update(metaJson).digest("hex");
+        metaUri = `ipfs://${(await traceStore.put(metaHash, metaJson)).cid}`;
+      } else {
+        metaUri = `local://${built.hash}`;
+      }
+    } catch (err) {
+      console.error(`[market-maker] skipped: trace ${built.hash} could not be stored:`, err);
+      continue;
+    }
+    console.log(`[market-maker] trace ${built.hash} -> ${cid}, meta_uri=${metaUri}`);
     const spec = buildSpec(process.env, deployments.agent, signal.priceRule);
     const closeTime = BigInt(Math.floor(Date.now() / 1000) + closeInSecs);
     let traceHash = "";
@@ -235,9 +274,9 @@ async function main() {
     const result = await adapter.agentCreateMarket({
       question_hash: questionHash,
       resolution_hash: placeholderResolutionHash,
-      meta_uri: `local://${built.hash}`,
+      meta_uri: metaUri,
       category: { tag: "Macro", values: undefined },
-      close_time: BigInt(Math.floor(Date.now() / 1000) + 3600),
+      close_time: closeTime,
       seed_amount: decision.seedAmountStroops!,
       initial_yes_bps: decision.initialYesBps!,
     });
