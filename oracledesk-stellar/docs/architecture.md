@@ -753,6 +753,102 @@ With `multiformats`:
 After fetching, `sha256(body) === trace_hash`, as `x402/trace-verification.ts`
 checks, proves the bytes are the ones the agent committed to.
 
+### Event triggers (agents) vs. the event indexer
+
+`agents/core/events/` (#105) lets agents react to contract events instead
+of waiting for their next scheduled run. It is a **trigger system, not an
+indexer**, and the two must not be confused:
+
+| | Event triggers (`agents/core/events`) | Event indexer (`docs/wave-issues/06-event-indexer.md`) |
+| --- | --- | --- |
+| Purpose | Wake an agent when something it cares about happens | Durable, queryable history for UIs and analytics |
+| Storage | One checkpoint per network and contract set: `{cursor, lastLedger}` plus recently processed event ids, in `EVENTS_STATE_DIR` | Every event, in Postgres |
+| History | None. Starts at the latest ledger; never replays | Replayable from any ledger it has stored |
+| Retention gap | Detected; triggers a full state resync from chain reads | Is the thing it exists to cover |
+| Source of truth | Chain state, re-read before every action | Its own tables |
+
+Flow: `EventSubscriber` polls `getEvents` (cursor pagination, filters
+checked against the RPC's limits, failed contract calls dropped) and hands
+each page to the `Dispatcher`. Events are decoded with the binding specs
+(`decode.ts`, via the SDK's `Spec.parseEvent`) into a typed
+`OracleDeskEvent`, with an `Unknown` variant for anything else.
+
+- **At-least-once delivery.** A page's checkpoint is written only after
+  every handler finished (or the event was dead-lettered). A crash in
+  between redelivers the page, so handlers are idempotent and an LRU of
+  processed ids, saved with the checkpoint, drops repeats.
+- **Ordering.** One market's events run in order; different markets run
+  concurrently up to `EVENTS_CONCURRENCY`.
+- **Failures.** A handler is retried with exponential backoff up to
+  `EVENTS_MAX_ATTEMPTS`, then the event goes to
+  `<EVENTS_STATE_DIR>/dead-letter.jsonl` and the page moves on.
+- **Idle polls** still advance `lastLedger`, so a quiet stretch is not
+  mistaken for a retention gap.
+
+Handlers (`handlers.ts`): `TradeReevaluate` queues a market for the trader
+after a trade of at least `EVENTS_TRADE_THRESHOLD` stroops (re-reading the
+market first); `ProposalWatch` alerts on a `ResolutionProposed` where the
+treasury holds a position and the resolver still reports the proposal as
+standing (cancellations emit no event), with the dispute deadline computed
+from the proposal's ledger timestamp; `FinalityTracker` marks markets final
+on `MarketResolved`, `ResolutionFinalized` or `PriceResolution`; and the
+resync handler re-evaluates every tradable market after a gap.
+
+`npm run trader -- --follow` runs this loop (`runtime/follow.ts`); without
+`--follow` the trader behaves exactly as before.
+
+### Cross-market arbitrage (agents, #108)
+
+Independent FPMM pools can price related markets inconsistently. With
+`ARB_ENABLED=1` the trader runs an `arbitrage` task
+(`runtime/tasks/arbitrage.ts`) over the relations in `ARB_RELATIONS_FILE`:
+
+```json
+{ "relations": [ { "id": "btc-100k-implies-90k", "type": "implies", "a": 12, "b": 7,
+    "resolution": { "a": { "mechanism": "price", "source": "reflector:BTC/USD" },
+                    "b": { "mechanism": "price", "source": "reflector:BTC/USD" } },
+    "voidCorrelation": "joint", "maxCloseSkewSecs": 0 } ] }
+```
+
+- **Relations** (`core/strategies/arbitrage.ts`): `implies` (P(A) <= P(B)),
+  `complement` (P(A) + P(B) = 1) and `exclusive` (P(A) + P(B) <= 1). A
+  relation is rejected unless both markets exist and are open, their close
+  times are within `maxCloseSkewSecs`, and both declare the *same*
+  resolution mechanism and source; a declared `resolutionHash` must equal
+  the market's on-chain commitment. The file's canonical sha256 (the graph
+  hash) is recorded in every trace.
+- **Planning**: for each pair of legs, a payoff table over every outcome the
+  relation allows, plus void scenarios (`joint`: both void together;
+  `independent`: either may void alone, paying half per share), gives the
+  worst-case payout, measured on top of existing treasury holdings. Costs
+  are exact integer FPMM collateral (`collateralForShares`: fees, price
+  impact and rounding). The share count is found by integer ternary search
+  and a +/-64 verification scan, inside `max_trade`, remaining `max_market`
+  headroom, the rolling `max_daily` and `ARB_MAX_NOTIONAL`, and must clear
+  `ARB_MIN_PROFIT_STROOPS` and `ARB_MIN_PROFIT_BPS`.
+- **Risk** (`core/risk.ts`, `checkArbPlan`): treasury caps and existing
+  exposure; `ARB_MARKET_HEADROOM_BPS` of each market's `max_market` kept free
+  for later hedges; `ARB_MAX_UNHEDGED_STROOPS` caps the first leg, which is
+  the exposure left if the second never fills; `ARB_MAX_OPEN_LEGS` and
+  `ARB_MAX_UNWIND_RETRIES` bound concurrent legs and unwind attempts.
+- **Execution** (`core/strategies/arb-executor.ts`): treasury calls are not
+  atomic, so the legs are sequential. The less liquid market goes first,
+  re-quoted and bought with `min_shares_out` = the planned shares. The second
+  market is then re-read; if its cost rose by more than `ARB_MAX_LEG_LOSS`
+  the first leg is sold back with `agent_sell`, otherwise the second leg is
+  bought. Every step is journaled before and after submission in
+  `ARB_JOURNAL_FILE`, and the next run finishes or unwinds any plan a crash
+  interrupted, settling ambiguous submissions from the treasury's positions.
+  A trace with the relation, graph hash, snapshots, plan and leg results is
+  published when a plan completes or is unwound. Dry-run only plans and logs.
+
+**Residual risks.** Between the legs the treasury holds one side naked: a
+fast move can cost up to `ARB_MAX_LEG_LOSS` plus the unwind's price impact,
+and if every unwind attempt fails the leg stays open (`ARB_UNHEDGED` is
+logged and the plan closes as `unwind-failed`). The relation file is
+trusted: a wrong relation produces confident, wrong trades, which is why
+compatibility must be declared and is checked against the chain.
+
 ## Known limitations (see docs/STATUS.md for the full, current list)
 
 - Testnet only; unaudited.
