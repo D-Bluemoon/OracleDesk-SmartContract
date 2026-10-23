@@ -233,3 +233,12 @@ still exist but are deprecated: they do not apply the pool-favouring
 correction loop, so they can disagree with the contract by a few units.
 Prefer `sell_shares` / `quote_sell_shares` on-chain, or `calcSellShares` /
 `calc_sell_shares` off-chain.
+
+### Bindings interface versions
+
+`packages/bindings/*` start at `0.1.0`. A breaking interface change requires a
+minor bump while the major is zero, then a major bump after 1.0.0; additions need
+at least a patch. Read each package's `CHANGELOG.md` and `interface.json` before
+syncing. The manifest describes functions, named/tuple types, numeric errors and
+event payloads directly from the built WASM. Hash-critical resolver types carry
+ADR 0001 compatibility implications. See CONTRIBUTING's interface workflow.
