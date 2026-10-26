@@ -86,6 +86,16 @@ emits `LpTransferred`. Both preserve the solvency invariant by
 construction; the position mapping is unchanged down to the "remove
 zero entries" rule.
 
+**Runtime enforcement.** The invariant is no longer just a test
+property. Every collateral movement in market-core goes through a
+checked transfer helper that measures the actual balance delta, and a
+global locked-collateral counter is updated on every inflow and outflow.
+Every market shares one token balance held at the market-core address, so
+the contract no longer trusts that every `token.transfer` moved exactly
+the requested amount.
+
+#### Runtime solvency accounting
+
 **Economics.** LP worst-case loss, the rounding argument and the no-arbitrage
 theorem for this exact integer math are in [fpmm-economics.md](fpmm-economics.md)
 (executable checks: `model/fpmm_bounds.py`).
@@ -98,9 +108,56 @@ with bounds) → `resolve` or `void_market` (resolver-only) → `redeem` per
 holder, `claim_pool_remainder` for the creator/LP, `sweep_fees`
 (permissionless) to the snapshotted fee recipient. Positions and LP
 ownership can change hands at any point via `transfer_position` /
-`transfer_lp`.
+`transfer_lp`. `finalize_market` (permissionless, after the redemption
+deadline) closes the market and sweeps the residual.
 
-### resolver
+A per-market `SettleState` side entry (views `settle_state` and
+`redeem_deadline`) tracks user-held outstanding shares, the finality
+timestamp, a per-market redemption horizon snapshotted at creation (default
+365 days; admin-set default bounded to 180–1825 days), what has already been
+paid out, and whether the market is closed. `redeem` and
+`claim_pool_remainder` maintain it on every payout. Once
+`finalized_at + horizon_secs` has passed, anyone can call `finalize_market`:
+it reserves exactly what the outstanding shares can still claim
+(`settle_upper` — for void markets the aggregate floor, which is at least
+the sum of the per-holder floors) plus any unclaimed LP remainder, then
+sweeps the market's **entire** remaining balance — expired user claims,
+void rounding dust, the unclaimed remainder and accrued fees — to the
+treasury, marks the market `RedemptionClosed`, and zeroes the market's
+balance. A holder who redeems before the deadline is paid the exact
+`settle_value` they would have received without finalization; expired claims
+go to the treasury rather than the LP, so the LP cannot profit from
+suppressing redemptions. Markets created before this bookkeeping existed
+have no `Settle` entry: they have no deadline and cannot be finalized
+(`NotSupported`), and stay redeemable through the old paths.
+
+A per-market **TWAP accumulator** records a time-weighted price. Every trade
+(`buy`/`sell`) folds the market's pre-trade price into a cumulative
+`price × time` value before reserves move (Uniswap-v2 semantics), with state
+in `Oracle(id)` and a 16-slot ring of `Obs(id, k)` observations so the
+`Market` entry's XDR is unchanged. `observe(id, seconds_ago)`,
+`twap(id, window_secs)` and `price_cumulative(id)` read it back: between two
+bracketing observations the cumulative is interpolated (exact — the
+cumulative is piecewise-linear between trades, since no price moves inside
+an interval), past the newest observation the last price
+is extended counterfactually, and a time earlier than the oldest surviving
+observation fails with `ObservationTooOld`. Same-timestamp trades only
+refresh the spot price — nothing is accumulated within one ledger, so a
+manipulator cannot move the TWAP without holding the price across a ledger
+boundary. Markets created before the accumulator existed return
+`NotSupported` from these views.
+
+The contract maintains a global counter and a per-market figure:
+
+-  `DataKey::TotalLocked` (instance, `i128`, initialised to `0` in the
+    constructor): the sum over all markets of collateral the contract
+    still owes (unredeemed claims plus unswept fees).
+-  `DataKey::Locked(market_id)` (persistent, `ii128`, same TT\ policy as
+    `Market`): the per-market share of that obligation. It is kept in a
+    separate entry so the `Market` XDR layout does not change.
+
+Every collateral movement goes through `transfer_in` / `transfer_out`,
+which measure the actual balance delta around the transfer:
 
 Independent resolution modes, all ultimately calling
 `market_core.resolve(market_id, outcome)`:
@@ -145,6 +202,15 @@ Independent resolution modes, all ultimately calling
   allow fallback signers to propose and attest. If a valid price report arrives before
   the fallback dispute window closes, `resolve_price` immediately supersedes the proposal
   and resolves the market.
+
+-  *Inbound* transfers must increase the contract balance by exactly the
+    requested amount. Any mismatch reverts with `Error::CollateralMismatch`.
+-  *Outbound* transfers must decrease it by exactly the amount (else
+    `CollateralMismatch`), and after the decrement of `TotalLocked` the
+    global guard checks `token.balance(contract) >= TotalLocked`.
+    Otherwise the call reverts with `Error::Insolvent`.
+
+The accounting rules are exactly:
 
 The resolution lifecycle (both modes, the guardian, expiry and market-core's
 status) is model-checked in TLA+; see [formal/README.md](formal/README.md) for
@@ -254,7 +320,16 @@ The resolver never depends on `market-core`'s Rust crate — see
 [ADR 0002](adr/0002-cross-contract-calls.md) for why, and what that trades
 off.
 
-### treasury
+| Site                     | Direction           | `Locked` / `TotalLocked` delta |
+|--------------------------|------------------|------------------------------|
+| `create_market`          | creator -> contract | `+= seed_amount`                |
+| `buy`                     | trader -> contract | `+= collateral_in` (net + fee)      |
+| `sell`                    | contract -> trader | `-= collateral_out`                |
+| `redeem`                  | contract -> holder | `-= payout`                        |
+| `claim_pool_remainder`    | contract -> creator| `-= payout`                       |
+| `sweep_fees`              | contract -> recipient| `-= amount`                        |
+
+Notes on the rules:
 
 Holds the agents' pooled USDC and is the *only* path that spends it: an
 agent calls `agent_create_market` / `agent_buy` / `agent_sell` /
@@ -431,6 +506,21 @@ implemented: it would record provenance only, and the events plus the
 successor's own exposure records are enough for an off-chain dashboard
 ([wave-issue 08](wave-issues/08-treasury-exposure-dashboard.md)).
 
+- `buy` locks `collateral_in = net + fee`, because `net` mints sets and
+  `fee` accrues to the protocol/LP shares. The fee remains inside
+  `locked` until `sweep_fees` / `claim_lp_fees` / `claim_pool_remainder`
+  subtract it — it is never double-counted.
+- `sell` burns gross sets and pays out `collateral_out`; the fee
+  `gross - out` stays in the market's fee accrual, and the locked delta is
+  only the cash actually leaving.
+- `claim_pool_remainder` zeroes the reserves and subtracts the payout
+  from `locked`. After this claim, `sets_minted`+`$fees_accrued` is no
+  longer the correct figure for what the market still owes; the
+  solvency report uses `locked` alone in that state.
+- `sweep_fees` subtracts the swept amount from `locked`.
+- Any negative result returns `Error::Overflow` (with a `debug_assert`
+  in debug builds).
+
 **Permissionless settlement & exposure release (#45).** Settle market capital
 without depending on hot agent keys: `settle_market(caller, market_id)` is
 permissionless and idempotent. It redeems the treasury's outcome-share position if
@@ -475,6 +565,12 @@ is documented at length in `contracts/treasury/src/lib.rs` (see
 `pitfall_agent_buy_requires_treasury_self_authorization_for_nested_transfer`
 in the same file's test module — a test that's been verified to fail
 without the fix and pass with it (see the commit history / docs/STATUS.md).
+
+The global guard is the only check that can be made against the shared
+ledger balance: a per-market figure cannot be verified on-chain because
+the balance is shared across markets. Donations (anyone sending tokens
+directly to the contract) make `balance > TotalLocked`, which is
+normal and must not revert.
 
 #### Treasury cap guarantees
 
@@ -587,13 +683,45 @@ is 9, the same as the treasury's `InsufficientBalance`).
 
 ### reasoning-registry
 
-An admin allow-list of agent addresses; a registered agent calls
-`publish_trace(agent, market_id, action, trace_hash, cid)` to record that a
-trace exists, returning a `trace_id`. `verify_trace(trace_id, candidate_hash)`
-is the check a paying subscriber (via `x402/`) or a frontend runs before
-trusting fetched trace content. Traces are also indexed per market
-(`market_trace_count` / `market_trace_at`) via a counter rather than an
-unbounded `Vec`, so the index never has an unbounded-growth storage cost.
+**Views.** `solvency_report(market_id)` returns a `SolvencyReport`
+with the market's locked collateral, fees accrued, sets minted, and
+ outstanding-claims upper bound (`sets_minted + fees_accrued` while
+open or unclaimed, derived from `locked` alone after the LP claim),
+plus `lp_claimed`. `global_solvency()` returns `(token.balance(contract),
+TotalLocked)`. The per-market figure is an audit aid, not an enforced
+check; the global guard is the enforced one.
+
+**Misbehaving collateral.** A fee-on-transfer or rebasing SEP-41 token, a
+Classic asset whose issuer has `AUTH_CLAWBACK_ENABLED` and claws back
+from the contract, or a buggy custom collateral each make the contract hold
+less than it owes. The balance-delta checks reject fee-on-transfer
+collateral at the first inflow (`CollateralMismatch`). If the issuer claws
+back between transactions, the next outbound transfer trips `Insolvent`.
+That freezes payouts globally — intentional fail-safe behaviour, so the
+shortfall is visible instead of silently draining other markets.
+
+The contract has no upgrade path today (see `scripts/deploy-testnet.sh`), so
+this is a new-deployment-only change: a redeployed market-core starts from
+`TotalLocked = 0`. There is deliberately no admin setter to backfill the
+counter for pre-existing markets, because that would be an obvious
+privileged backdoor.
+
+**Fee split and recipient snapshot.** `create_market` snapshots a
+`FeeTerms { recipient, protocol_share_bps }` side entry per market, so
+`set_treasury` / `set_protocol_fee_share_bps` only affect markets created
+after them. Each trade's fee is split once at accrual time
+(`math::split_fee`, protocol shares round up so `protocol + lp == fee`
+exactly): the protocol portion accumulates in `Market.fees_accrued` and is
+swept to the snapshotted recipient by the permissionless `sweep_fees`(old `FeesSwept` event kept for indexers, plus `FeesSweptTo`); the creator
+portion accumulates in a `LpFees(market_id)` side entry, claimable any time
+(before finality too) via `claim_lp_fees`, and also drained by
+`claim_pool_remainder`. Markets created before this change have no
+`FeeTerms` entry and fall back to the old behavior: recipient = whatever
+`DataKey::Treasury` Holds at sweep time, `protocol_share_bps = 10_000` —
+fully backward compatible, no migration transaction needed. The separate
+LP balance (rather than adding fees to the reserves) is deliberate: it does
+not move `k` or the price and maps directly onto the per-LP fee accumulator
+of the future multi-LP design ([wave-issue 02](wave-issues/02-multi-lp-liquidity.md)).
 
 #### Agent Lifecycle and Trace Annotations (#56)
 
@@ -660,6 +788,38 @@ events. An indexer (Soroban events → Postgres, replayable) is required for
 any UI that wants to list traces/trades older than that window — this is
 one of the seeded `docs/wave-issues/`.
 
+## Storage TTL policy
+
+Soroban archives persistent/instance entries once their TTL runs out, and an
+archived entry cannot be read or written until it is restored. Every contract
+carries an identical `src/ttl.rs` (duplicated because contract crates cannot
+depend on each other — [ADR 0002](adr/0002-cross-contract-calls.md)) with the
+shared policy:
+
+- Per-market entries (`Market`, `Position`, resolver configs, treasury
+  exposure) are extended to `close_time` plus a 90-day settlement horizon,
+  clamped to the network's `max_ttl()`. The threshold is half the target, so
+  a frequently touched entry is only rewritten when its remaining TTL halves.
+- Instance TTL is extended by every entrypoint that reads instance storage
+  (30-day target, 7-day threshold); pure views over persistent entries stay
+  read-only so indexer simulations keep read-only footprints.
+- The registry additionally refreshes an agent's registration on every
+  successful `publish_trace`.
+- The market-core `Settle` entry (outstanding shares, redemption deadline) is
+  kept to the long-lived target — 365 days, clamped to `max_ttl()`. A market
+  whose redemption deadline is more than one network-max TTL away can archive
+  before it is finalized and needs touches or a restore first;
+  `finalize_market` works after a restore, and the deadline is computed from
+  on-chain state (`finalized_at + horizon_secs`), so a late finalization is
+  still exact.
+- The market-core `Oracle` entry and every written `Obs` slot are extended to
+  the same close-time-aware target as the market's other entries. Unwritten
+  ring slots are never extended and the read path skips missing slots, so a
+  half-used ring costs nothing and never fails a read.
+- Markets whose `close_time` is further out than `max_ttl` cannot be kept
+  alive by a single bump and need periodic touches or the keeper described in
+  [`docs/wave-issues/14-storage-ttl-keeper.md`](wave-issues/14-storage-ttl-keeper.md),
+  which also covers TTL monitoring and the rent cost model.
 ### router
 
 A stateless address book (`RouterConfig { market_core, resolver,
@@ -729,6 +889,42 @@ also re-quotes immediately before submission and applies a deadline.
 The limit protects the estimated post-trade marginal price from crossing
 `effective fair value - SIZING_BUFFER_BPS`; it cannot guarantee a fill if
 another transaction changes the pool between the snapshot and execution.
+**Trade bounds and circuit breakers.** Two layers of protection beyond the
+share-count slippage parameters:
+
+- *Deadline + limit price* (#12): `buy_v2` / `sell_v2` take a
+  `deadline` (ledger **timestamp**, unix seconds) checked before anything
+  else, and a `limit_price_bps` bounding the **average execution price**
+  (`collateral_in / shares_out` for buys, `collateral_out / shares_in` for
+  sells, fee included, compared by cross-multiplication). `0` means "no
+  limit" for buys; for sells it is trivially satisfied and buys no
+  protection. The original `buy` / `sell` remain as thin wrappers for
+  backward compatibility (same body, no bounds).
+- *Per-market breakers* (#10): `BreakerConfig { max_impact_bps, band_bps }`
+  is snapshotted per market from an admin default (`set_default_breaker`,
+  which rejects `band_bps < max_impact_bps` because that makes one trade
+  cover the whole band). `max_impact_bps` bounds a single trade's
+  |post − pre| YES-price move (`>` — a trade moving exactly the cap
+  passes); `band_bps` bounds |post − ledger-open price|, with the reference
+  stored in short-TTL **temporary** storage keyed by ledger sequence, so it
+  resets by itself every ledger. 0 disables either check; legacy markets
+  have no config and are unaffected. Breaker trips revert with
+  `PriceImpactTooHigh` / `PriceBandExceeded` and — because Soroban rolls
+  back an invocation's events on `Err` — emit **no** event (the error codes
+  and the `would_trip`` / `breaker_config` / `breaker_state` views are the
+  observability path; see the comment on `check_breakers`).
+
+  *Worst-case lock cost.* The band cannot be ratcheted: the reference is
+  the ledger-open price, so an attacker who pushes the price to the band
+  edge only blocks further trades for the rest of that ledger (~5 s) —
+  and pays the trading fee plus price impact to do it, which are both
+  retained by the pool.
+
+**Resolution and payouts.** `resolve(market_id, outcome)` sets the
+final outcome once. `redeem` pays `payout` for a winning position and
+burns it; `lp_claimed` gates `claim_pool_remainder`, which pays the
+creator the residual value of the reserves and zeroes them. Both payouts
+ are subject to the checked transfer and global solvency guard.
 
 ### IPFS trace storage
 
