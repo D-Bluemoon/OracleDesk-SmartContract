@@ -412,6 +412,8 @@ impl From<MathError> for Error {
 // event window, so do not rely on querying old events live)
 // ---------------------------------------------------------------------------
 
+const EVENT_VERSION: u32 = 1;
+
 #[contractevent]
 pub struct MarketCreated {
     #[topic]
@@ -569,6 +571,35 @@ pub struct LpTransferred {
     pub to: Address,
 }
 
+/// V1 event: pool remainder claimed by creator after market finality.
+#[contractevent]
+pub struct PoolRemainderClaimedV1 {
+    #[topic]
+    pub version: u32,
+    #[topic]
+    pub market_id: u64,
+    #[topic]
+    pub creator: Address,
+    pub payout: i128,
+}
+
+/// V1 event: market pause state changed.
+#[contractevent]
+pub struct PausedSet {
+    #[topic]
+    pub version: u32,
+    pub paused: bool,
+}
+
+/// V1 event: default fee for new markets changed.
+#[contractevent]
+pub struct DefaultFeeSet {
+    #[topic]
+    pub version: u32,
+    pub old_fee_bps: u32,
+    pub new_fee_bps: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
@@ -658,6 +689,11 @@ impl MarketCore {
     pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Paused, &paused);
+        PausedSet {
+            version: EVENT_VERSION,
+            paused,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -667,9 +703,20 @@ impl MarketCore {
         if fee_bps > MAX_FEE_BPS {
             return Err(Error::InvalidFee);
         }
+        let old_fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DefaultFeeBps)
+            .unwrap_or(0);
         env.storage()
             .instance()
             .set(&DataKey::DefaultFeeBps, &fee_bps);
+        DefaultFeeSet {
+            version: EVENT_VERSION,
+            old_fee_bps,
+            new_fee_bps: fee_bps,
+        }
+        .publish(&env);
         Ok(())
     }
 
