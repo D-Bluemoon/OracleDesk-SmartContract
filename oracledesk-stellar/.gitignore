@@ -63,3 +63,6 @@ agents/sim/results/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# Incident logs (sensitive operational data)
+incidents/
