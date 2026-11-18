@@ -21,7 +21,7 @@ export interface TaskContext {
    * *start* once shutdown began; once `fn` is running it is never aborted.
    * State is flushed after every submission.
    */
-  submit: <T>(fn: () => Promise<T>, intent?: string) => Promise<T>;
+  submit: <T>(fn: (lease?: import("../stellar/channels.js").ChannelLease) => Promise<T>, intent?: string) => Promise<T>;
   log: Logger;
   now: () => number;
 }
@@ -137,7 +137,7 @@ export class Runtime {
     };
   }
 
-  private async submit<T>(fn: () => Promise<T>, intent: string): Promise<T> {
+  private async submit<T>(fn: (lease?: import("../stellar/channels.js").ChannelLease) => Promise<T>, intent: string): Promise<T> {
     if (this.controller.signal.aborted) throw new AbortedError();
     return this.mutex.run(async () => {
       // Queued behind another submission when shutdown began: not yet sent, so drop it.
@@ -146,7 +146,7 @@ export class Runtime {
       this.inFlight++;
       this.pending.set(id, intent);
       try {
-        return await fn();
+        return await fn(undefined);
       } finally {
         this.inFlight--;
         this.pending.delete(id);
