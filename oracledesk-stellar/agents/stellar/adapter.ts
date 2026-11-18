@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { toTraceAction, type TraceActionType } from "../core/trace.js";
 import { assertNever, type AgentMode } from "../runtime/config.js";
+import type { StellarSigner } from "./signers/types.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // HERE is agents/stellar/ — the repo root is two levels up.
@@ -80,7 +81,10 @@ interface CommonAdapterOptions {
  * signed with `agentSecret` (`S...`), which it requires.
  */
 export type StellarAdapterOptions = CommonAdapterOptions &
-  ({ mode: "dry-run"; agentSecret?: undefined } | { mode: "live"; agentSecret?: string });
+  (
+    | { mode: "dry-run"; agentSecret?: undefined; signer?: undefined }
+    | { mode: "live"; agentSecret?: string; signer?: StellarSigner }
+  );
 
 export interface DryRunResult {
   dryRun: true;
@@ -93,6 +97,22 @@ export interface DryRunResult {
 export type LiveResult<T> = { dryRun: false; value: T };
 
 export type AdapterResult<T> = DryRunResult | LiveResult<T>;
+
+/** Snapshot of a market's read-only state, from `readMarket`. */
+export interface MarketRead {
+  marketId: number;
+  /** IPFS CID / URI of the question metadata (the question text itself is
+   * stored off-chain; see docs/frontend-integration.md). */
+  metaUri: string;
+  closeTime: number;
+  reserveYes: bigint;
+  reserveNo: bigint;
+  /** YES spot price in bps (0..=10_000), from `get_price`. */
+  yesBps: number;
+  /** YES time-weighted average over the requested `useTwapSecs` window,
+   * from `twap`. Present only when `useTwapSecs` was passed. */
+  twapBps?: number;
+}
 
 /**
  * The call failed before a transaction was submitted (building or
@@ -113,19 +133,34 @@ export class NotSubmittedError extends Error {
  * misconfigured agent can never accidentally submit a real transaction.
  */
 export class StellarAdapter {
-  private readonly signer?: KeypairSigner;
+  private readonly signer?: StellarSigner;
   private readonly publicKey?: string;
 
   constructor(private readonly opts: StellarAdapterOptions) {
     switch (opts.mode) {
       case "dry-run":
-        if (opts.agentSecret !== undefined) throw new Error("dry-run mode must not be given agentSecret");
+        if (opts.agentSecret !== undefined || opts.signer !== undefined) {
+          throw new Error("dry-run mode must not be given a signer or agentSecret");
+        }
         break;
       case "live": {
-        if (!opts.agentSecret) throw new Error("live mode requires agentSecret");
-        const keypair = Keypair.fromSecret(opts.agentSecret);
-        this.signer = new KeypairSigner(keypair, opts.networkPassphrase);
-        this.publicKey = keypair.publicKey();
+        if (opts.signer && opts.agentSecret) {
+          throw new Error("live mode accepts either signer or agentSecret, not both");
+        }
+        if (opts.signer) {
+          this.signer = opts.signer;
+          this.publicKey = opts.signer.address;
+        } else if (opts.agentSecret) {
+          const keypair = Keypair.fromSecret(opts.agentSecret);
+          this.signer = new KeypairSigner(keypair, opts.networkPassphrase);
+          this.publicKey = keypair.publicKey();
+        } else {
+          throw new Error("live mode requires signer or agentSecret");
+        }
+        const expectedAddress = opts.agentAddress ?? opts.deployments.agent;
+        if (this.publicKey !== expectedAddress) {
+          throw new Error("signer address does not match the configured agent address");
+        }
         break;
       }
       default:
@@ -364,18 +399,49 @@ export class StellarAdapter {
    * The treasury caps that bound this agent: the stricter of the global
    * config and the agent's own policy, plus what it has spent today.
    */
-  async riskCaps(): Promise<{ maxTrade: bigint; maxMarket: bigint; maxDaily: bigint; dailyUsed: bigint }> {
+  async riskCaps(): Promise<{
+    maxTrade: bigint;
+    maxMarket: bigint;
+    maxDaily: bigint;
+    dailyUsed: bigint;
+    dailyHeadroom?: bigint;
+  }> {
     const client = await this.client<any>("treasury", "@oracledesk/bindings-treasury");
     const config = unwrapContractResult("get_config", (await client.get_config()).result) as { max_trade: bigint; max_market: bigint; max_daily: bigint };
     const policy = (await client.get_agent({ agent: this.agent })).result as { max_trade: bigint; max_daily: bigint } | undefined;
-    const usage = unwrapContractResult("agent_daily_usage", (await client.agent_daily_usage({ agent: this.agent })).result) as { amount: bigint };
+    const [usageResult, globalHeadroomResult] = await Promise.all([
+      client.agent_daily_usage({ agent: this.agent }),
+      client.daily_headroom(),
+    ]);
+    const usage = unwrapContractResult("agent_daily_usage", usageResult.result) as { amount: bigint };
     const min = (a: bigint, b?: bigint) => (b !== undefined && BigInt(b) < BigInt(a) ? BigInt(b) : BigInt(a));
+    const maxDaily = min(config.max_daily, policy?.max_daily);
+    const agentHeadroom = max0(maxDaily - BigInt(usage.amount));
     return {
       maxTrade: min(config.max_trade, policy?.max_trade),
       maxMarket: BigInt(config.max_market),
-      maxDaily: min(config.max_daily, policy?.max_daily),
+      maxDaily,
       dailyUsed: BigInt(usage.amount),
+      dailyHeadroom: min(BigInt(unwrapContractResult("daily_headroom", globalHeadroomResult.result) as bigint), agentHeadroom),
     };
+  }
+
+  /** Cumulative treasury spend for this market; sells and close_trade do not erase it. */
+  async marketExposure(marketId: bigint): Promise<bigint> {
+    const key = xdr.LedgerKey.contractData(
+      new xdr.LedgerKeyContractData({
+        contract: new Address(this.opts.deployments.contracts.treasury).toScAddress(),
+        key: xdr.ScVal.scvVec([xdr.ScVal.scvSymbol("Market"), xdr.ScVal.scvU64(xdr.Uint64.fromString(String(marketId)))]),
+        durability: xdr.ContractDataDurability.persistent(),
+      }),
+    );
+    const { entries } = await this.rpcServer().getLedgerEntries(key);
+    const entry = entries[0];
+    if (!entry) return 0n;
+    const data = entry.val.contractData()?.val();
+    const amount = data?.map()?.find((item) => item.key().sym?.().toString() === "amount")?.val()?.i128()?.toString();
+    if (amount === undefined) throw new Error(`treasury market exposure ${marketId} has an invalid ledger entry`);
+    return BigInt(amount);
   }
 
   /** What the treasury has committed to `marketId` (its cost basis). */
@@ -508,6 +574,55 @@ export class StellarAdapter {
       (client) => client.publish_trace_signed(call),
     );
   }
+
+  /**
+   * Reads a market's price state. Unlike the write wrappers above, a read
+   * always queries the network — through the bindings' simulation, which
+   * never signs or submits — so it works identically in dry-run and live
+   * mode and there is no offline stand-in to return.
+   *
+   * `useTwapSecs` additionally reads `twap(market_id, useTwapSecs)`: the
+   * time-weighted average over that trailing window, which a single
+   * transaction cannot move (see market-core's accumulator, issue #11).
+   * Prefer it over spot for any automated trading loop.
+   */
+  async readMarket(
+    marketId: bigint,
+    opts: { useTwapSecs?: number } = {},
+  ): Promise<MarketRead> {
+    const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
+    const marketTx = await client.get_market({ market_id: marketId });
+    const market = marketTx.result.unwrap() as {
+      meta_uri: string;
+      close_time: bigint;
+      reserve_yes: bigint;
+      reserve_no: bigint;
+    };
+    const priceTx = await client.get_price({
+      market_id: marketId,
+      outcome: { tag: "Yes", values: undefined },
+    });
+    const read: MarketRead = {
+      marketId: Number(marketId),
+      metaUri: market.meta_uri,
+      closeTime: Number(market.close_time), // unix seconds, safe as number
+      reserveYes: market.reserve_yes,
+      reserveNo: market.reserve_no,
+      yesBps: priceTx.result.unwrap() as number,
+    };
+    if (opts.useTwapSecs !== undefined) {
+      const twapTx = await client.twap({
+        market_id: marketId,
+        window_secs: BigInt(opts.useTwapSecs),
+      });
+      read.twapBps = twapTx.result.unwrap() as number;
+    }
+    return read;
+  }
+}
+
+function max0(value: bigint): bigint {
+  return value > 0n ? value : 0n;
 }
 
 /**
