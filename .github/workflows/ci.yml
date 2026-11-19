@@ -130,28 +130,28 @@ jobs:
       - name: Fail if committed bindings are stale
         run: git diff --exit-code -- packages/bindings
 
-      - name: Install and build bindings packages
+      - name: Install workspace dependencies
+        run: if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      - name: Verify single @stellar/stellar-sdk version in workspace
         run: |
-          for pkg in market-core resolver treasury reasoning-registry timelock router; do
-            (cd "packages/bindings/$pkg" && npm install && npm run build)
-          done
+          VERSIONS=$(npm ls @stellar/stellar-sdk --all --parseable | wc -l)
+          npm ls @stellar/stellar-sdk
+          test "$VERSIONS" -le 2
+
+      - name: Build bindings and typecheck workspace
+        run: npm run build
+
+      - name: Lint and format check
+        run: |
+          npm run lint
+          npm run format:check
 
       - name: Interface tool tests
         run: CARGO_TARGET_DIR=target cargo test --locked --manifest-path scripts/interface-manifest/Cargo.toml
 
-      - name: x402 — install, typecheck, test
-        run: |
-          cd x402
-          npm ci
-          npm run build
-          npm test
-
-      - name: agents — install, typecheck, test
-        run: |
-          cd agents
-          npm install
-          npm run build
-          npm test
+      - name: Workspace tests (x402, agents, deployer, governance)
+        run: npm test
 
       # Fake-RPC fault injection against the real live adapter (#106). Uses
       # the wasm downloaded above when it fits the adapter, else the vendored
