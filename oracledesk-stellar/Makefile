@@ -1,4 +1,4 @@
-.PHONY: setup build test lint fmt deploy-plan deploy-verify deploy-testnet seed-market demo bindings clean interface-check
+.PHONY: setup build test lint fmt deploy-plan deploy-verify deploy-testnet seed-market demo bindings docs-reference docs docs-serve clean interface-check
 
 # Installs Node dependencies for the TypeScript packages. Rust toolchain,
 # the `stellar` CLI, and Python 3 are expected to already be on PATH — see
@@ -50,6 +50,7 @@ test: build
 	python3 model/fpmm_bounds.py --quick
 	python3 scripts/coverage-tools.py --self-test
 	python3 scripts/coverage-gate.py --self-test
+	node --test scripts/gen-contract-docs/generate.test.mjs
 	npm test
 
 lint:
@@ -111,6 +112,19 @@ demo:
 
 bindings: build
 	./scripts/gen-bindings.sh
+
+docs-reference:
+	node scripts/gen-contract-docs/generate.mjs
+
+docs: docs-reference
+	mdbook build docs
+	cargo doc --no-deps -p market-core -p resolver -p treasury -p reasoning-registry
+	mkdir -p docs/book/rustdoc
+	cp -r target/doc/* docs/book/rustdoc/
+	npx --yes typedoc --options typedoc.json
+
+docs-serve: docs-reference
+	mdbook serve docs
 
 clean:
 	cargo clean
