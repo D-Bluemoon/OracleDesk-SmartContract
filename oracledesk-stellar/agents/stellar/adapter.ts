@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { toTraceAction, type TraceActionType } from "../core/trace.js";
 import { assertNever, type AgentMode } from "../runtime/config.js";
+import { createJournalRecord, type TransactionJournal } from "./journal.js";
 import {
   applyResourceMargin,
   feePolicyFor,
@@ -28,7 +29,6 @@ import {
   type FeeStatsResponse,
 } from "./fees.js";
 import { feeChargedOf, submitSorobanTransaction, type ReplacementPolicy } from "./submit.js";
-import { TransactionJournal } from "./journal.js";
 import type { StellarSigner } from "./signers/types.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -91,6 +91,8 @@ interface CommonAdapterOptions {
   rpcUrl: string;
   agentAddress?: string;
   deployments: Deployments;
+  /** Checked before dry-run descriptions and immediately before live broadcasts. */
+  beforeSend?: () => void | Promise<void>;
   feePolicy?: FeePolicy;
   journal?: TransactionJournal;
   task?: string;
@@ -348,6 +350,7 @@ export class StellarAdapter {
     const contractId = this.opts.deployments.contracts[pkg];
     switch (this.opts.mode) {
       case "dry-run":
+        await this.opts.beforeSend?.();
         return { dryRun: true, contractId, method: methodName, args };
       case "live":
         break;
@@ -365,7 +368,6 @@ export class StellarAdapter {
     if (assembled.simulation?.error) {
       throw new NotSubmittedError(`${methodName} simulation failed: ${assembled.simulation.error}`);
     }
-
     const actionClass = feePolicyFor(methodName);
     const rule = this.opts.feePolicy?.policies[actionClass];
     const built = assembled.built ?? assembled.signed;
@@ -387,6 +389,7 @@ export class StellarAdapter {
         maxAttempts: 4 + rule.maxBumps,
         maxPollsPerAttempt: Math.max(5, 2 * rule.maxBumps + 3),
         retryDelayMs: 250,
+        beforeSend: this.opts.beforeSend,
         replacement: this.replacementFor(
           prepared,
           rule,
@@ -407,8 +410,28 @@ export class StellarAdapter {
       return { dryRun: false, value: unwrapContractResult(methodName, assembled.result as T), fee };
     }
 
+    try {
+      await this.opts.beforeSend?.();
+    } catch (error) {
+      await this.journalCancelled(methodName, assembled, error);
+      throw error;
+    }
     const { result } = await assembled.signAndSend();
     return { dryRun: false, value: unwrapContractResult(methodName, result) };
+  }
+
+  private async journalCancelled(methodName: string, assembled: unknown, error: unknown): Promise<void> {
+    const journal = this.opts.journal;
+    if (!journal) return;
+    const built = (assembled as { built?: { toXDR(): string; hash(): { toString(radix?: number): string } } }).built;
+    const hash = built?.hash().toString("hex") ?? "";
+    await journal.append(createJournalRecord({
+      id: `${methodName}:${hash || "before-broadcast"}`,
+      stage: "cancelled",
+      hash,
+      envelopeXdr: built?.toXDR() ?? "",
+      detail: error instanceof Error ? error.message : String(error),
+    }));
   }
 
   async agentCreateMarket(args: {
@@ -489,6 +512,34 @@ export class StellarAdapter {
       client.agent_sell_v2(call, options),
       { deadlineUnix: args.deadline },
     );
+  }
+
+  async agentHalt(reason: number): Promise<AdapterResult<void>> {
+    const call = { agent: this.agent, reason };
+    return this.run("treasury", "@oracledesk/bindings-treasury", "agent_halt", call, (client) =>
+      client.agent_halt(call),
+    );
+  }
+
+  async getAgent(agent = this.agent): Promise<{ active: boolean; roles: number } | undefined> {
+    const client = await this.client<any>("treasury", "@oracledesk/bindings-treasury");
+    const policy = (await client.get_agent({ agent })).result as { active: boolean; roles: bigint | number } | undefined;
+    if (!policy) return undefined;
+    return { active: Boolean(policy.active), roles: Number(policy.roles) };
+  }
+
+  async drawdownStatus(): Promise<{ tripped: boolean; windowPnl: bigint; maxDrawdown: bigint }> {
+    const client = await this.client<any>("treasury", "@oracledesk/bindings-treasury");
+    const status = unwrapContractResult("drawdown_status", (await client.drawdown_status()).result) as {
+      tripped: boolean;
+      window_pnl: bigint;
+      max_drawdown: bigint;
+    };
+    return {
+      tripped: Boolean(status.tripped),
+      windowPnl: BigInt(status.window_pnl),
+      maxDrawdown: BigInt(status.max_drawdown),
+    };
   }
 
   /**

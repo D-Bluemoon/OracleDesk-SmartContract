@@ -1,7 +1,7 @@
 import { open, readFile, mkdir, truncate } from "node:fs/promises";
 import { dirname } from "node:path";
 
-export type JournalStage = "signed" | "submitting" | "submitted" | "bumped" | "confirmed" | "failed" | "uncertain";
+export type JournalStage = "signed" | "submitting" | "submitted" | "bumped" | "confirmed" | "failed" | "uncertain" | "cancelled";
 
 export interface TransactionJournalRecord {
   version: 1 | 2;
@@ -31,6 +31,7 @@ const stages = new Set<JournalStage>([
   "confirmed",
   "failed",
   "uncertain",
+  "cancelled",
 ]);
 const DECIMAL = /^(0|[1-9][0-9]*)$/;
 

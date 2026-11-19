@@ -73,18 +73,32 @@ on-chain gave that list. The treasury keeps an index:
   treasury has since switched away from (see "Timelocked configuration" in
   `docs/architecture.md`) keep counting.
 
-The index is capped at `MAX_OPEN_MARKETS = 12`. A buy or creation in a 13th
-market fails with `TooManyOpenMarkets`. Each entry costs two cross-contract
-reads, and each read instantiates market-core at about 2.5 MB of memory.
-Measured with the test host's per-invocation limit checks:
+Once marks are migrated, `compute_nav` reads only `idle`, `NavHoldings` and
+`QueueReserved`: no per-market cross-contract calls. Each indexed market keeps a
+`MarkRecord` whose `contribution` is the same floor the legacy walk computed.
+Treasury-originated position changes update that record in `save_net`; LP floors
+change with other users' trades, so `refresh_mark` recomputes them in bounded
+batches. `deposit` and `request_withdraw` refuse LP marks older than
+`max_mark_age_ledgers`. Batch settlement paths (`redeem_many` and
+`claim_pool_remainders`) now refresh marks and update net accounting for every
+reported item, so they cannot silently drift NAV.
 
-| Open markets | Call | Memory | Limit |
-| ---: | --- | ---: | ---: |
-| 32 | `nav()` alone | ~81 MB | 40 MiB |
-| 16 | `deposit` | ~40.4 MB | 40 MiB |
-| 12 | `deposit` / `request_withdraw` | ~30.3 MB, ~15M instructions | 40 MiB |
+Resolution can only raise the true floor above the stored open-market value
+(`settle_value(y, n) >= min(y, n)`, including void), so an unrefreshed
+contribution remains conservative. A fully finalized market whose balance has
+been swept must be detected with market-core's `settle_state(id).closed`, which
+sets the contribution to zero; that detection lands with the refreshed
+market-core wasm and bindings.
 
-The 12-market case is pinned by `nav_budget_within_limits_at_max_open_markets`.
+The index is capped at `MAX_OPEN_MARKETS = 128`. Position-only markets have no
+read cost in NAV once migrated; LP marks are bounded separately by what one
+`refresh_mark` batch can read inside the staleness window.
+
+| Open markets | Call | Old walk | Incremental path |
+| ---: | --- | ---: | --- |
+| 32 | `nav()` alone | ~81 MB | O(1) storage reads |
+| 16 | `deposit` | ~40.4 MB | O(1) storage reads |
+| 128 | `deposit` / `request_withdraw` | over the 40 MiB limit | budget scenario to be regenerated with fresh bindings |
 
 ### Shares
 

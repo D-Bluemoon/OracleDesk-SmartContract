@@ -25,6 +25,7 @@ export interface SorobanSubmitOptions {
   maxPollsPerAttempt?: number;
   retryDelayMs?: number;
   sleep?: (milliseconds: number) => Promise<void>;
+  beforeSend?: () => void | Promise<void>;
   replacement?: ReplacementPolicy;
   nowUnix?: () => number;
 }
@@ -78,6 +79,7 @@ export async function submitSorobanTransaction(options: SorobanSubmitOptions): P
     maxPollsPerAttempt = 4,
     retryDelayMs = 250,
     sleep = defaultSleep,
+    beforeSend,
     replacement,
     nowUnix = () => Math.floor(Date.now() / 1000),
   } = options;
@@ -170,6 +172,12 @@ export async function submitSorobanTransaction(options: SorobanSubmitOptions): P
   await log("signed");
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await beforeSend?.();
+    } catch (error) {
+      await log("cancelled", attempt, errorMessage(error));
+      throw error;
+    }
     await log("submitting", attempt);
     let sendResponse: Awaited<ReturnType<typeof server.sendTransaction>> | undefined;
     try {
