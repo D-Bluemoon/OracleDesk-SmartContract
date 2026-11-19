@@ -431,9 +431,15 @@ markers in the files themselves:
   (`--salt`), and `scripts/migrate-market-core-wiring.sh` upgrades a
   pre-handshake deployment.
 - **Multi-step flows are atomic through the router** (ADR 0009):
-  `create_and_reveal_{signers,price}`, `reveal_spec`, and
-  `buy_and_publish_trace`, so a market cannot exist without its rule and a
-  trade cannot drop its reasoning trace.
+  `create_and_reveal_{signers,price}`, `reveal_spec`,
+  `trade_and_publish_trace` and `agent_trade_and_publish_trace`, so a market
+  cannot exist without its rule and a trade cannot drop its reasoning trace.
+  Trades use `buy_v2`/`sell_v2` bounds, a typed `TraceAction`, and optional
+  chaining/signature; the treasury path verifies the supplied treasury is
+  wired to the configured market-core. `buy_and_publish_trace` is a deprecated
+  wrapper with a breaking `action: string` → `TraceAction` change (bindings
+  0.2.0). The router's vendored wasm is pinned, but its registry wasm is stale
+  (pre-#53), so dynamic publish calls need a current deployed registry.
 - **Residual admin blast radius.** The treasury's config, price policy and
   agent registry are timelocked (loosening waits `config_delay`, tightening
   is immediate), which bounds what a compromised admin can unlock for the

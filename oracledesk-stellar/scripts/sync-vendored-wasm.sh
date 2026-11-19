@@ -27,7 +27,7 @@ else
   exit 1
 fi
 
-for f in market_core reasoning_registry; do
+for f in market_core resolver reasoning_registry treasury; do
   if [ ! -f "$WASM_DIR/$f.wasm" ]; then
     echo "error: $WASM_DIR/$f.wasm is missing — run 'stellar contract build' first" >&2
     exit 1
@@ -44,3 +44,8 @@ sync() { # <built wasm> <vendored wasm>
 sync "$WASM_DIR/market_core.wasm" contracts/resolver/market_core.wasm
 sync "$WASM_DIR/market_core.wasm" contracts/treasury/market_core.wasm
 sync "$WASM_DIR/reasoning_registry.wasm" contracts/resolver/reasoning_registry.wasm
+
+sync "$WASM_DIR/market_core.wasm" contracts/router/market_core.wasm
+sync "$WASM_DIR/resolver.wasm" contracts/router/resolver.wasm
+sync "$WASM_DIR/reasoning_registry.wasm" contracts/router/reasoning_registry.wasm
+sync "$WASM_DIR/treasury.wasm" contracts/router/treasury.wasm

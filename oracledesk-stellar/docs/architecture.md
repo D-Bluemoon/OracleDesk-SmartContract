@@ -970,10 +970,13 @@ reasoning_registry }`) plus atomic multi-step entrypoints, so a client cannot
 half-apply a flow or point it at a hostile resolver (ADR 0009):
 `create_and_reveal_signers` / `create_and_reveal_price` (create the market and
 reveal its rule in one transaction; the commitment is computed locally from
-the spec), `reveal_spec` (the deferred commit-now/reveal-later path), and
-`buy_and_publish_trace` (buy through market-core and publish the reasoning
-trace together, so a trade cannot drop its trace). It holds no funds and has
-no admin.
+the spec), `reveal_spec` (the deferred commit-now/reveal-later path),
+`trade_and_publish_trace` (`buy_v2`/`sell_v2` with typed `TraceAction`, limits,
+deadline and optional chain/signature, publishing in the same transaction),
+and `agent_trade_and_publish_trace` (the same flow through a treasury verified
+against the configured market-core). Both emit `TradeTraced` and return
+`TradeTraceResult`. `buy_and_publish_trace` remains as a deprecated buy-only
+wrapper. It holds no funds and has no admin.
 
 ### Governance: wiring, admin transfer, timelock
 

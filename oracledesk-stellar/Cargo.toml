@@ -5,6 +5,7 @@ members = [
     "contracts/resolver",
     "contracts/reasoning-registry",
     "contracts/treasury",
+    "contracts/signer-stake",
     "contracts/timelock",
     "contracts/router",
     "contracts/integration-tests",

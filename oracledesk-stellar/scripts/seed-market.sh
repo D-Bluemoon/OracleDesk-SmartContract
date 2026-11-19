@@ -3,11 +3,9 @@
 # reveals its signer-mode resolution spec, using the addresses recorded in
 # deployments/testnet.json by scripts/deploy-testnet.sh.
 #
-# The agent itself is the sole signer (threshold 1) with a short dispute
-# window — good enough to demonstrate the commit/reveal flow end to end
-# without needing a real oracle. For a PriceConfig-based market, compute the
-# hash with `spec-hash --v2 ... price ...` instead (same envelope, different
-# rule).
+# Signer mode uses the deployment's agent as the sole signer (threshold 1).
+# Price mode uses contracts.test_oracle and the PRICE_* defaults below. Both
+# commit through the same salted ResolutionSpecV2 envelope.
 #
 # The commitment is a salted ResolutionSpecV2 (docs/adr/0004-spec-versioning.md).
 # The salt is the only secret protecting the rule until reveal and is needed to
@@ -23,7 +21,11 @@
 # flow itself, with crash recovery: see agents/core/maker-flow.ts and
 # docs/adr/0001-resolution-commitment.md ("Agent flow and recovery").
 #
-# Usage: scripts/seed-market.sh [--commit-only] [seed_amount_stroops] [initial_yes_bps] [close_in_seconds]
+# Usage: scripts/seed-market.sh [--commit-only] [--mode signer|price] \
+#   [seed_amount_stroops] [initial_yes_bps] [close_in_seconds] [dispute_window_secs] [question_text]
+# Price mode env: PRICE_ASSET=other:XLM|stellar:<addr> (default other:XLM),
+#   PRICE_THRESHOLD (2000), PRICE_DIRECTION (above|at-or-above|below|at-or-below),
+#   PRICE_MAX_STALENESS (3600).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -40,15 +42,24 @@ AGENT_KEY=${AGENT_KEY:-${IDENTITY_PREFIX}-agent}
 DEPLOYMENTS=${DEPLOYMENTS:-deployments/$NETWORK.json}
 SPECS_DIR=${SPECS_DIR:-deployments/specs-$NETWORK}
 ATOMIC=true
+MODE=signer
 
-# Allow --commit-only anywhere in the argument list.
+# Allow flags anywhere among the positional arguments.
 ARGS=()
-for arg in "$@"; do
-  case "$arg" in
-    --commit-only) ATOMIC=false ;;
-    *) ARGS+=("$arg") ;;
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --commit-only) ATOMIC=false; shift ;;
+    --mode)
+      [ "$#" -ge 2 ] || { echo "error: --mode needs signer or price" >&2; exit 2; }
+      MODE=$2; shift 2 ;;
+    --mode=*) MODE=${1#--mode=}; shift ;;
+    *) ARGS+=("$1"); shift ;;
   esac
 done
+case "$MODE" in
+  signer|price) ;;
+  *) echo "error: --mode must be signer or price" >&2; exit 2 ;;
+esac
 set -- "${ARGS[@]:-}"
 
 SEED_AMOUNT=${1:-1500000000}   # 150 USDC, comfortably above the 100 USDC MIN_SEED
@@ -74,6 +85,27 @@ for addr in "$TREASURY" "$MARKET_CORE"; do
   [ -n "$addr" ] && [ "$addr" != "null" ] || { echo "error: no treasury/market_core address in $DEPLOYMENTS" >&2; exit 1; }
 done
 
+if [ "$MODE" = "price" ]; then
+  ORACLE=$(jq -r '.contracts.test_oracle // empty' "$DEPLOYMENTS")
+  [ -n "$ORACLE" ] || { echo "error: price mode requires contracts.test_oracle in $DEPLOYMENTS" >&2; exit 1; }
+  PRICE_ASSET=${PRICE_ASSET:-other:XLM}
+  PRICE_THRESHOLD=${PRICE_THRESHOLD:-2000}
+  PRICE_DIRECTION=${PRICE_DIRECTION:-above}
+  PRICE_MAX_STALENESS=${PRICE_MAX_STALENESS:-3600}
+  case "$PRICE_ASSET" in
+    other:*) PRICE_ASSET_JSON=$(jq -nc --arg s "${PRICE_ASSET#other:}" '{Other:$s}') ;;
+    stellar:*) PRICE_ASSET_JSON=$(jq -nc --arg a "${PRICE_ASSET#stellar:}" '{Stellar:$a}') ;;
+    *) echo "error: PRICE_ASSET must be other:<symbol> or stellar:<address>" >&2; exit 2 ;;
+  esac
+  case "$PRICE_DIRECTION" in
+    above) PRICE_DIRECTION_ENUM=Above ;;
+    at-or-above) PRICE_DIRECTION_ENUM=AtOrAbove ;;
+    below) PRICE_DIRECTION_ENUM=Below ;;
+    at-or-below) PRICE_DIRECTION_ENUM=AtOrBelow ;;
+    *) echo "error: unknown PRICE_DIRECTION '$PRICE_DIRECTION'" >&2; exit 2 ;;
+  esac
+fi
+
 sha256_hex() {
   python3 -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "$1"
 }
@@ -94,11 +126,28 @@ v2_flags() {
   printf '%s\n' --v2 --salt "$1" --network-passphrase "$NETWORK_PASSPHRASE" --market-core "$MARKET_CORE"
 }
 
-echo "==> computing salted V2 resolution commitment (signers: [$AGENT], threshold 1)" >&2
-mapfile -t SIGNERS < <(canonical_signers "$AGENT")
+echo "==> computing salted V2 resolution commitment (mode=$MODE)" >&2
 SALT=$(spec_hash gen-salt)
 mapfile -t V2_FLAGS < <(v2_flags "$SALT")
-RESOLUTION_HASH=$(spec_hash "${V2_FLAGS[@]}" signers 1 "$DISPUTE_WINDOW" "${SIGNERS[@]}")
+
+if [ "$MODE" = "price" ]; then
+  RULE_HASH_ARGS=(price "$ORACLE" "$PRICE_ASSET" "$PRICE_THRESHOLD" "$PRICE_DIRECTION" "$PRICE_MAX_STALENESS")
+  RULE_JSON=$(jq -nc \
+    --arg oracle "$ORACLE" --argjson asset "$PRICE_ASSET_JSON" \
+    --argjson threshold "$PRICE_THRESHOLD" --arg direction "$PRICE_DIRECTION_ENUM" \
+    --argjson staleness "$PRICE_MAX_STALENESS" \
+    '{Price:{reflector:$oracle, asset:$asset, threshold:$threshold, direction:$direction, max_staleness:$staleness}}')
+else
+  echo "==> signers: [$AGENT], threshold 1" >&2
+  mapfile -t SIGNERS < <(canonical_signers "$AGENT")
+  RULE_HASH_ARGS=(signers 1 "$DISPUTE_WINDOW" "${SIGNERS[@]}")
+  RULE_JSON=$(jq -nc \
+    --argjson signers "$(printf '%s\n' "${SIGNERS[@]}" | jq -R . | jq -sc .)" \
+    --argjson window "$DISPUTE_WINDOW" \
+    '{Signers:{dispute_window:$window, signers:$signers, threshold:1}}')
+fi
+
+RESOLUTION_HASH=$(spec_hash "${V2_FLAGS[@]}" "${RULE_HASH_ARGS[@]}")
 
 echo "==> persisting the salt to $SPECS_DIR before creating the market" >&2
 mkdir -p "$SPECS_DIR"
@@ -107,20 +156,20 @@ SPEC_FILE="$SPECS_DIR/$RESOLUTION_HASH.json"
   umask 077
   jq -n --arg question "$QUESTION_TEXT" --arg hash "$RESOLUTION_HASH" --arg salt "$SALT" \
     --arg network_id "$(sha256_hex "$NETWORK_PASSPHRASE")" --arg market_core "$MARKET_CORE" \
-    --argjson signers "$(printf '%s\n' "${SIGNERS[@]}" | jq -R . | jq -sc .)" --argjson window "$DISPUTE_WINDOW" '{
+    --argjson rule "$RULE_JSON" '{
       market_question: $question,
       resolution_hash: $hash,
       salt: $salt,
       spec: {
         version: 2, network_id: $network_id, market_core: $market_core, salt: $salt,
-        rule: { Signers: { dispute_window: $window, signers: $signers, threshold: 1 } }
+        rule: $rule
       }
     }' >"$SPEC_FILE.tmp"
   mv "$SPEC_FILE.tmp" "$SPEC_FILE"
 )
 # Prove the stored salt reproduces the commitment before any funds move.
 mapfile -t V2_FLAGS < <(v2_flags "$(jq -r .salt "$SPEC_FILE")")
-spec_hash verify "$RESOLUTION_HASH" "${V2_FLAGS[@]}" signers 1 "$DISPUTE_WINDOW" "${SIGNERS[@]}" >/dev/null
+spec_hash verify "$RESOLUTION_HASH" "${V2_FLAGS[@]}" "${RULE_HASH_ARGS[@]}" >/dev/null
 
 QUESTION_HASH=$(sha256_hex "$QUESTION_TEXT")
 CLOSE_TIME=$(( $(date +%s) + CLOSE_IN_SECONDS ))
@@ -161,4 +210,5 @@ fi
 echo "market_id=$MARKET_ID"
 echo "close_time=$CLOSE_TIME"
 echo "dispute_window=$DISPUTE_WINDOW"
+echo "mode=$MODE"
 echo "spec_file=$SPEC_FILE"

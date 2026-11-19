@@ -25,6 +25,7 @@ npm run trader                         # unchanged: the trader task, once
 | **Trade with no published trace** | Before every submission the state records an *intent*, and *done* after. Each trace is queued as *pending* before `publish_trace` and marked *published* after, and every tick retries pending traces first. Processed signals are deduplicated by `sha256(source, observedAt, question)`. |
 | **Crash loops** | A failing task backs off exponentially (`BACKOFF_BASE_MS` × 2ⁿ, capped at `BACKOFF_MAX_MS`), and the backoff resets on success. The process circuit opens, logging `CIRCUIT_OPEN` and exiting 1 so the supervisor reacts, after `MAX_CONSECUTIVE_FAILURES` in a row from one task, or `MAX_FAILURES_IN_WINDOW` failures across tasks within `FAILURE_WINDOW_MS`. |
 | **Misconfiguration** | `AGENT_MODE` must be exactly `dry-run` or `live` (unset means dry-run). Anything else exits **2**, where it used to fall through to the live path. Mixing modes in one process is rejected. |
+| **Kill switch** | One persistent marker stops every task immediately, cancels unsent envelopes, blocks new submissions before and after taking the mutex, and makes a tripped daemon refuse to start. Contract-error, risk, operator and drawdown triggers all use the same path. The local stop never waits for RPC; the on-chain `agent_halt` retries independently with capped backoff. |
 
 State lives in `AGENT_STATE_PATH` (default `./.agent-state/state.json`,
 gitignored). It is versioned and keyed by treasury contract id, so a testnet
@@ -41,6 +42,34 @@ stay *created*, and the trader correctly leaves them alone.
 Each task run logs one JSON line (`TASK_OK` / `TASK_FAILED` with the task
 name and duration), plus decision and submission events.
 
+## Kill switch
+
+```bash
+npm run agentd -- kill --reason operator --detail "incident 123"
+npm run agentd -- rearm --operator alice
+```
+
+`kill` writes an fsynced marker file (`AGENT_KILL_FILE`, default
+`.agent-state/KILLED`) and signals the PID recorded in `.agent-state/agent.lock`
+with `SIGUSR2`. The daemon also polls the marker every second. Valid reasons are
+`operator`, `risk`, `errors` and `drawdown`. A killed daemon exits **3** and
+will not start tasks again until an operator explicitly runs `rearm`.
+
+The default task set includes a 30-second `guard` task that calls
+`drawdown_status()` and trips on `tripped`. The trader calls
+`evaluateAgentRisk` before each buy and trips on model violations. Repeated
+contract errors trip with `errors`. Unsigned envelopes are never sent; the
+transaction journal records a `cancelled` stage for envelopes stopped before
+broadcast, while already submitted envelopes are polled to a terminal state.
+
+Once the local halt completes, a live daemon schedules `agent_halt` outside the
+task loops. It retries with exponential backoff capped at 60 seconds and keeps
+its pending state in `AGENT_STATE_PATH`, so it resumes after a restart. It
+finishes when `get_agent` shows no `ROLE_CREATE | ROLE_TRADE`. Dry-run writes
+the marker and stops locally but never calls the chain. After the keeper has
+settled remaining positions, an admin restores rights with `set_agent` followed
+by `execute_agent` after `config_delay`.
+
 ## Exit codes
 
 | code | meaning |
@@ -48,6 +77,7 @@ name and duration), plus decision and submission events.
 | 0 | clean stop, or `--once` succeeded |
 | 1 | task failure (`--once`), circuit open, lease lost, or shutdown with submissions in flight |
 | 2 | bad configuration (`AGENT_MODE`, arguments, env values) |
+| 3 | killed; re-arm explicitly before restarting |
 | 75 | lease held by another live instance; retry later |
 | 130 | forced by a second `SIGINT` |
 
@@ -111,6 +141,23 @@ restarts. Use exec-form `CMD`, so the signal reaches node rather than a shell.
 | `MAX_FAILURES_IN_WINDOW` / `FAILURE_WINDOW_MS` | 20 / 600000 | failures across tasks that open the circuit |
 | `STATE_FLUSH_DEBOUNCE_MS` | 250 | state write debounce |
 | `MARKET_CLOSE_IN_SECS` | 3600 | close time of markets the maker creates |
+
+## Fees
+
+In live mode the adapter reads `getFeeStats` before each submission and sets
+the generated binding's `fee` / `timeoutInSeconds` from the configured
+percentile for the action class (`trade`, `create`, `trace`, `maintenance`).
+The simulated Soroban resource fee is increased by `resourceMarginBps` before
+signing. Per-transaction and rolling daily caps are enforced; a JSON
+`FEE_POLICY_FILE` can override any class, and `AGENT_FEE_PAYER_SECRET` names the
+separate key that signs fee bumps.
+
+Fee bumps keep the signed inner transaction and sequence number unchanged:
+only the outer fee-bump envelope changes, so a bump has a new outer hash. The
+transaction journal records both hashes plus the offered and charged fees;
+`onFeeCharged` receives the same report for metrics. `txINSUFFICIENT_FEE`,
+`txFEE_BUMP_INNER_FAILED` and `ResourceLimitExceeded` are classified as
+retriable fee errors, while `txBAD_AUTH` and `txBAD_SEQ` remain terminal.
 
 ## Extending
 
