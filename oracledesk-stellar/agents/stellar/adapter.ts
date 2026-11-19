@@ -543,6 +543,50 @@ export class StellarAdapter {
   }
 
   /**
+   * Unwind-mode sell (#150). The caller must be the configured agent or the
+   * treasury's unwinder, and the treasury must be in `Unwinding` mode.
+   */
+  async unwindSell(args: {
+    market_id: bigint;
+    outcome: { tag: "Yes" | "No"; values: void };
+    collateral_out: bigint;
+    max_shares_in: bigint;
+  }): Promise<AdapterResult<bigint>> {
+    const call = { caller: this.agent, ...args };
+    return this.run("treasury", "@oracledesk/bindings-treasury", "unwind_sell", call, (client) =>
+      client.unwind_sell(call),
+    );
+  }
+
+  /** Treasury `mode()` as a tag, e.g. "Normal", "Unwinding", "Paused". */
+  async treasuryMode(): Promise<string> {
+    const client = await this.client<any>("treasury", "@oracledesk/bindings-treasury");
+    const { result } = await client.mode();
+    return String((result as { tag?: string }).tag ?? result);
+  }
+
+  /** Effective exit floor for `marketId`, in bps. */
+  async exitFloor(marketId: bigint): Promise<bigint> {
+    const client = await this.client<any>("treasury", "@oracledesk/bindings-treasury");
+    const { result } = await client.exit_floor({ market_id: marketId });
+    return BigInt(result);
+  }
+
+  /**
+   * Simulates market-core's `quote_sell` (read-only) and returns the shares
+   * a sale of exactly `collateral_out` would consume.
+   */
+  async quoteSell(args: {
+    market_id: bigint;
+    outcome: { tag: "Yes" | "No"; values: void };
+    collateral_out: bigint;
+  }): Promise<bigint> {
+    const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
+    const { result } = await client.quote_sell(args);
+    return BigInt(unwrapContractResult("quote_sell", result) as bigint);
+  }
+
+  /**
    * Simulates market-core's `quote_buy` (read-only — never signs or
    * submits) and returns the quoted shares. Unlike the mutating wrappers
    * this also runs in dry-run mode, so a dry-run trader can still derive

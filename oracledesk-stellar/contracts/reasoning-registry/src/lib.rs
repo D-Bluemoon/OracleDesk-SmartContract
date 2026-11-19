@@ -10,8 +10,10 @@ extern crate std;
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, Bytes, BytesN,
-    Env, String, Vec,
+    Env, String, Symbol, Vec,
 };
+use soroban_sdk::xdr::ToXdr;
+use soroban_sdk::{};
 
 /// Rolling window for trace entries, unchanged from the pre-#16 policy:
 /// 60 days, extended at half that. Registration (`Agent`) instead uses
@@ -55,6 +57,8 @@ pub struct TraceBatch {
     pub manifest_cid: String,
     pub published_at: u64,
 }
+
+pub const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
 
 const BUMP_THRESHOLD: u32 = 30 * 17_280;
 const BUMP_TO: u32 = 60 * 17_280;
@@ -126,6 +130,75 @@ pub enum TraceVerdict {
     AgentRevokedAfter(u64),
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRetired {
+    #[topic]
+    pub agent: Address,
+    pub at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRevoked {
+    #[topic]
+    pub agent: Address,
+    pub effective_from: u64,
+    pub reason: Symbol,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentReactivated {
+    #[topic]
+    pub agent: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceFlagged {
+    #[topic]
+    pub trace_id: u64,
+    pub reason: Symbol,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceUnflagged {
+    #[topic]
+    pub trace_id: u64,
+    pub reason: Symbol,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSigningKeyAdded {
+    #[topic]
+    pub agent: Address,
+    #[topic]
+    pub public_key: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSigningKeyRetired {
+    #[topic]
+    pub agent: Address,
+    #[topic]
+    pub public_key: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceSigned {
+    #[topic]
+    pub trace_id: u64,
+    #[topic]
+    pub agent: Address,
+    #[topic]
+    pub signing_key: BytesN<32>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Trace {
@@ -171,36 +244,32 @@ pub enum DataKey {
     NextId,
     Agent(Address),
     Trace(u64),
-    /// Number of traces published for a market, so a client can page through
-    /// `MarketTrace(market_id, 0..count)` without the contract ever holding
-    /// an unbounded Vec of trace ids in one storage entry.
     MarketTraceCount(u64),
     MarketTrace(u64, u64),
-    /// Ledger sequence a trace was written in (#50). Kept beside `Trace`
-    /// rather than inside it so the `Trace` XDR shape doesn't change.
     TraceLedger(u64),
     TraceDecision(u64),
     Flag(u64),
-    /// Contracts allowed to call `consume_trace` (#50).
     Consumer(Address),
-    /// Set once a trace has backed an action (#50).
     Consumed(u64),
-    /// Per-agent hash-chain head (#52).
     AgentHead(Address),
-    /// Per-agent `seq -> trace_id` (#52).
     AgentTrace(Address, u64),
-    /// `trace_id -> ChainLink`; absent for legacy traces (#52).
     TraceLink(u64),
-    /// Number of traces published by an agent, in publish order (#57).
     AgentTraceCount(Address),
-    /// `agent, index -> trace_id`, a secondary index parallel to
-    /// `MarketTrace` so "everything agent X published" is one page (#57).
     AgentTraceAt(Address, u64),
-    /// Number of traces for a `(market, action)` pair (#57).
     MarketActionTraceCount(u64, String),
-    /// `market, action, index -> trace_id`, so "every Buy decision on market
-    /// 7" is one page instead of scanning the market's whole index (#57).
     MarketActionTraceAt(u64, String, u64),
+    FlagHistoryCount(u64),
+    FlagHistory(u64, u32),
+    MarketCore,
+    Batch(u64),
+    NextBatchId,
+    AgentBatchCount(Address),
+    AgentBatch(Address, u64),
+    AgentSigningKeys(Address),
+    SigningKeyHistoryCount(Address),
+    SigningKeyHistory(Address, u32),
+    KeyToAgent(BytesN<32>),
+    TraceSignature(u64),
 }
 
 /// Head of an agent's append-only trace log (#52). Genesis is `seq = 0`
@@ -249,12 +318,36 @@ pub enum Error {
     NoPendingAdmin = 11,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 12,
-    TraceAgentMismatch = 13,
-    TraceMismatch = 14,
-    AgentNotActive = 15,
-    TraceFlagged = 16,
-    TraceTooOld = 17,
-    TraceDecisionMissing = 18,
+    CannotReactivateRevoked = 100,
+    FlagHistoryFull = 101,
+    InvalidEffectiveTime = 102,
+    UnknownMarket = 103,
+    MarketRequired = 104,
+    ProposalMustUseNoMarket = 105,
+    UseCanonicalAction = 106,
+    BatchNotFound = 107,
+    InvalidBatch = 108,
+    InvalidProof = 109,
+    TooManyKeys = 110,
+    KeyAlreadyBound = 111,
+    InvalidKey = 112,
+    InvalidSignature = 113,
+    TraceNotSigned = 114,
+    AgentNotActive = 115,
+    ActionTooLong = 116,
+    CidTooLong = 117,
+    PageTooLarge = 118,
+    TraceFlagged = 119,
+    TraceTooOld = 120,
+    TraceDecisionMissing = 121,
+    TraceAgentMismatch = 122,
+    TraceMismatch = 123,
+    AlreadyRetired = 124,
+    NotRetired = 125,
+    SigningKeyNotFound = 126,
+    TooManySigningKeys = 127,
+    SigningKeyAlreadyBound = 128,
+
 }
 
 #[contractevent]
@@ -665,144 +758,6 @@ impl ReasoningRegistry {
         env.storage().persistent().has(&DataKey::Consumed(trace_id))
     }
 
-    pub fn publish_decision_trace(
-        env: Env,
-        agent: Address,
-        market_id: u64,
-        action: TraceAction,
-        trace_hash: BytesN<32>,
-        ipfs_cid: String,
-        decision_hash: BytesN<32>,
-    ) -> Result<u64, Error> {
-        Self::check_publish(&env, &agent, market_id, &action, &ipfs_cid)?;
-        let trace_id = Self::write_trace(env.clone(), agent, market_id, action, trace_hash, ipfs_cid)?;
-        Self::put(&env, &DataKey::TraceDecision(trace_id), &decision_hash);
-        Ok(trace_id)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn publish_chained_decision_trace(
-        env: Env,
-        agent: Address,
-        market_id: u64,
-        action: TraceAction,
-        trace_hash: BytesN<32>,
-        ipfs_cid: String,
-        expected_seq: u64,
-        prev_trace_hash: BytesN<32>,
-        decision_hash: BytesN<32>,
-    ) -> Result<u64, Error> {
-        ttl::bump_instance(&env);
-        Self::check_publish(&env, &agent, market_id, &action, &ipfs_cid)?;
-        ttl::bump_persistent(
-            &env,
-            &DataKey::Agent(agent.clone()),
-            ttl::long_lived_target(&env),
-        );
-        let head = Self::load_head(&env, &agent);
-        if expected_seq != head.seq + 1 || prev_trace_hash != head.head_hash {
-            return Err(Error::ChainHeadMismatch);
-        }
-        let trace_id = Self::write_trace(
-            env.clone(),
-            agent.clone(),
-            market_id,
-            action,
-            trace_hash.clone(),
-            ipfs_cid,
-        )?;
-        Self::put(&env, &DataKey::TraceDecision(trace_id), &decision_hash);
-        Self::put(
-            &env,
-            &DataKey::TraceLink(trace_id),
-            &ChainLink {
-                seq: expected_seq,
-                prev_trace_hash: prev_trace_hash.clone(),
-            },
-        );
-        Self::put(&env, &DataKey::AgentTrace(agent.clone(), expected_seq), &trace_id);
-        Self::put(
-            &env,
-            &DataKey::AgentHead(agent.clone()),
-            &ChainHead {
-                seq: expected_seq,
-                head_hash: trace_hash.clone(),
-                head_trace_id: Some(trace_id),
-            },
-        );
-        TraceChained {
-            agent,
-            seq: expected_seq,
-            trace_id,
-            prev_trace_hash,
-            trace_hash,
-        }
-        .publish(&env);
-        Ok(trace_id)
-    }
-
-    pub fn get_trace_decision(env: Env, trace_id: u64) -> Option<BytesN<32>> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::TraceDecision(trace_id))
-    }
-
-    pub fn consume_trace_for(
-        env: Env,
-        consumer: Address,
-        trace_id: u64,
-        agent: Address,
-        market_id: u64,
-        action: TraceAction,
-        max_age_ledgers: u32,
-    ) -> Result<TraceConsumeInfo, Error> {
-        consumer.require_auth();
-        if !env
-            .storage()
-            .persistent()
-            .has(&DataKey::Consumer(consumer.clone()))
-        {
-            return Err(Error::Unauthorized);
-        }
-        let trace = Self::get_trace(env.clone(), trace_id)?;
-        if trace.agent != agent {
-            return Err(Error::TraceAgentMismatch);
-        }
-        if trace.market_id != market_id || trace.action != action {
-            return Err(Error::TraceMismatch);
-        }
-        let record = Self::load_agent(&env, &agent).ok_or(Error::AgentNotRegistered)?;
-        if !matches!(record.status, AgentStatus::Active) {
-            return Err(Error::AgentNotActive);
-        }
-        if env.storage().persistent().has(&DataKey::Flag(trace_id)) {
-            return Err(Error::TraceFlagged);
-        }
-        let written = env
-            .storage()
-            .persistent()
-            .get::<_, u32>(&DataKey::TraceLedger(trace_id))
-            .ok_or(Error::TraceNotFound)?;
-        if env.ledger().sequence() > written.saturating_add(max_age_ledgers) {
-            return Err(Error::TraceTooOld);
-        }
-        let decision = env
-            .storage()
-            .persistent()
-            .get::<_, BytesN<32>>(&DataKey::TraceDecision(trace_id))
-            .ok_or(Error::TraceDecisionMissing)?;
-        let key = DataKey::Consumed(trace_id);
-        if env.storage().persistent().has(&key) {
-            return Err(Error::TraceAlreadyConsumed);
-        }
-        Self::put(&env, &key, &true);
-        TraceConsumed { trace_id, consumer }.publish(&env);
-        Ok(TraceConsumeInfo {
-            decision: Some(decision),
-            ledger: written,
-        })
-    }
-
     /// Checks a commit-reveal commitment (#51):
     /// `commitment == sha256("oracledesk.trace.commit.v1" || trace_hash || salt)`.
     pub fn verify_commitment(
@@ -964,12 +919,7 @@ impl ReasoningRegistry {
     }
 
     /// The `index`-th (0-based, publish order) trace id for `agent` (#57).
-    pub fn agent_trace_at(env: Env, agent: Address, index: u64) -> Result<u64, Error> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::AgentTraceAt(agent, index))
-            .ok_or(Error::TraceNotFound)
-    }
+
 
     /// Number of traces for the `(market_id, action)` pair (#57).
     pub fn market_action_trace_count(env: Env, market_id: u64, action: String) -> u64 {
@@ -1048,8 +998,6 @@ impl ReasoningRegistry {
                 .ok_or(Error::TraceNotFound)
         })
     }
-}
-
     /// Anchors a Merkle batch of N traces off-chain, storing only the 32-byte root
     /// and manifest CID on-chain (#54).
     pub fn publish_trace_batch(
@@ -1064,17 +1012,9 @@ impl ReasoningRegistry {
         if !matches!(record.status, AgentStatus::Active) {
             return Err(Error::AgentNotActive);
         }
-        if action.len() > MAX_ACTION_LEN {
-            return Err(Error::ActionTooLong);
+        if leaf_count == 0 || leaf_count > MAX_LEAVES || manifest_cid.is_empty() {
+            return Err(Error::InvalidBatch);
         }
-        if ipfs_cid.is_empty() {
-            return Err(Error::EmptyCid);
-        }
-        if ipfs_cid.len() > MAX_CID_LEN {
-            return Err(Error::CidTooLong);
-        }
-        Ok(())
-    }
 
         let batch_id: u64 = env
             .storage()
@@ -1097,29 +1037,8 @@ impl ReasoningRegistry {
         Self::put(&env, &DataKey::AgentBatch(agent.clone(), agent_idx), &batch_id);
         Self::put(&env, &agent_count_key, &(agent_idx + 1));
 
-        // Secondary index by agent (#57).
-        let agent_count_key = DataKey::AgentTraceCount(agent.clone());
-        let agent_index: u64 = env.storage().persistent().get(&agent_count_key).unwrap_or(0);
-        Self::put(env, &DataKey::AgentTraceAt(agent.clone(), agent_index), &id);
-        Self::put(env, &agent_count_key, &(agent_index + 1));
-
-        // Secondary index by (market, action) (#57).
-        let action_count_key = DataKey::MarketActionTraceCount(market_id, action.clone());
-        let action_index: u64 = env
-            .storage()
-            .persistent()
-            .get(&action_count_key)
-            .unwrap_or(0);
-        Self::put(
-            env,
-            &DataKey::MarketActionTraceAt(market_id, action.clone(), action_index),
-            &id,
-        );
-        Self::put(env, &action_count_key, &(action_index + 1));
-
-        TracePublished {
-            trace_id: id,
-            market_id,
+        BatchPublished {
+            batch_id,
             agent,
             root,
             leaf_count,
@@ -1146,6 +1065,13 @@ impl ReasoningRegistry {
 
     pub fn batch_count(env: Env) -> u64 {
         env.storage().instance().get(&DataKey::NextBatchId).unwrap_or(0)
+    }
+
+    pub fn agent_batch_count(env: Env, agent: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AgentBatchCount(agent))
+            .unwrap_or(0)
     }
 
     /// Shared body of the three paginated readers (#57): validates the page
@@ -1191,7 +1117,6 @@ impl ReasoningRegistry {
     fn load_pending(env: &Env) -> Option<PendingAdmin> {
         env.storage().instance().get(&DataKey::PendingAdmin)
     }
-}
 
     pub fn agent_batch_at(env: Env, agent: Address, index: u64) -> Result<u64, Error> {
         let key = DataKey::AgentBatch(agent, index);
@@ -1868,15 +1793,27 @@ impl ReasoningRegistry {
         env.crypto().sha256(&bytes).into()
     }
 
-    fn require_admin(env: &Env) -> Result<(), Error> {
-        ttl::bump_instance(env);
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
-        Ok(())
+
+}
+
+impl ReasoningRegistry {
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, BUMP_THRESHOLD, BUMP_TO);
+    }
+
+    fn load_trace(env: &Env, trace_id: u64) -> Result<Trace, Error> {
+        Self::get_trace(env.clone(), trace_id)
+    }
+
+    fn require_active_agent(env: &Env, agent: &Address) -> Result<(), Error> {
+        let record = Self::load_agent(env, agent).ok_or(Error::AgentNotRegistered)?;
+        if matches!(record.status, AgentStatus::Active) {
+            Ok(())
+        } else {
+            Err(Error::AgentNotActive)
+        }
     }
 }
 
@@ -1976,7 +1913,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #4)")]
+    #[should_panic(expected = "Error(Contract, #3004)")]
     fn unregistered_agent_cannot_publish() {
         let (env, client, _, agent) = setup();
         client.publish_trace(
@@ -1989,7 +1926,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #5)")]
+    #[should_panic(expected = "Error(Contract, #3005)")]
     fn unknown_trace_cannot_be_verified() {
         let (env, client, _, _) = setup();
         client.verify_trace(&99, &BytesN::from_array(&env, &[0u8; 32]));
@@ -2108,8 +2045,8 @@ mod test {
         let cid = String::from_str(env, "ipfs://publish-refresh");
         client.publish_trace(
             agent,
-            &(100 + day),
-            &String::from_str(env, "trade"),
+            &(day % 50),
+            &TraceAction::Other(Symbol::new(env, "trade")),
             &trace_hash,
             &cid,
         );
@@ -3215,4 +3152,5 @@ mod test {
             .try_cancel_admin_transfer()
             .is_err());
     }
+}
 }

@@ -50,9 +50,12 @@ mint shares and only a share's owner can burn it. There is no admin
 `withdraw`. Configuration that would let the *agents* spend more (raised
 caps, new or widened agents, a looser price policy, a market-core or
 collateral switch) waits `config_delay` (at least one day) after a public
-`*Proposed` event, while tightening applies at once. What this does **not**
-protect against: the admin can still pause the treasury instantly, and can
-`set_successor` + `migrate_market` to move positions to another address, so
+`*Proposed` event, while tightening applies at once. Capital-moving admin
+ops (`set_yield_venue`, `allocate_to_yield`, `set_successor`,
+`migrate_markets`) use the same queue (`propose_op` / `execute_op` /
+`cancel_op`). What this does **not** protect against: the admin can still
+pause the treasury instantly, and can propose `set_successor` +
+`migrate_markets` to move positions to another address, so
 a compromised admin key remains a custody risk for open positions. A
 governance timelock over all admin roles is separate work.
 
@@ -60,7 +63,9 @@ In scope for reports: anything that lets a depositor withdraw more than
 their pro-rata share of NAV (share inflation, rounding, NAV manipulation
 through trades against a pool), lets an agent spend capital reserved for
 queued withdrawals, or bypasses the role checks, sub-budgets, price limits
-or timelock.
+or timelock. Also in scope: a caller who is neither the agent nor the
+admin-set `unwinder` selling through `unwind_sell`, an `exit_floor` bypass,
+or a non-allow-listed token entering market-core or the vault.
 
 ## Guardian trust model
 

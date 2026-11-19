@@ -490,7 +490,7 @@ migrated lazily into `GlobalConfig` plus one full-role agent.
   and keeps a running `net_exposure() = sum(max(0, in - out))`. Profit in
   one market floors at zero and never offsets another. A sell frees net
   headroom but not lifetime headroom; `close_trade` changes neither;
-  `migrate_market` drops the market from net accounting. Enforcement uses
+  `migrate_markets` drops the markets from net accounting. Enforcement uses
   only these local counters (no extra cross-contract call on the hot path)
   and never a pool price: a spot-valued cap would let anyone pump a price to
   unlock headroom or crash it to block the agent. `market_valuation(id)`
@@ -555,6 +555,42 @@ This bounds
 what a compromised admin can unlock *for the agents*; it is not a custody
 control (see "Vault" and SECURITY.md).
 
+**Operating modes (#150).** `Mode` is `Normal`, `Unwinding`, or `Paused`.
+`Unwinding` rejects buys and market creation but permits sells by the agent
+and by an optional admin-set `unwinder`; `unwind_sell` additionally enforces
+the per-market `exit_floor` (default 0, admin `set_exit_floor` /
+`set_default_exit_floor`) and records collateral returned in `unwound(id)`.
+`Paused` rejects all spending. A tripped drawdown is stricter: every non-sell
+operation fails until `acknowledge_drawdown`, while reduce-only sells remain
+available, including in `Unwinding`.
+
+**Delayed admin operations (#250).** Capital-moving or risk-loosening admin
+ops use `AdminOp` with stable kinds: yield venue (0), yield allocation (1),
+successor (2), market migration (3), drawdown config (4), PnL-window reset
+(5), creation policy (6), and correlation caps (7). `propose_op` queues one
+op per kind for `config_delay`; `execute_op(kind)` is permissionless, checks
+`executable_at`/`expires_at`, and revalidates against current state;
+`cancel_op(kind)` is admin-only. Tightening-only variants of the legacy
+setters still apply immediately, and a successor proposal cancels a pending
+migration so the destination cannot change under it.
+
+**Correlated risk (#259).** Optional `CorrelationCaps` bound net cost-basis
+exposure by market category and close-date bucket. Category indices follow
+market-core's `Category` order and each market's metadata is cached on first
+touch; `category_exposure` / `bucket_exposure` / `correlation_headroom` expose
+the accounting. Caps are opt-in: with no stored `CorrelationCaps`, checks are
+skipped so existing deployments keep their previous error precedence.
+Loosening or changing `bucket_secs` is delayed, and `bucket_secs` cannot change
+while correlated exposure is open.
+
+**Multi-collateral (#151).** market-core keeps an allow-list of SEP-41
+tokens (`add_collateral`, `set_collateral_enabled`) and snapshots each
+market's token and max size at creation. Treasury creations, buys, deposits,
+sells and settlement use that market's token; per-token `TokenCaps` and
+sliding usage windows fall back to the global caps when absent. Only the
+default collateral mints vault shares; other allow-listed tokens are donated
+and tracked for that token's markets.
+
 **Vault.** Deposits mint internal shares against a conservative NAV and
 withdrawals burn them; there is no admin `withdraw`. `nav() = idle +
 Σ floor(open markets) - queue_reserved`, where an open market's floor is its
@@ -580,19 +616,21 @@ free idle collateral without touching market-core. See
 redeploying it (a bug fix, or anything the timelocked setters above do not
 cover) means deploying a new contract. `set_successor(successor)`
 (admin) records where value may go and emits `SuccessorSet`; then
-`migrate_market(market_id)` (admin, **not** agent) moves the treasury's
-YES/NO position and, if it is still the LP, its LP ownership for one market
-to the successor — market by market, so the footprint stays bounded — and
-emits `MarketMigrated`. The auth model:
+`migrate_markets(market_ids)` (admin, **not** agent, delayed by
+`config_delay` as admin op kind 3) moves the treasury's YES/NO position and,
+if it is still the LP, its LP ownership for each listed market to the
+successor in one bounded batch and emits `MarketMigrated` per market. The
+auth model:
 
-- The agent has no path: both migration entrypoints are `require_admin`.
-- The destination is fixed to the configured `Successor` — `migrate_market`
+- The agent has no path: `set_successor` and `migrate_markets` are
+  `require_admin`; the latter is also queued as a delayed `AdminOp`.
+- The destination is fixed to the configured `Successor` — `migrate_markets`
   takes no destination argument, so even a compromised agent key cannot
   redirect value. It is still an admin power over shareholders' capital:
   migrated positions leave this treasury's NAV without compensation, so a
   compromised admin could move them to a successor it controls. The
   successor is visible on-chain via `SuccessorSet` before any
-  `migrate_market`, and SECURITY.md lists this as a known admin power.
+  `migrate_markets`, and SECURITY.md lists this as a known admin power.
 - The treasury's calls to market-core's `transfer_position` / `transfer_lp`
   are *direct* calls, so market-core's `require_auth` on the treasury's own
   address is satisfied implicitly by the invoker rule — no
@@ -700,9 +738,10 @@ behaviour is covered by each contract's own tests.
 
 **Not guaranteed:**
 
-- *Admin actions are not agent spending.* `withdraw`, `emergency_withdraw`,
-  config changes after their timelock, and the market-core admin swapping the
-  resolver or treasury role all bypass these caps by design.
+- *Admin actions are not agent spending.* `emergency_withdraw`, config
+  changes after their timelock, and the market-core admin swapping the
+  resolver or treasury role all bypass these caps by design. `request_withdraw`
+  is shareholder-only and cannot exceed pro-rata NAV.
 - *`max_daily` is not a calendar-day cap.* It is a trailing 24-25h cap, so the
   agent can be refused a spend that is a few minutes over 24h after a previous
   one. It is also not a cap on losses by itself: an agent may spend `max_daily`
