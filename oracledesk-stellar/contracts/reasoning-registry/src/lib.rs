@@ -137,6 +137,13 @@ pub struct Trace {
     pub published_at: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceConsumeInfo {
+    pub decision: Option<BytesN<32>>,
+    pub ledger: u32,
+}
+
 /// One `(trace_id, Trace)` pair in a [`TracePage`].
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -172,6 +179,8 @@ pub enum DataKey {
     /// Ledger sequence a trace was written in (#50). Kept beside `Trace`
     /// rather than inside it so the `Trace` XDR shape doesn't change.
     TraceLedger(u64),
+    TraceDecision(u64),
+    Flag(u64),
     /// Contracts allowed to call `consume_trace` (#50).
     Consumer(Address),
     /// Set once a trace has backed an action (#50).
@@ -240,6 +249,12 @@ pub enum Error {
     NoPendingAdmin = 11,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 12,
+    TraceAgentMismatch = 13,
+    TraceMismatch = 14,
+    AgentNotActive = 15,
+    TraceFlagged = 16,
+    TraceTooOld = 17,
+    TraceDecisionMissing = 18,
 }
 
 #[contractevent]
@@ -648,6 +663,144 @@ impl ReasoningRegistry {
 
     pub fn is_consumed(env: Env, trace_id: u64) -> bool {
         env.storage().persistent().has(&DataKey::Consumed(trace_id))
+    }
+
+    pub fn publish_decision_trace(
+        env: Env,
+        agent: Address,
+        market_id: u64,
+        action: TraceAction,
+        trace_hash: BytesN<32>,
+        ipfs_cid: String,
+        decision_hash: BytesN<32>,
+    ) -> Result<u64, Error> {
+        Self::check_publish(&env, &agent, market_id, &action, &ipfs_cid)?;
+        let trace_id = Self::write_trace(env.clone(), agent, market_id, action, trace_hash, ipfs_cid)?;
+        Self::put(&env, &DataKey::TraceDecision(trace_id), &decision_hash);
+        Ok(trace_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_chained_decision_trace(
+        env: Env,
+        agent: Address,
+        market_id: u64,
+        action: TraceAction,
+        trace_hash: BytesN<32>,
+        ipfs_cid: String,
+        expected_seq: u64,
+        prev_trace_hash: BytesN<32>,
+        decision_hash: BytesN<32>,
+    ) -> Result<u64, Error> {
+        ttl::bump_instance(&env);
+        Self::check_publish(&env, &agent, market_id, &action, &ipfs_cid)?;
+        ttl::bump_persistent(
+            &env,
+            &DataKey::Agent(agent.clone()),
+            ttl::long_lived_target(&env),
+        );
+        let head = Self::load_head(&env, &agent);
+        if expected_seq != head.seq + 1 || prev_trace_hash != head.head_hash {
+            return Err(Error::ChainHeadMismatch);
+        }
+        let trace_id = Self::write_trace(
+            env.clone(),
+            agent.clone(),
+            market_id,
+            action,
+            trace_hash.clone(),
+            ipfs_cid,
+        )?;
+        Self::put(&env, &DataKey::TraceDecision(trace_id), &decision_hash);
+        Self::put(
+            &env,
+            &DataKey::TraceLink(trace_id),
+            &ChainLink {
+                seq: expected_seq,
+                prev_trace_hash: prev_trace_hash.clone(),
+            },
+        );
+        Self::put(&env, &DataKey::AgentTrace(agent.clone(), expected_seq), &trace_id);
+        Self::put(
+            &env,
+            &DataKey::AgentHead(agent.clone()),
+            &ChainHead {
+                seq: expected_seq,
+                head_hash: trace_hash.clone(),
+                head_trace_id: Some(trace_id),
+            },
+        );
+        TraceChained {
+            agent,
+            seq: expected_seq,
+            trace_id,
+            prev_trace_hash,
+            trace_hash,
+        }
+        .publish(&env);
+        Ok(trace_id)
+    }
+
+    pub fn get_trace_decision(env: Env, trace_id: u64) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TraceDecision(trace_id))
+    }
+
+    pub fn consume_trace_for(
+        env: Env,
+        consumer: Address,
+        trace_id: u64,
+        agent: Address,
+        market_id: u64,
+        action: TraceAction,
+        max_age_ledgers: u32,
+    ) -> Result<TraceConsumeInfo, Error> {
+        consumer.require_auth();
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Consumer(consumer.clone()))
+        {
+            return Err(Error::Unauthorized);
+        }
+        let trace = Self::get_trace(env.clone(), trace_id)?;
+        if trace.agent != agent {
+            return Err(Error::TraceAgentMismatch);
+        }
+        if trace.market_id != market_id || trace.action != action {
+            return Err(Error::TraceMismatch);
+        }
+        let record = Self::load_agent(&env, &agent).ok_or(Error::AgentNotRegistered)?;
+        if !matches!(record.status, AgentStatus::Active) {
+            return Err(Error::AgentNotActive);
+        }
+        if env.storage().persistent().has(&DataKey::Flag(trace_id)) {
+            return Err(Error::TraceFlagged);
+        }
+        let written = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::TraceLedger(trace_id))
+            .ok_or(Error::TraceNotFound)?;
+        if env.ledger().sequence() > written.saturating_add(max_age_ledgers) {
+            return Err(Error::TraceTooOld);
+        }
+        let decision = env
+            .storage()
+            .persistent()
+            .get::<_, BytesN<32>>(&DataKey::TraceDecision(trace_id))
+            .ok_or(Error::TraceDecisionMissing)?;
+        let key = DataKey::Consumed(trace_id);
+        if env.storage().persistent().has(&key) {
+            return Err(Error::TraceAlreadyConsumed);
+        }
+        Self::put(&env, &key, &true);
+        TraceConsumed { trace_id, consumer }.publish(&env);
+        Ok(TraceConsumeInfo {
+            decision: Some(decision),
+            ledger: written,
+        })
     }
 
     /// Checks a commit-reveal commitment (#51):

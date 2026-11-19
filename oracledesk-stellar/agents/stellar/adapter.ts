@@ -9,14 +9,26 @@
  * packages/bindings/<name> — see README.md's quickstart).
  */
 
-import { Address, Keypair, rpc, xdr } from "@stellar/stellar-sdk";
-import { KeypairSigner } from "@stellar/stellar-sdk/contract";
+import { Address, Keypair, rpc, TransactionBuilder, xdr, type Transaction } from "@stellar/stellar-sdk";
+import { KeypairSigner, type MethodOptions } from "@stellar/stellar-sdk/contract";
 import { toContractArg, type PriceConfigArg, type SignerConfigArg, type SpecJson } from "../core/spec.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { toTraceAction, type TraceActionType } from "../core/trace.js";
 import { assertNever, type AgentMode } from "../runtime/config.js";
+import {
+  applyResourceMargin,
+  feePolicyFor,
+  inclusionBid,
+  resourceFeeOf,
+  type ActionClass,
+  type FeePolicy,
+  type FeeRule,
+  type FeeStatsResponse,
+} from "./fees.js";
+import { feeChargedOf, submitSorobanTransaction, type ReplacementPolicy } from "./submit.js";
+import { TransactionJournal } from "./journal.js";
 import type { StellarSigner } from "./signers/types.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -66,13 +78,32 @@ export function agentCredentials(
   };
 }
 
+export interface FeeReport {
+  task: string;
+  decisionId: string;
+  actionClass: ActionClass;
+  feeCharged: string;
+  bumps: number;
+}
+
 interface CommonAdapterOptions {
   networkPassphrase: string;
   rpcUrl: string;
-  /** The acting agent's address for dry-run descriptions (live mode always
-   * uses the secret key's public key). Defaults to `deployments.agent`. */
   agentAddress?: string;
   deployments: Deployments;
+  feePolicy?: FeePolicy;
+  journal?: TransactionJournal;
+  task?: string;
+  onFeeCharged?: (report: FeeReport) => void;
+  nowUnix?: () => number;
+}
+
+interface AssembledCall<T> {
+  built?: Transaction;
+  signed?: Transaction;
+  simulation?: { error?: string };
+  result?: T;
+  signAndSend(): Promise<{ result: T }>;
 }
 
 /**
@@ -94,7 +125,7 @@ export interface DryRunResult {
 }
 
 /** Real result shape depends on the call; see each wrapper method below. */
-export type LiveResult<T> = { dryRun: false; value: T };
+export type LiveResult<T> = { dryRun: false; value: T; fee?: FeeReport };
 
 export type AdapterResult<T> = DryRunResult | LiveResult<T>;
 
@@ -135,6 +166,10 @@ export class NotSubmittedError extends Error {
 export class StellarAdapter {
   private readonly signer?: StellarSigner;
   private readonly publicKey?: string;
+  private readonly agentKeypair?: Keypair;
+  private readonly feePayerKeypair?: Keypair;
+  private readonly feeSpent = new Map<string, bigint>();
+  private feeStatsCache?: { ledger: number; stats: FeeStatsResponse };
 
   constructor(private readonly opts: StellarAdapterOptions) {
     switch (opts.mode) {
@@ -152,6 +187,7 @@ export class StellarAdapter {
           this.publicKey = opts.signer.address;
         } else if (opts.agentSecret) {
           const keypair = Keypair.fromSecret(opts.agentSecret);
+          this.agentKeypair = keypair;
           this.signer = new KeypairSigner(keypair, opts.networkPassphrase);
           this.publicKey = keypair.publicKey();
         } else {
@@ -160,6 +196,15 @@ export class StellarAdapter {
         const expectedAddress = opts.agentAddress ?? opts.deployments.agent;
         if (this.publicKey !== expectedAddress) {
           throw new Error("signer address does not match the configured agent address");
+        }
+        if (opts.feePolicy) {
+          if (!opts.journal) throw new Error("feePolicy requires a transaction journal in live mode");
+          for (const rule of Object.values(opts.feePolicy.policies)) {
+            if (rule.bumpMultiplier < 10) throw new Error("fee bump multiplier must be at least 10");
+          }
+          if (opts.feePolicy.feePayerSecret) {
+            this.feePayerKeypair = Keypair.fromSecret(opts.feePolicy.feePayerSecret);
+          }
         }
         break;
       }
@@ -182,6 +227,90 @@ export class StellarAdapter {
   /** The deployment this adapter is bound to. */
   get deployments(): Deployments {
     return this.opts.deployments;
+  }
+
+  private get taskName(): string {
+    return this.opts.task ?? "agent";
+  }
+
+  private nowUnix(): number {
+    return this.opts.nowUnix?.() ?? Math.floor(Date.now() / 1000);
+  }
+
+  private async feeStats(): Promise<FeeStatsResponse> {
+    const server = this.rpcServer() as unknown as { getFeeStats?: () => Promise<FeeStatsResponse> };
+    if (typeof server.getFeeStats !== "function") throw new TypeError("RPC does not support getFeeStats");
+    const stats = await server.getFeeStats();
+    if (this.feeStatsCache && this.feeStatsCache.ledger === stats.latestLedger) return this.feeStatsCache.stats;
+    this.feeStatsCache = { ledger: stats.latestLedger, stats };
+    return stats;
+  }
+
+  private async feeOptionsFor(methodName: string, deadlineUnix?: bigint): Promise<MethodOptions | undefined> {
+    if (this.opts.mode !== "live" || !this.opts.feePolicy) return undefined;
+    const rule = this.opts.feePolicy.policies[feePolicyFor(methodName)];
+    const bid = inclusionBid(await this.feeStats(), rule);
+    const options: MethodOptions = { fee: bid.toString() };
+    if (deadlineUnix !== undefined) {
+      options.timeoutInSeconds = Math.max(1, Number(deadlineUnix - BigInt(this.nowUnix())));
+    }
+    return options;
+  }
+
+  private checkFeeCap(actionClass: ActionClass, fee: bigint, rule: FeeRule): void {
+    if (!this.opts.feePolicy) return;
+    if (fee > rule.maxTotalFee) throw new NotSubmittedError("fee cap");
+    const day = Math.floor(this.nowUnix() / 86_400);
+    const used = this.feeSpent.get(`${day}:${actionClass}`) ?? 0n;
+    if (used + rule.maxTotalFee > this.opts.feePolicy.maxDailyFees[actionClass]) {
+      throw new NotSubmittedError("fee cap");
+    }
+  }
+
+  private reserveDailyFee(actionClass: ActionClass, rule: FeeRule): void {
+    const day = Math.floor(this.nowUnix() / 86_400);
+    const key = `${day}:${actionClass}`;
+    this.feeSpent.set(key, (this.feeSpent.get(key) ?? 0n) + rule.maxTotalFee);
+  }
+
+  private replacementFor(
+    inner: Transaction,
+    rule: FeeRule,
+    stats: FeeStatsResponse,
+    deadlineUnix: number | undefined,
+    counter: { count: number },
+  ): ReplacementPolicy | undefined {
+    const feePayer = this.feePayerKeypair;
+    if (!feePayer) return undefined;
+    const resourceFee = resourceFeeOf(inner);
+    const feeRate = BigInt(inner.operations.length + 1);
+    return {
+      afterPolls: 2,
+      deadlineUnix,
+      maxBumps: rule.maxBumps,
+      bump: (_tx, attempt) => {
+        const bid = inclusionBid(stats, rule) * BigInt(rule.bumpMultiplier) ** BigInt(attempt);
+        if (bid > rule.maxInclusion) return undefined;
+        if (bid * feeRate + resourceFee > rule.maxTotalFee) return undefined;
+        try {
+          const bump = TransactionBuilder.buildFeeBumpTransaction(
+            feePayer.publicKey(),
+            bid.toString(),
+            inner,
+            this.opts.networkPassphrase,
+          );
+          bump.sign(feePayer);
+          counter.count += 1;
+          return bump;
+        } catch {
+          return undefined;
+        }
+      },
+    };
+  }
+
+  private decisionId(methodName: string): string {
+    return `${this.taskName}-${methodName}-${this.nowUnix()}-${Math.random().toString(16).slice(2)}`;
   }
 
   /**
@@ -213,7 +342,8 @@ export class StellarAdapter {
     moduleName: string,
     methodName: string,
     args: unknown,
-    call: (client: any) => Promise<{ signAndSend: () => Promise<{ result: T }> }>,
+    call: (client: any, options?: MethodOptions) => Promise<AssembledCall<T>>,
+    opts: { deadlineUnix?: bigint } = {},
   ): Promise<AdapterResult<T>> {
     const contractId = this.opts.deployments.contracts[pkg];
     switch (this.opts.mode) {
@@ -224,17 +354,59 @@ export class StellarAdapter {
       default:
         assertNever(this.opts, "mode", (this.opts as { mode?: unknown }).mode);
     }
-    let assembled: Awaited<ReturnType<typeof call>>;
+    let assembled: AssembledCall<T>;
     try {
+      const options = await this.feeOptionsFor(methodName, opts.deadlineUnix);
       const client = await this.client<any>(pkg, moduleName);
-      assembled = await call(client);
+      assembled = await call(client, options);
     } catch (err) {
       throw new NotSubmittedError(`${methodName}: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
     }
-    const simulation = (assembled as { simulation?: { error?: string } }).simulation;
-    if (simulation?.error) {
-      throw new NotSubmittedError(`${methodName} simulation failed: ${simulation.error}`);
+    if (assembled.simulation?.error) {
+      throw new NotSubmittedError(`${methodName} simulation failed: ${assembled.simulation.error}`);
     }
+
+    const actionClass = feePolicyFor(methodName);
+    const rule = this.opts.feePolicy?.policies[actionClass];
+    const built = assembled.built ?? assembled.signed;
+    if (rule && built && this.agentKeypair && this.opts.journal) {
+      this.checkFeeCap(actionClass, BigInt(built.fee), rule);
+      const prepared = applyResourceMargin(built, rule.resourceMarginBps);
+      if (prepared.signatures.length === 0) prepared.sign(this.agentKeypair);
+      this.checkFeeCap(actionClass, BigInt(prepared.fee), rule);
+      this.reserveDailyFee(actionClass, rule);
+
+      const stats = await this.feeStats();
+      const decisionId = this.decisionId(methodName);
+      const counter = { count: 0 };
+      const result = await submitSorobanTransaction({
+        id: decisionId,
+        transaction: prepared,
+        server: this.rpcServer(),
+        journal: this.opts.journal,
+        maxAttempts: 4 + rule.maxBumps,
+        maxPollsPerAttempt: Math.max(5, 2 * rule.maxBumps + 3),
+        retryDelayMs: 250,
+        replacement: this.replacementFor(
+          prepared,
+          rule,
+          stats,
+          opts.deadlineUnix === undefined ? undefined : Number(opts.deadlineUnix),
+          counter,
+        ),
+        nowUnix: this.opts.nowUnix,
+      });
+      const fee: FeeReport = {
+        task: this.taskName,
+        decisionId,
+        actionClass,
+        feeCharged: feeChargedOf(result) ?? BigInt(prepared.fee).toString(),
+        bumps: counter.count,
+      };
+      this.opts.onFeeCharged?.(fee);
+      return { dryRun: false, value: unwrapContractResult(methodName, assembled.result as T), fee };
+    }
+
     const { result } = await assembled.signAndSend();
     return { dryRun: false, value: unwrapContractResult(methodName, result) };
   }
@@ -249,8 +421,8 @@ export class StellarAdapter {
     initial_yes_bps: number;
   }): Promise<AdapterResult<bigint>> {
     const call = { agent: this.agent, ...args };
-    return this.run("treasury", "@oracledesk/bindings-treasury", "agent_create_market", call, (client) =>
-      client.agent_create_market(call),
+    return this.run("treasury", "@oracledesk/bindings-treasury", "agent_create_market", call, (client, options) =>
+      client.agent_create_market(call, options),
     );
   }
 
@@ -261,8 +433,8 @@ export class StellarAdapter {
     min_shares_out: bigint;
   }): Promise<AdapterResult<bigint>> {
     const call = { agent: this.agent, ...args };
-    return this.run("treasury", "@oracledesk/bindings-treasury", "agent_buy", call, (client) =>
-      client.agent_buy(call),
+    return this.run("treasury", "@oracledesk/bindings-treasury", "agent_buy", call, (client, options) =>
+      client.agent_buy(call, options),
     );
   }
 
@@ -281,8 +453,9 @@ export class StellarAdapter {
     deadline: bigint;
   }): Promise<AdapterResult<bigint>> {
     const call = { agent: this.agent, ...args };
-    return this.run("treasury", "@oracledesk/bindings-treasury", "agent_buy_v2", call, (client) =>
-      client.agent_buy_v2(call),
+    return this.run("treasury", "@oracledesk/bindings-treasury", "agent_buy_v2", call, (client, options) =>
+      client.agent_buy_v2(call, options),
+      { deadlineUnix: args.deadline },
     );
   }
 
@@ -293,8 +466,8 @@ export class StellarAdapter {
     max_shares_in: bigint;
   }): Promise<AdapterResult<bigint>> {
     const call = { agent: this.agent, ...args };
-    return this.run("treasury", "@oracledesk/bindings-treasury", "agent_sell", call, (client) =>
-      client.agent_sell(call),
+    return this.run("treasury", "@oracledesk/bindings-treasury", "agent_sell", call, (client, options) =>
+      client.agent_sell(call, options),
     );
   }
 
@@ -312,8 +485,9 @@ export class StellarAdapter {
     deadline: bigint;
   }): Promise<AdapterResult<bigint>> {
     const call = { agent: this.agent, ...args };
-    return this.run("treasury", "@oracledesk/bindings-treasury", "agent_sell_v2", call, (client) =>
-      client.agent_sell_v2(call),
+    return this.run("treasury", "@oracledesk/bindings-treasury", "agent_sell_v2", call, (client, options) =>
+      client.agent_sell_v2(call, options),
+      { deadlineUnix: args.deadline },
     );
   }
 
@@ -339,15 +513,15 @@ export class StellarAdapter {
    * Permissionless: the commitment, not the caller, authorizes it.
    */
   async registerSignerSpec(args: { market_id: bigint; spec: SignerConfigArg }): Promise<AdapterResult<void>> {
-    return this.run("resolver", "@oracledesk/bindings-resolver", "register_signer_spec", args, (client) =>
-      client.register_signer_spec(args),
+    return this.run("resolver", "@oracledesk/bindings-resolver", "register_signer_spec", args, (client, options) =>
+      client.register_signer_spec(args, options),
     );
   }
 
   /** Reveals a price-mode spec (resolver `register_price_spec`). */
   async registerPriceSpec(args: { market_id: bigint; spec: PriceConfigArg }): Promise<AdapterResult<void>> {
-    return this.run("resolver", "@oracledesk/bindings-resolver", "register_price_spec", args, (client) =>
-      client.register_price_spec(args),
+    return this.run("resolver", "@oracledesk/bindings-resolver", "register_price_spec", args, (client, options) =>
+      client.register_price_spec(args, options),
     );
   }
 
@@ -509,7 +683,7 @@ export class StellarAdapter {
       "@oracledesk/bindings-reasoning-registry",
       "publish_trace",
       call,
-      (client) => client.publish_trace(call),
+      (client, options) => client.publish_trace(call, options),
     );
   }
 
@@ -524,7 +698,7 @@ export class StellarAdapter {
       "@oracledesk/bindings-reasoning-registry",
       "publish_trace_batch",
       args,
-      (client) => client.publish_trace_batch(args),
+      (client, options) => client.publish_trace_batch(args, options),
     );
   }
 
@@ -538,7 +712,7 @@ export class StellarAdapter {
       "@oracledesk/bindings-reasoning-registry",
       "add_signing_key",
       args,
-      (client) => client.add_signing_key(args),
+      (client, options) => client.add_signing_key(args, options),
     );
   }
 
@@ -551,7 +725,7 @@ export class StellarAdapter {
       "@oracledesk/bindings-reasoning-registry",
       "retire_signing_key",
       args,
-      (client) => client.retire_signing_key(args),
+      (client, options) => client.retire_signing_key(args, options),
     );
   }
 
@@ -571,7 +745,7 @@ export class StellarAdapter {
       "@oracledesk/bindings-reasoning-registry",
       "publish_trace_signed",
       call,
-      (client) => client.publish_trace_signed(call),
+      (client, options) => client.publish_trace_signed(call, options),
     );
   }
 
@@ -619,10 +793,128 @@ export class StellarAdapter {
     }
     return read;
   }
+
+  async publishDecisionTrace(args: {
+    agent: string;
+    marketId: bigint;
+    action: string;
+    traceHash: string;
+    ipfsCid: string;
+    decisionHash: string;
+  }): Promise<{ traceId: bigint }> {
+    const call = {
+      agent: args.agent,
+      market_id: args.marketId,
+      action: toTraceAction(args.action),
+      trace_hash: hexToBuffer(args.traceHash),
+      ipfs_cid: args.ipfsCid,
+      decision_hash: hexToBuffer(args.decisionHash),
+    };
+    const result = await this.run(
+      "reasoning_registry",
+      "@oracledesk/bindings-reasoning-registry",
+      "publish_decision_trace",
+      call,
+      (client, options) => client.publish_decision_trace(call, options),
+    );
+    if (result.dryRun) throw new NotSubmittedError("publishDecisionTrace requires live mode");
+    return { traceId: BigInt(result.value) };
+  }
+
+  async agentBuyTraced(args: {
+    agent: string;
+    marketId: bigint;
+    outcome: number;
+    collateralIn: bigint;
+    minSharesOut: bigint;
+    limitPriceBps: number;
+    deadline: bigint;
+    traceId: bigint;
+  }): Promise<AdapterResult<bigint>> {
+    const call = {
+      agent: args.agent,
+      market_id: args.marketId,
+      outcome: outcomeFromNumber(args.outcome),
+      collateral_in: args.collateralIn,
+      min_shares_out: args.minSharesOut,
+      limit_price_bps: args.limitPriceBps,
+      deadline: args.deadline,
+      trace_id: args.traceId,
+    };
+    const result = await this.run(
+      "treasury",
+      "@oracledesk/bindings-treasury",
+      "agent_buy_traced",
+      call,
+      (client, options) => client.agent_buy_traced(call, options),
+      { deadlineUnix: args.deadline },
+    );
+    return result;
+  }
+
+  async agentSellTraced(args: {
+    agent: string;
+    marketId: bigint;
+    outcome: number;
+    collateralOut: bigint;
+    maxSharesIn: bigint;
+    limitPriceBps: number;
+    deadline: bigint;
+    traceId: bigint;
+  }): Promise<AdapterResult<bigint>> {
+    const call = {
+      agent: args.agent,
+      market_id: args.marketId,
+      outcome: outcomeFromNumber(args.outcome),
+      collateral_out: args.collateralOut,
+      max_shares_in: args.maxSharesIn,
+      limit_price_bps: args.limitPriceBps,
+      deadline: args.deadline,
+      trace_id: args.traceId,
+    };
+    const result = await this.run(
+      "treasury",
+      "@oracledesk/bindings-treasury",
+      "agent_sell_traced",
+      call,
+      (client, options) => client.agent_sell_traced(call, options),
+      { deadlineUnix: args.deadline },
+    );
+    return result;
+  }
+
+  async tradeAndPublishTrace(args: any): Promise<any> {
+    const method = typeof args?.method === "string" ? args.method : "trade_and_publish_trace";
+    const result = await this.run(
+      "treasury",
+      "@oracledesk/bindings-treasury",
+      method,
+      args,
+      (client, options) => client[method](args, options),
+      args?.deadline === undefined ? {} : { deadlineUnix: BigInt(args.deadline) },
+    );
+    return liveValue(result, method);
+  }
 }
 
 function max0(value: bigint): bigint {
   return value > 0n ? value : 0n;
+}
+
+function liveValue<T>(result: AdapterResult<T>, method: string): T {
+  if (result.dryRun) throw new NotSubmittedError(`${method} requires live mode`);
+  return result.value;
+}
+
+function hexToBuffer(value: string): Buffer {
+  if (!/^(?:0x)?[0-9a-f]{64}$/i.test(value)) throw new TypeError("expected a 32-byte hex string");
+  return Buffer.from(value.replace(/^0x/, ""), "hex");
+}
+
+function outcomeFromNumber(value: number): { tag: "Yes" | "No"; values: void } {
+  if (value === 0) return { tag: "Yes", values: undefined };
+  if (value === 1) return { tag: "No", values: undefined };
+  throw new TypeError("outcome must be 0 (Yes) or 1 (No)");
 }
 
 /**
