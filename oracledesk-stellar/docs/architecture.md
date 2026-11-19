@@ -1166,6 +1166,21 @@ logged and the plan closes as `unwind-failed`). The relation file is
 trusted: a wrong relation produces confident, wrong trades, which is why
 compatibility must be declared and is checked against the chain.
 
+### Dispute economics and the proposal watcher (agents, #275)
+
+On a `SignersDisputable` market a dispute escrows `dispute_bond` of the
+collateral token. The contract pays **no reward**: a bond is *refunded* to the
+disputer if the ruling overturns the proposal (or the escalation timeout
+lapses, which voids the market), and *forfeited* to market-core's treasury if
+the proposal is upheld. A challenger therefore cannot profit from disputing; it
+can only protect a position it already holds. That is why the `watcher` task
+(`runtime/tasks/watcher.ts`, see [agent-runtime.md](agent-runtime.md#proposal-watcher))
+runs on a dedicated key with a capped bond budget and disputes only when the
+exposure it protects, weighted by its confidence, outweighs the bond it
+risks; with no treasury position on the right side, it never disputes. It does
+not attest, does not act as an escalation committee member, and is a
+safety net for the treasury's own capital, not a general-purpose oracle.
+
 ## Known limitations (see docs/STATUS.md for the full, current list)
 
 - Testnet only; unaudited.

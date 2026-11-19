@@ -21,6 +21,9 @@ import { z } from "zod";
 import { ConfigError, type AgentMode } from "../runtime/config.js";
 import type { AgentRole, Deployments } from "../stellar/adapter.js";
 
+/** The watcher signs with its own key and is not a treasury agent. */
+export type ConfigRole = AgentRole | "watcher";
+
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 /** Canonical passphrase and default RPC for each supported network. Mainnet
@@ -136,6 +139,7 @@ export const EnvSchema = z.object({
   AGENT_SECRET_KEY: secretField,
   MAKER_SECRET_KEY: secretField,
   TRADER_SECRET_KEY: secretField,
+  WATCHER_SECRET_KEY: secretField,
   DEPLOYMENTS_FILE: nonEmptyPath,
   DEPLOYMENTS_PATH: nonEmptyPath,
   TRACE_STORE_DIR: nonEmptyPath,
@@ -160,6 +164,14 @@ export const EnvSchema = z.object({
   EVENTS_CONCURRENCY: intField(4, 1, 64),
   EVENTS_MAX_ATTEMPTS: intField(5, 1, 100),
   EVENTS_DISPUTE_WINDOW_SECS: intField(600, 0, 30 * 86_400),
+  WATCHER_ENABLED: z.enum(["0", "1", "false", "true"], { error: (i) => `must be 0, 1, false or true, got ${JSON.stringify(i.input)}` }).default("0"),
+  WATCHER_INTERVAL_MS: intField(15_000, 100, 3_600_000),
+  WATCHER_MIN_CONFIDENCE_BPS: bpsField(9_500),
+  WATCHER_MIN_LEAD_SECS: intField(60, 0, 86_400),
+  WATCHER_MAX_BOND_STROOPS: stroopsField(500_000_000n),
+  WATCHER_BUDGET_STROOPS: stroopsField(1_000_000_000n),
+  WATCHER_MAX_DISPUTES_PER_DAY: intField(5, 1, 1_000),
+  WATCHER_VERDICTS_FILE: nonEmptyPath,
   ARB_ENABLED: z.enum(["0", "1", "false", "true"], { error: (i) => `must be 0, 1, false or true, got ${JSON.stringify(i.input)}` }).default("0"),
   ARB_RELATIONS_FILE: nonEmptyPath,
   ARB_JOURNAL_FILE: nonEmptyPath,
@@ -294,6 +306,23 @@ export interface EventsConfig {
   disputeWindowSecs: number;
 }
 
+/** Proposal watcher (#275); off unless WATCHER_ENABLED. */
+export interface WatcherConfig {
+  enabled: boolean;
+  intervalMs: number;
+  /** Dispute only at or above this confidence. */
+  minConfidenceBps: number;
+  /** Refuse to sign with less than this many ledger seconds of window left. */
+  minLeadSecs: number;
+  /** Largest bond escrowed in one dispute. */
+  maxBondStroops: bigint;
+  /** Largest total bond at risk at once. */
+  budgetStroops: bigint;
+  maxDisputesPerDay: number;
+  /** Operator verdicts for the ManualSource. */
+  verdictsFile: string;
+}
+
 /** Cross-market arbitrage (#108); off unless ARB_ENABLED. */
 export interface ArbConfig {
   enabled: boolean;
@@ -322,6 +351,7 @@ export interface Tunables {
   trading: TradingConfig;
   maker: MakerConfig;
   events: EventsConfig;
+  watcher: WatcherConfig;
   arb: ArbConfig;
   /** Runtime knobs (lease, state file, backoff, trace store selection) still
    * read by runtime/wiring.ts. Never printed: it may hold secrets. */
@@ -329,7 +359,7 @@ export interface Tunables {
 }
 
 export interface AgentConfig extends Tunables {
-  role: AgentRole;
+  role: ConfigRole;
   mode: AgentMode;
   network: NetworkName;
   networkPassphrase: string;
@@ -346,7 +376,7 @@ export interface AgentConfig extends Tunables {
 }
 
 export interface LoadAgentConfigOptions {
-  role: AgentRole;
+  role: ConfigRole;
   env?: NodeJS.ProcessEnv;
   /** CLI arguments; --offline and --print-config are recognised. */
   argv?: string[];
@@ -394,6 +424,16 @@ function tunablesFrom(e: ParsedEnv, env: NodeJS.ProcessEnv): Tunables {
       concurrency: e.EVENTS_CONCURRENCY!,
       maxAttempts: e.EVENTS_MAX_ATTEMPTS!,
       disputeWindowSecs: e.EVENTS_DISPUTE_WINDOW_SECS!,
+    },
+    watcher: {
+      enabled: e.WATCHER_ENABLED === "1" || e.WATCHER_ENABLED === "true",
+      intervalMs: e.WATCHER_INTERVAL_MS!,
+      minConfidenceBps: e.WATCHER_MIN_CONFIDENCE_BPS!,
+      minLeadSecs: e.WATCHER_MIN_LEAD_SECS!,
+      maxBondStroops: e.WATCHER_MAX_BOND_STROOPS,
+      budgetStroops: e.WATCHER_BUDGET_STROOPS,
+      maxDisputesPerDay: e.WATCHER_MAX_DISPUTES_PER_DAY!,
+      verdictsFile: e.WATCHER_VERDICTS_FILE ?? "./watcher-verdicts.json",
     },
     arb: {
       enabled: e.ARB_ENABLED === "1" || e.ARB_ENABLED === "true",
@@ -487,17 +527,23 @@ export async function loadAgentConfig(o: LoadAgentConfigOptions): Promise<AgentC
   }
 
   // Signing identity. Each role prefers its own key and registered address.
-  const roleSecret = o.role === "maker" ? e.MAKER_SECRET_KEY : e.TRADER_SECRET_KEY;
-  const secret = roleSecret ?? e.AGENT_SECRET_KEY;
-  const expected = deployments ? deployments.agents?.[o.role] ?? deployments.agent : undefined;
-  let agentAddress = expected ?? "";
+  // The watcher never falls back to the treasury agent's key: it is a separate
+  // identity that holds its own bond funds.
+  const watcher = o.role === "watcher";
+  const roleSecret = o.role === "maker" ? e.MAKER_SECRET_KEY : o.role === "trader" ? e.TRADER_SECRET_KEY : e.WATCHER_SECRET_KEY;
+  const secret = watcher ? roleSecret : roleSecret ?? e.AGENT_SECRET_KEY;
+  const expected = deployments && !watcher ? deployments.agents?.[o.role as AgentRole] ?? deployments.agent : undefined;
+  let agentAddress = expected ?? deployments?.agent ?? "";
   if (mode === "live") {
     if (!secret) {
-      issues.push(`live mode needs ${o.role === "maker" ? "MAKER_SECRET_KEY" : "TRADER_SECRET_KEY"} or AGENT_SECRET_KEY`);
+      issues.push(`live mode needs ${watcher ? "WATCHER_SECRET_KEY" : o.role === "maker" ? "MAKER_SECRET_KEY or AGENT_SECRET_KEY" : "TRADER_SECRET_KEY or AGENT_SECRET_KEY"}`);
     } else {
       const pub = Keypair.fromSecret(secret).publicKey();
       if (expected && pub !== expected) {
-        issues.push(`signing key ${pub} does not match the deployment's ${deployments?.agents?.[o.role] ? `agents.${o.role}` : "agent"} ${expected}`);
+        issues.push(`signing key ${pub} does not match the deployment's ${deployments?.agents?.[o.role as AgentRole] ? `agents.${o.role}` : "agent"} ${expected}`);
+      }
+      if (watcher && deployments && [deployments.agent, deployments.agents?.maker, deployments.agents?.trader].includes(pub)) {
+        issues.push("WATCHER_SECRET_KEY must not be a treasury agent's key: use a dedicated key");
       }
       agentAddress = pub;
     }
@@ -561,11 +607,12 @@ async function verifyNetwork(cfg: AgentConfig, probe: NetworkProbe, log: (m: str
 /** A printable copy of the config. The secret becomes its public key; the raw
  * environment is dropped entirely. */
 export function describeConfig(cfg: AgentConfig): Record<string, unknown> {
-  const { env: _env, agentSecret, trading, maker, events, arb, ...rest } = cfg;
+  const { env: _env, agentSecret, trading, maker, events, watcher, arb, ...rest } = cfg;
   const strings = (o: object) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, typeof v === "bigint" ? v.toString() : v]));
   return {
     ...rest,
     arb: strings(arb),
+    watcher: strings(watcher),
     events: { ...events, tradeThresholdStroops: events.tradeThresholdStroops.toString() },
     agentSecret: agentSecret ? { publicKey: Keypair.fromSecret(agentSecret).publicKey(), redacted: true } : null,
     trading: {

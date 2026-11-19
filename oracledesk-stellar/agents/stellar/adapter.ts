@@ -9,7 +9,7 @@
  * packages/bindings/<name> — see README.md's quickstart).
  */
 
-import { Address, Keypair, rpc, xdr } from "@stellar/stellar-sdk";
+import { Account, Address, Contract, Keypair, TransactionBuilder, rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
 import { KeypairSigner } from "@stellar/stellar-sdk/contract";
 import { toContractArg, type PriceConfigArg, type SignerConfigArg, type SpecJson } from "../core/spec.js";
 import { readFileSync } from "node:fs";
@@ -94,9 +94,34 @@ export interface DryRunResult {
 }
 
 /** Real result shape depends on the call; see each wrapper method below. */
-export type LiveResult<T> = { dryRun: false; value: T };
+export type LiveResult<T> = { dryRun: false; value: T; /** Hash of the submitted transaction, when the SDK reports it. */ txHash?: string };
 
 export type AdapterResult<T> = DryRunResult | LiveResult<T>;
+
+export type Side = "Yes" | "No";
+
+/** The committed `DisputableSignerConfig` as the watcher reads it. */
+export interface DisputableConfigRead {
+  signers: string[];
+  threshold: number;
+  /** Seconds after `proposed_at` during which `dispute` is accepted. */
+  disputeWindow: bigint;
+  /** Collateral escrowed per dispute, stroops. */
+  disputeBond: bigint;
+  escalation: "Guardian" | "Committee";
+  /** Seconds after a dispute opens before `expire_dispute` may void it. */
+  escalationTimeout: bigint;
+}
+
+/** A resolver `Dispute` entry. `payee` is undefined while the dispute is open. */
+export interface DisputeRead {
+  disputer: string;
+  bond: bigint;
+  /** Collateral token snapshotted when the dispute opened. */
+  token: string;
+  openedAt: bigint;
+  payee?: string;
+}
 
 /** Snapshot of a market's read-only state, from `readMarket`. */
 export interface MarketRead {
@@ -213,7 +238,7 @@ export class StellarAdapter {
     moduleName: string,
     methodName: string,
     args: unknown,
-    call: (client: any) => Promise<{ signAndSend: () => Promise<{ result: T }> }>,
+    call: (client: any) => Promise<{ signAndSend: () => Promise<{ result: T; sendTransactionResponse?: { hash?: string } }> }>,
   ): Promise<AdapterResult<T>> {
     const contractId = this.opts.deployments.contracts[pkg];
     switch (this.opts.mode) {
@@ -235,8 +260,9 @@ export class StellarAdapter {
     if (simulation?.error) {
       throw new NotSubmittedError(`${methodName} simulation failed: ${simulation.error}`);
     }
-    const { result } = await assembled.signAndSend();
-    return { dryRun: false, value: unwrapContractResult(methodName, result) };
+    const sent = await assembled.signAndSend();
+    const txHash = sent.sendTransactionResponse?.hash;
+    return { dryRun: false, value: unwrapContractResult(methodName, sent.result), ...(txHash ? { txHash } : {}) };
   }
 
   async agentCreateMarket(args: {
@@ -493,6 +519,171 @@ export class StellarAdapter {
     );
     const { entries } = await new rpc.Server(this.opts.rpcUrl, { allowHttp: this.opts.rpcUrl.startsWith("http://") }).getLedgerEntries(key);
     return entries.length > 0;
+  }
+
+  // ─── Disputes (resolver) ────────────────────────────────────────────────
+  // Used by the proposal watcher. The disputer is always this adapter's own
+  // address, so the watcher runs on a dedicated adapter and key.
+
+  /**
+   * Challenges the market's pending signer proposal with a bond
+   * (resolver `dispute`). `alternative` is the outcome the caller claims is
+   * correct; `null` claims the market is invalid.
+   */
+  async dispute(args: { market_id: bigint; alternative: Side | null }): Promise<AdapterResult<void>> {
+    const call = {
+      market_id: args.market_id,
+      disputer: this.agent,
+      alternative: args.alternative === null ? undefined : { tag: args.alternative, values: undefined as void },
+    };
+    return this.run("resolver", "@oracledesk/bindings-resolver", "dispute", call, (client) => client.dispute(call));
+  }
+
+  /** Permissionless: voids a dispute that outlived `escalation_timeout` and refunds the bond. */
+  async expireDispute(marketId: bigint): Promise<AdapterResult<void>> {
+    const call = { market_id: marketId };
+    return this.run("resolver", "@oracledesk/bindings-resolver", "expire_dispute", call, (client) => client.expire_dispute(call));
+  }
+
+  /** Permissionless: pays a settled dispute's bond to its payee. */
+  async claimDisputeBond(marketId: bigint): Promise<AdapterResult<void>> {
+    const call = { market_id: marketId };
+    return this.run("resolver", "@oracledesk/bindings-resolver", "claim_dispute_bond", call, (client) => client.claim_dispute_bond(call));
+  }
+
+  /**
+   * A resolver persistent entry, decoded without the binding spec: the
+   * generated bindings only carry the types that appear in a function
+   * signature, and `Dispute` / `SignerProposalV2` do not. Structs decode to
+   * objects, unit enum variants to `[name]`, `None` to null.
+   */
+  private async resolverEntry<T>(variant: string, marketId: bigint): Promise<T | undefined> {
+    const key = xdr.LedgerKey.contractData(
+      new xdr.LedgerKeyContractData({
+        contract: new Address(this.opts.deployments.contracts.resolver).toScAddress(),
+        key: xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(variant), xdr.ScVal.scvU64(xdr.Uint64.fromString(String(marketId)))]),
+        durability: xdr.ContractDataDurability.persistent(),
+      }),
+    );
+    const { entries } = await this.rpcServer().getLedgerEntries(key);
+    const entry = entries[0];
+    if (!entry) return undefined;
+    return scValToNative(entry.val.contractData().val()) as T;
+  }
+
+  /**
+   * The committed `DisputableSignerConfig` (resolver `DataKey::Disputable`),
+   * or `undefined` for a market that is not a disputable signer market.
+   */
+  async disputableConfig(marketId: bigint): Promise<DisputableConfigRead | undefined> {
+    const c = await this.resolverEntry<{
+      signers: string[];
+      threshold: number;
+      dispute_window: bigint;
+      dispute_bond: bigint;
+      escalation: ["Guardian"] | ["Committee", ...unknown[]];
+      escalation_timeout: bigint;
+    }>("Disputable", marketId);
+    if (!c) return undefined;
+    return {
+      signers: c.signers,
+      threshold: c.threshold,
+      disputeWindow: BigInt(c.dispute_window),
+      disputeBond: BigInt(c.dispute_bond),
+      escalation: c.escalation[0],
+      escalationTimeout: BigInt(c.escalation_timeout),
+    };
+  }
+
+  /** The open or settled dispute (resolver `DataKey::Dispute`), if any. */
+  async currentDispute(marketId: bigint): Promise<DisputeRead | undefined> {
+    const d = await this.resolverEntry<{ disputer: string; bond: bigint; token: string; opened_at: bigint; payee?: string | null }>("Dispute", marketId);
+    if (!d) return undefined;
+    return { disputer: d.disputer, bond: BigInt(d.bond), token: d.token, openedAt: BigInt(d.opened_at), payee: d.payee ?? undefined };
+  }
+
+  /** The pending signer proposal (resolver `DataKey::ProposalV2`), if any. */
+  async currentProposal(marketId: bigint): Promise<{ outcome: "Yes" | "No" | "Invalid"; proposedAt: bigint } | undefined> {
+    const p = await this.resolverEntry<{ outcome: ["Yes" | "No" | "Invalid"]; proposed_at: bigint }>("ProposalV2", marketId);
+    return p ? { outcome: p.outcome[0], proposedAt: BigInt(p.proposed_at) } : undefined;
+  }
+
+  /** Close time of the latest ledger, unix seconds: the clock `dispute` is judged against. */
+  async ledgerTime(): Promise<bigint> {
+    return BigInt((await this.rpcServer().getLatestLedger()).closeTime);
+  }
+
+  /** `addr`'s balance of the market-core collateral token, in stroops. */
+  async collateralBalance(addr: string): Promise<bigint> {
+    const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
+    const config = unwrapContractResult("get_config", (await client.get_config()).result) as { collateral: string };
+    return this.readToken(config.collateral, addr);
+  }
+
+  /** SEP-41 `balance(addr)` of `token`, simulated (never signed or submitted). */
+  async readToken(token: string, addr: string): Promise<bigint> {
+    return BigInt((await this.simulateRead(token, "balance", [new Address(addr).toScVal()])) as bigint);
+  }
+
+  /**
+   * Simulates `contractId.method(args)` and returns the decoded result.
+   * Read-only: used for contracts without generated bindings (Reflector, SAC).
+   */
+  async simulateRead(contractId: string, method: string, args: xdr.ScVal[]): Promise<unknown> {
+    const source = new Account(this.agent, "0");
+    const tx = new TransactionBuilder(source, { fee: "100", networkPassphrase: this.opts.networkPassphrase })
+      .addOperation(new Contract(contractId).call(method, ...args))
+      .setTimeout(30)
+      .build();
+    const sim = await this.rpcServer().simulateTransaction(tx);
+    if (!rpc.Api.isSimulationSuccess(sim) || !sim.result) throw new Error(`${method} simulation failed on ${contractId}`);
+    return scValToNative(sim.result.retval);
+  }
+
+  /** Reflector (SEP-40) `resolution()`: seconds between records. */
+  async reflectorResolution(reflector: string): Promise<number> {
+    return Number(await this.simulateRead(reflector, "resolution", []));
+  }
+
+  /** Reflector `price(asset, timestamp)`: the record at exactly `timestamp`, if any. */
+  async reflectorPrice(
+    reflector: string,
+    asset: { tag: "Stellar" | "Other"; value: string },
+    timestamp: bigint,
+  ): Promise<{ price: bigint; timestamp: bigint } | undefined> {
+    const assetVal = xdr.ScVal.scvVec([
+      xdr.ScVal.scvSymbol(asset.tag),
+      asset.tag === "Stellar" ? new Address(asset.value).toScVal() : xdr.ScVal.scvSymbol(asset.value),
+    ]);
+    const r = (await this.simulateRead(reflector, "price", [assetVal, xdr.ScVal.scvU64(xdr.Uint64.fromString(timestamp.toString()))])) as
+      | { price: bigint; timestamp: bigint }
+      | null
+      | undefined;
+    return r ? { price: BigInt(r.price), timestamp: BigInt(r.timestamp) } : undefined;
+  }
+
+  /** The attestation-linked evidence citations recorded for `marketId` (resolver `evidence_at`). */
+  async attestationEvidence(marketId: bigint): Promise<{ signer: string; outcome: "Yes" | "No" | "Invalid"; traceId: bigint; traceHash: string }[]> {
+    const client = await this.client<any>("resolver", "@oracledesk/bindings-resolver");
+    const count = Number((await client.evidence_count({ market_id: marketId })).result);
+    const out = [];
+    for (let index = 0; index < count; index++) {
+      const e = unwrapContractResult("evidence_at", (await client.evidence_at({ market_id: marketId, index })).result) as {
+        signer: string;
+        outcome: { tag: "Yes" | "No" | "Invalid" };
+        trace_id: bigint;
+        trace_hash: Uint8Array;
+      };
+      out.push({ signer: e.signer, outcome: e.outcome.tag, traceId: BigInt(e.trace_id), traceHash: Buffer.from(e.trace_hash).toString("hex") });
+    }
+    return out;
+  }
+
+  /** The IPFS CID a registry trace was published with. */
+  async traceCid(traceId: bigint): Promise<string> {
+    const client = await this.client<any>("reasoning_registry", "@oracledesk/bindings-reasoning-registry");
+    const t = unwrapContractResult("get_trace", (await client.get_trace({ trace_id: traceId })).result) as { ipfs_cid: string };
+    return t.ipfs_cid;
   }
 
   async publishTrace(args: {
