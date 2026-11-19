@@ -1,13 +1,17 @@
-name: Formal model (resolver)
+name: Formal models (resolver, governance)
 
-# Optional model check of the resolution lifecycle (oracledesk-stellar/docs/formal).
-# Runs only when the resolver, market-core or the model itself changes.
+# Model checks of the resolution lifecycle and the governance protocols
+# (oracledesk-stellar/docs/formal). Runs only when a contract a model mirrors,
+# a model, or the runner changes.
 
 on:
   pull_request:
     paths:
       - "oracledesk-stellar/contracts/resolver/**"
       - "oracledesk-stellar/contracts/market-core/**"
+      - "oracledesk-stellar/contracts/timelock/**"
+      - "oracledesk-stellar/contracts/treasury/**"
+      - "oracledesk-stellar/contracts/reasoning-registry/**"
       - "oracledesk-stellar/docs/formal/**"
       - "oracledesk-stellar/scripts/formal.sh"
       - ".github/workflows/formal.yml"
