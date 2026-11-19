@@ -491,7 +491,84 @@ pub enum DataKey {
     CreationBuckets,
     YieldVenue,
     YieldPrincipal,
+    Registry,
+    TracePolicy,
+    PendingTracePolicy,
 }
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TracePolicy {
+    Off,
+    Optional,
+    Required,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TracePolicyConfig {
+    pub policy: TracePolicy,
+    pub max_trace_age_ledgers: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingTracePolicy {
+    pub config: TracePolicyConfig,
+    pub registry: Option<Address>,
+    pub proposed_at: u64,
+    pub executable_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TraceAction {
+    CreateMarket,
+    ProposeMarket,
+    Buy,
+    Sell,
+    Skip,
+    Redeem,
+    ClaimRemainder,
+    Resolve,
+    Other(Symbol),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentStatus {
+    Active,
+    Retired(u64),
+    Revoked(u64, Symbol),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRecord {
+    pub status: AgentStatus,
+    pub registered_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Trace {
+    pub market_id: u64,
+    pub agent: Address,
+    pub action: TraceAction,
+    pub trace_hash: BytesN<32>,
+    pub ipfs_cid: String,
+    pub published_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceConsumeInfo {
+    pub decision: Option<BytesN<32>>,
+    pub ledger: u32,
+}
+
+pub const NO_MARKET: u64 = u64::MAX;
+pub const DECISION_DOMAIN: &[u8] = b"oracledesk.decision.v1";
 
 /// Note that market-core errors reach callers of treasury entrypoints with
 /// market-core's own codes, which overlap these numerically (e.g. its
@@ -563,6 +640,17 @@ pub enum Error {
     /// `agent_create_market_and_reveal` was given a malformed resolution
     /// envelope or a rule outside the two primary modes (#64).
     InvalidResolution = 63,
+    TraceRequired = 64,
+    TraceDecisionMismatch = 65,
+    TraceMismatch = 66,
+    TraceAgentMismatch = 67,
+    TraceFlagged = 68,
+    TraceStale = 69,
+    TraceConsumed = 70,
+    TraceRegistryCallFailed = 71,
+    TracePolicyPending = 72,
+    TracePolicyNotPending = 73,
+    TraceTimelockActive = 74,
 }
 
 #[contractevent]
@@ -1718,6 +1806,79 @@ impl Treasury {
         Ok(amount)
     }
 
+    // ----- trace-gated policy -------------------------------------------------
+
+    pub fn trace_policy(env: Env) -> TracePolicyConfig {
+        Self::load_trace_policy_config(&env)
+    }
+
+    pub fn propose_trace_policy(
+        env: Env,
+        policy: TracePolicy,
+        max_trace_age_ledgers: u32,
+        registry: Option<Address>,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if env.storage().instance().has(&DataKey::PendingTracePolicy) {
+            return Err(Error::TracePolicyPending);
+        }
+        let old = Self::load_trace_policy_config(&env);
+        let old_registry = env.storage().instance().get::<_, Address>(&DataKey::Registry);
+        let new = TracePolicyConfig {
+            policy,
+            max_trace_age_ledgers,
+        };
+        let tightening = Self::is_trace_policy_tightening(&old, &new, &old_registry, &registry);
+        if tightening {
+            env.storage().instance().set(&DataKey::TracePolicy, &new);
+            match registry {
+                Some(r) => env.storage().instance().set(&DataKey::Registry, &r),
+                None => env.storage().instance().remove(&DataKey::Registry),
+            }
+            return Ok(());
+        }
+        let executable_at = Self::unlock_time(&env)?;
+        let pending = PendingTracePolicy {
+            config: new,
+            registry,
+            proposed_at: env.ledger().timestamp(),
+            executable_at,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingTracePolicy, &pending);
+        Ok(())
+    }
+
+    pub fn execute_trace_policy(env: Env) -> Result<(), Error> {
+        let pending: PendingTracePolicy = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingTracePolicy)
+            .ok_or(Error::TracePolicyNotPending)?;
+        if env.ledger().timestamp() < pending.executable_at {
+            return Err(Error::TraceTimelockActive);
+        }
+        env.storage().instance().remove(&DataKey::PendingTracePolicy);
+        env.storage()
+            .instance()
+            .set(&DataKey::TracePolicy, &pending.config);
+        match pending.registry {
+            Some(r) => env.storage().instance().set(&DataKey::Registry, &r),
+            None => env.storage().instance().remove(&DataKey::Registry),
+        }
+        Ok(())
+    }
+
+    pub fn cancel_trace_policy(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if !env.storage().instance().has(&DataKey::PendingTracePolicy) {
+            return Err(Error::TracePolicyNotPending);
+        }
+        env.storage().instance().remove(&DataKey::PendingTracePolicy);
+        Ok(())
+    }
+
     // ----- agent-driven trading --------------------------------------------
     // An agent never touches market-core directly with treasury funds: it
     // asks the treasury to do so, the treasury checks its own on-chain caps,
@@ -1742,6 +1903,9 @@ impl Treasury {
         initial_yes_bps: u32,
     ) -> Result<u64, Error> {
         Self::assert_not_paused(&env)?;
+        if Self::trace_policy(&env).policy == TracePolicy::Required {
+            return Err(Error::TraceRequired);
+        }
         let global = Self::load_global(&env)?;
         let policy = Self::require_agent(&env, &agent, ROLE_CREATE)?;
         if seed_amount <= 0 {
@@ -1815,6 +1979,9 @@ impl Treasury {
         initial_yes_bps: u32,
         spec_v2: ResolutionSpecV2,
     ) -> Result<u64, Error> {
+        if Self::trace_policy(&env).policy == TracePolicy::Required {
+            return Err(Error::TraceRequired);
+        }
         let resolution_hash = Self::resolve_commitment(&env, &spec_v2)?;
         let market_id = Self::agent_create_market(
             env.clone(),
@@ -1841,6 +2008,9 @@ impl Treasury {
         collateral_in: i128,
         min_shares_out: i128,
     ) -> Result<i128, Error> {
+        if Self::trace_policy(&env).policy == TracePolicy::Required {
+            return Err(Error::TraceRequired);
+        }
         Self::do_agent_buy(
             env,
             agent,
@@ -1868,6 +2038,9 @@ impl Treasury {
         limit_price_bps: u32,
         deadline: u64,
     ) -> Result<i128, Error> {
+        if Self::trace_policy(&env).policy == TracePolicy::Required {
+            return Err(Error::TraceRequired);
+        }
         Self::do_agent_buy(
             env,
             agent,
@@ -1893,6 +2066,9 @@ impl Treasury {
         collateral_out: i128,
         max_shares_in: i128,
     ) -> Result<i128, Error> {
+        if Self::trace_policy(&env).policy == TracePolicy::Required {
+            return Err(Error::TraceRequired);
+        }
         Self::do_agent_sell(
             env,
             agent,
@@ -1918,6 +2094,9 @@ impl Treasury {
         limit_price_bps: u32,
         deadline: u64,
     ) -> Result<i128, Error> {
+        if Self::trace_policy(&env).policy == TracePolicy::Required {
+            return Err(Error::TraceRequired);
+        }
         Self::do_agent_sell(
             env,
             agent,
@@ -1946,6 +2125,80 @@ impl Treasury {
         Self::save_market(&env, &core, market_id, &exposure);
         PositionClosed { market_id, amount }.publish(&env);
         Ok(amount)
+    }
+
+    /// Buys with a prior decision-bearing trace consumed atomically.
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_buy_traced(
+        env: Env,
+        agent: Address,
+        market_id: u64,
+        outcome: Outcome,
+        collateral_in: i128,
+        min_shares_out: i128,
+        limit_price_bps: u32,
+        deadline: u64,
+        trace_id: u64,
+    ) -> Result<i128, Error> {
+        let cfg = Self::load_trace_policy_config(&env);
+        if cfg.policy == TracePolicy::Off {
+            // traced entrypoint still validates/consumes when registry configured
+        }
+        let action = TraceAction::Buy;
+        let decision_hash = Self::decision_hash_buy(
+            &env,
+            market_id,
+            &outcome,
+            collateral_in,
+            min_shares_out,
+            limit_price_bps,
+            deadline,
+        );
+        Self::consume_trace_for_action(&env, &agent, market_id, &action, trace_id, decision_hash)?;
+        Self::do_agent_buy(
+            env,
+            agent,
+            market_id,
+            outcome,
+            collateral_in,
+            min_shares_out,
+            Some((limit_price_bps, deadline)),
+        )
+    }
+
+    /// Sells with a prior decision-bearing trace consumed atomically.
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_sell_traced(
+        env: Env,
+        agent: Address,
+        market_id: u64,
+        outcome: Outcome,
+        collateral_out: i128,
+        max_shares_in: i128,
+        limit_price_bps: u32,
+        deadline: u64,
+        trace_id: u64,
+    ) -> Result<i128, Error> {
+        let action = TraceAction::Sell;
+        let decision_hash = Self::decision_hash_sell(
+            &env,
+            market_id,
+            &outcome,
+            collateral_out,
+            max_shares_in,
+            limit_price_bps,
+            deadline,
+        );
+        Self::consume_trace_for_action(&env, &agent, market_id, &action, trace_id, decision_hash)?;
+        Self::do_agent_sell(
+            env,
+            agent,
+            market_id,
+            outcome,
+            collateral_out,
+            max_shares_in,
+            Some((limit_price_bps, deadline)),
+        )
     }
 
     /// Redeems the treasury's position in a resolved/voided market
@@ -2751,7 +3004,8 @@ impl Treasury {
     }
 
     /// `agent` signed this invocation, is registered, active and holds
-    /// `role`.
+    /// `role`. When a registry is configured, trade/create roles also
+    /// require the registry agent to be Active.
     fn require_agent(env: &Env, agent: &Address, role: u32) -> Result<AgentPolicy, Error> {
         agent.require_auth();
         let key = DataKey::Agent(agent.clone());
@@ -2762,6 +3016,9 @@ impl Treasury {
             .ok_or(Error::Unauthorized)?;
         if !policy.active || policy.roles & role == 0 {
             return Err(Error::Unauthorized);
+        }
+        if role & (ROLE_TRADE | ROLE_CREATE) != 0 {
+            Self::require_registry_active(env, agent)?;
         }
         env.storage()
             .persistent()
@@ -3974,6 +4231,176 @@ impl Treasury {
     fn save_market(env: &Env, core: &Address, market_id: u64, exposure: &MarketExposure) {
         Self::put_persistent(env, &Self::market_key(env, core, market_id), exposure);
     }
+}
+
+impl Treasury {
+    // ----- trace helpers -------------------------------------------------------
+
+    fn load_trace_policy_config(env: &Env) -> TracePolicyConfig {
+        env.storage().instance().get(&DataKey::TracePolicy).unwrap_or(TracePolicyConfig {
+            policy: TracePolicy::Off,
+            max_trace_age_ledgers: 120,
+        })
+    }
+
+    fn get_registry(env: &Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Registry)
+    }
+
+    fn is_trace_policy_tightening(
+        old: &TracePolicyConfig,
+        new: &TracePolicyConfig,
+        old_registry: &Option<Address>,
+        new_registry: &Option<Address>,
+    ) -> bool {
+        let rank = |p: &TracePolicy| match p {
+            TracePolicy::Off => 0i32,
+            TracePolicy::Optional => 1i32,
+            TracePolicy::Required => 2i32,
+        };
+        let policy_tightened = rank(&new.policy) >= rank(&old.policy);
+        let age_tightened = new.max_trace_age_ledgers <= old.max_trace_age_ledgers;
+        let registry_tightened = match (old_registry, new_registry) {
+            (None, Some(_)) => true,
+            (Some(a), Some(b)) if a == b => true,
+            (Some(_), Some(_)) => false,
+            (_, None) => false,
+        };
+        policy_tightened && age_tightened && registry_tightened
+            && (rank(&new.policy) > rank(&old.policy)
+                || new.max_trace_age_ledgers < old.max_trace_age_ledgers
+                || (old_registry.is_none() && new_registry.is_some()))
+    }
+
+    fn require_registry_active(env: &Env, agent: &Address) -> Result<(), Error> {
+        let Some(registry) = Self::get_registry(env) else {
+            return Ok(());
+        };
+        let args = vec![env, agent.clone().into_val(env)];
+        let record: Option<AgentRecord> = match env.try_invoke_contract(
+            &registry,
+            &Symbol::new(env, "get_agent"),
+            args,
+        ) {
+            Ok(Ok(v)) => v,
+            _ => return Err(Error::TraceRegistryCallFailed),
+        };
+        match record {
+            Some(r) if matches!(r.status, AgentStatus::Active) => Ok(()),
+            _ => Err(Error::Unauthorized),
+        }
+    }
+
+    fn outcome_tag(outcome: &Outcome) -> u32 {
+        match outcome {
+            Outcome::Yes => 0,
+            Outcome::No => 1,
+        }
+    }
+
+    fn push_u64_be(env: &Env, out: &mut Bytes, value: u64) {
+        out.append(&Bytes::from_slice(env, &value.to_be_bytes()));
+    }
+
+    fn push_u32_be(env: &Env, out: &mut Bytes, value: u32) {
+        out.append(&Bytes::from_slice(env, &value.to_be_bytes()));
+    }
+
+    fn push_i128_be(env: &Env, out: &mut Bytes, value: i128) {
+        out.append(&Bytes::from_slice(env, &value.to_be_bytes()));
+    }
+
+    fn decision_hash_buy(
+        env: &Env,
+        market_id: u64,
+        outcome: &Outcome,
+        collateral_in: i128,
+        min_shares_out: i128,
+        limit_price_bps: u32,
+        deadline: u64,
+    ) -> BytesN<32> {
+        let mut pre = Bytes::from_slice(env, DECISION_DOMAIN);
+        Self::push_u64_be(env, &mut pre, market_id);
+        Self::push_u32_be(env, &mut pre, 2); // Buy action tag
+        Self::push_u32_be(env, &mut pre, Self::outcome_tag(outcome));
+        Self::push_i128_be(env, &mut pre, collateral_in);
+        Self::push_i128_be(env, &mut pre, min_shares_out);
+        Self::push_u32_be(env, &mut pre, limit_price_bps);
+        Self::push_u64_be(env, &mut pre, deadline);
+        env.crypto().sha256(&pre).into()
+    }
+
+    fn decision_hash_sell(
+        env: &Env,
+        market_id: u64,
+        outcome: &Outcome,
+        collateral_out: i128,
+        max_shares_in: i128,
+        limit_price_bps: u32,
+        deadline: u64,
+    ) -> BytesN<32> {
+        let mut pre = Bytes::from_slice(env, DECISION_DOMAIN);
+        Self::push_u64_be(env, &mut pre, market_id);
+        Self::push_u32_be(env, &mut pre, 3); // Sell action tag
+        Self::push_u32_be(env, &mut pre, Self::outcome_tag(outcome));
+        Self::push_i128_be(env, &mut pre, collateral_out);
+        Self::push_i128_be(env, &mut pre, max_shares_in);
+        Self::push_u32_be(env, &mut pre, limit_price_bps);
+        Self::push_u64_be(env, &mut pre, deadline);
+        env.crypto().sha256(&pre).into()
+    }
+
+    fn consume_trace_for_action(
+        env: &Env,
+        agent: &Address,
+        market_id: u64,
+        action: &TraceAction,
+        trace_id: u64,
+        expected_decision: BytesN<32>,
+    ) -> Result<(), Error> {
+        let cfg = Self::load_trace_policy_config(env);
+        let Some(registry) = Self::get_registry(env) else {
+            return if cfg.policy == TracePolicy::Required {
+                Err(Error::TraceRequired)
+            } else {
+                Ok(())
+            };
+        };
+        let consumer = env.current_contract_address();
+        let args = vec![
+            env,
+            consumer.into_val(env),
+            trace_id.into_val(env),
+            agent.clone().into_val(env),
+            market_id.into_val(env),
+            action.clone().into_val(env),
+            cfg.max_trace_age_ledgers.into_val(env),
+        ];
+        let info: TraceConsumeInfo = match env.try_invoke_contract(
+            &registry,
+            &Symbol::new(env, "consume_trace_for"),
+            args,
+        ) {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(Self::map_registry_trace_error(e)),
+            Err(Ok(e)) => return Err(Self::map_registry_trace_error(e)),
+            Err(Err(_)) => return Err(Error::TraceRegistryCallFailed),
+        };
+        match info.decision {
+            Some(d) if d == expected_decision => Ok(()),
+            _ => Err(Error::TraceDecisionMismatch),
+        }
+    }
+
+    fn map_registry_trace_error(e: soroban_sdk::Error) -> Error {
+        let code = |v: u32| soroban_sdk::Error::from_contract_error(v);
+        if e == code(10) {
+            Error::TraceConsumed
+        } else {
+            Error::TraceMismatch
+        }
+    }
+
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import test from "node:test";
 import { Account, Asset, Keypair, Operation, TransactionBuilder, type Transaction } from "@stellar/stellar-sdk";
 import { TransactionJournal } from "./journal.js";
-import { submitSorobanTransaction, transactionFromJournal } from "./submit.js";
+import { journaledHashes, submitSorobanTransaction, transactionFromJournal } from "./submit.js";
 import { SorobanPendingError, SorobanSubmissionError } from "./errors.js";
 
 function makeTransaction(): Transaction {
@@ -173,6 +173,62 @@ test("contract failures reported during send are terminal and are not retried", 
     );
     assert.equal(sends, 1);
     assert.equal((await journal.readAll()).at(-1)?.stage, "failed");
+  } finally {
+    await rm(path, { force: true });
+  }
+});
+
+test("a fee bump keeps the inner transaction and journals both hashes", async () => {
+  const path = makeJournalPath();
+  const journal = new TransactionJournal(path);
+  const inner = makeTransaction() as Transaction & { fee: string; operations: unknown[] };
+  Object.assign(inner, { fee: "100", operations: [{}] });
+  const outerHash = "cd".repeat(32);
+  const bump = {
+    fee: "1000",
+    hash: () => Buffer.from(outerHash, "hex"),
+    toXDR: () => "fee-bump-envelope-xdr",
+  } as unknown as Transaction;
+  const sent: Transaction[] = [];
+  let bumpAttempt = 0;
+  const server = {
+    async sendTransaction(tx: Transaction) {
+      sent.push(tx);
+      return sent.length === 1
+        ? ({ status: "ERROR", errorResult: "tx_insufficient_fee" } as never)
+        : ({ status: "PENDING", hash: outerHash } as never);
+    },
+    async getTransaction(hash: string) {
+      return hash === outerHash ? makeSuccess(hash) : makeNotFound("ab".repeat(32));
+    },
+  };
+  try {
+    const result = await submitSorobanTransaction({
+      id: "fee-bump-1",
+      transaction: inner,
+      server,
+      journal,
+      maxAttempts: 3,
+      maxPollsPerAttempt: 1,
+      retryDelayMs: 0,
+      sleep: async () => undefined,
+      replacement: {
+        afterPolls: 1,
+        maxBumps: 1,
+        bump: (_tx, attempt) => {
+          bumpAttempt = attempt;
+          return bump as never;
+        },
+      },
+    });
+    assert.equal(result.status, "SUCCESS");
+    assert.equal(sent[0], inner);
+    assert.equal(sent[1], bump);
+    assert.equal(bumpAttempt, 1);
+    const records = await journal.readAll();
+    assert.deepEqual(records.map(({ stage }) => stage), ["signed", "submitting", "bumped", "submitting", "confirmed"]);
+    assert.equal(records.find((r) => r.stage === "bumped")?.outerHash, outerHash);
+    assert.deepEqual(journaledHashes("fee-bump-1", records), ["ab".repeat(32), outerHash]);
   } finally {
     await rm(path, { force: true });
   }

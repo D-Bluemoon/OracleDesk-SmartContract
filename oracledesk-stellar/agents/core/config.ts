@@ -20,6 +20,7 @@ import { Address, Keypair, StrKey, rpc, xdr } from "@stellar/stellar-sdk";
 import { z } from "zod";
 import { ConfigError, type AgentMode } from "../runtime/config.js";
 import type { AgentRole, Deployments } from "../stellar/adapter.js";
+import { DEFAULT_FEE_POLICY, type ActionClass, type FeePercentile, type FeePolicy, type FeeRule } from "../stellar/fees.js";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -128,6 +129,82 @@ const contractIdField = z.preprocess(
 );
 const nonEmptyPath = z.string().min(1, "must not be empty").optional();
 
+const FEE_PERCENTILES = ["p50", "p70", "p90", "p95", "p99"] as const;
+const DEFAULT_MAX_DAILY_FEES: Record<ActionClass, bigint> = {
+  trade: 500_000_000n,
+  create: 200_000_000n,
+  trace: 100_000_000n,
+  maintenance: 50_000_000n,
+};
+const feePercentileField = (fallback: FeePercentile) =>
+  z.enum(FEE_PERCENTILES).optional().transform((value) => value ?? fallback);
+const jsonStroops = (min = 0n) =>
+  z.string().regex(DECIMAL, "must be a whole number of stroops").transform(BigInt)
+    .refine((value) => value >= min && value <= MAX_STROOPS, `must be from ${min} to ${MAX_STROOPS} stroops`);
+const FeeRuleFileSchema = z.object({
+  percentile: z.enum(FEE_PERCENTILES).optional(),
+  minInclusion: jsonStroops(1n).optional(),
+  maxInclusion: jsonStroops(1n).optional(),
+  resourceMarginBps: z.number().int().min(0).max(BPS_MAX).optional(),
+  maxTotalFee: jsonStroops(1n).optional(),
+  bumpMultiplier: z.number().int().min(10).max(1000).optional(),
+  maxBumps: z.number().int().min(0).max(20).optional(),
+});
+const FeePolicyFileSchema = z.looseObject({
+  policies: z.object({
+    trade: FeeRuleFileSchema.optional(),
+    create: FeeRuleFileSchema.optional(),
+    trace: FeeRuleFileSchema.optional(),
+    maintenance: FeeRuleFileSchema.optional(),
+  }).optional(),
+  maxDailyFees: z.object({
+    trade: jsonStroops().optional(),
+    create: jsonStroops().optional(),
+    trace: jsonStroops().optional(),
+    maintenance: jsonStroops().optional(),
+  }).optional(),
+  trade: FeeRuleFileSchema.optional(),
+  create: FeeRuleFileSchema.optional(),
+  trace: FeeRuleFileSchema.optional(),
+  maintenance: FeeRuleFileSchema.optional(),
+});
+type FeePolicyFile = z.output<typeof FeePolicyFileSchema>;
+
+const FEE_ENV_FIELDS = {
+  FEE_TRADE_PERCENTILE: feePercentileField(DEFAULT_FEE_POLICY.trade.percentile),
+  FEE_TRADE_MIN_INCLUSION: stroopsField(DEFAULT_FEE_POLICY.trade.minInclusion, 1n),
+  FEE_TRADE_MAX_INCLUSION: stroopsField(DEFAULT_FEE_POLICY.trade.maxInclusion, 1n),
+  FEE_TRADE_RESOURCE_MARGIN_BPS: bpsField(DEFAULT_FEE_POLICY.trade.resourceMarginBps),
+  FEE_TRADE_MAX_TOTAL_FEE: stroopsField(DEFAULT_FEE_POLICY.trade.maxTotalFee, 1n),
+  FEE_TRADE_BUMP_MULTIPLIER: intField(DEFAULT_FEE_POLICY.trade.bumpMultiplier, 10, 1000),
+  FEE_TRADE_MAX_BUMPS: intField(DEFAULT_FEE_POLICY.trade.maxBumps, 0, 20),
+  FEE_TRADE_MAX_DAILY_FEES: stroopsField(DEFAULT_MAX_DAILY_FEES.trade, 0n),
+  FEE_CREATE_PERCENTILE: feePercentileField(DEFAULT_FEE_POLICY.create.percentile),
+  FEE_CREATE_MIN_INCLUSION: stroopsField(DEFAULT_FEE_POLICY.create.minInclusion, 1n),
+  FEE_CREATE_MAX_INCLUSION: stroopsField(DEFAULT_FEE_POLICY.create.maxInclusion, 1n),
+  FEE_CREATE_RESOURCE_MARGIN_BPS: bpsField(DEFAULT_FEE_POLICY.create.resourceMarginBps),
+  FEE_CREATE_MAX_TOTAL_FEE: stroopsField(DEFAULT_FEE_POLICY.create.maxTotalFee, 1n),
+  FEE_CREATE_BUMP_MULTIPLIER: intField(DEFAULT_FEE_POLICY.create.bumpMultiplier, 10, 1000),
+  FEE_CREATE_MAX_BUMPS: intField(DEFAULT_FEE_POLICY.create.maxBumps, 0, 20),
+  FEE_CREATE_MAX_DAILY_FEES: stroopsField(DEFAULT_MAX_DAILY_FEES.create, 0n),
+  FEE_TRACE_PERCENTILE: feePercentileField(DEFAULT_FEE_POLICY.trace.percentile),
+  FEE_TRACE_MIN_INCLUSION: stroopsField(DEFAULT_FEE_POLICY.trace.minInclusion, 1n),
+  FEE_TRACE_MAX_INCLUSION: stroopsField(DEFAULT_FEE_POLICY.trace.maxInclusion, 1n),
+  FEE_TRACE_RESOURCE_MARGIN_BPS: bpsField(DEFAULT_FEE_POLICY.trace.resourceMarginBps),
+  FEE_TRACE_MAX_TOTAL_FEE: stroopsField(DEFAULT_FEE_POLICY.trace.maxTotalFee, 1n),
+  FEE_TRACE_BUMP_MULTIPLIER: intField(DEFAULT_FEE_POLICY.trace.bumpMultiplier, 10, 1000),
+  FEE_TRACE_MAX_BUMPS: intField(DEFAULT_FEE_POLICY.trace.maxBumps, 0, 20),
+  FEE_TRACE_MAX_DAILY_FEES: stroopsField(DEFAULT_MAX_DAILY_FEES.trace, 0n),
+  FEE_MAINTENANCE_PERCENTILE: feePercentileField(DEFAULT_FEE_POLICY.maintenance.percentile),
+  FEE_MAINTENANCE_MIN_INCLUSION: stroopsField(DEFAULT_FEE_POLICY.maintenance.minInclusion, 1n),
+  FEE_MAINTENANCE_MAX_INCLUSION: stroopsField(DEFAULT_FEE_POLICY.maintenance.maxInclusion, 1n),
+  FEE_MAINTENANCE_RESOURCE_MARGIN_BPS: bpsField(DEFAULT_FEE_POLICY.maintenance.resourceMarginBps),
+  FEE_MAINTENANCE_MAX_TOTAL_FEE: stroopsField(DEFAULT_FEE_POLICY.maintenance.maxTotalFee, 1n),
+  FEE_MAINTENANCE_BUMP_MULTIPLIER: intField(DEFAULT_FEE_POLICY.maintenance.bumpMultiplier, 10, 1000),
+  FEE_MAINTENANCE_MAX_BUMPS: intField(DEFAULT_FEE_POLICY.maintenance.maxBumps, 0, 20),
+  FEE_MAINTENANCE_MAX_DAILY_FEES: stroopsField(DEFAULT_MAX_DAILY_FEES.maintenance, 0n),
+};
+
 export const EnvSchema = z.object({
   AGENT_MODE: z.enum(["dry-run", "live"], { error: (i) => `must be "dry-run" or "live", got ${JSON.stringify(i.input)}` }).default("dry-run"),
   STELLAR_NETWORK: z.enum(NETWORK_NAMES, { error: (i) => `must be one of ${NETWORK_NAMES.join(", ")}, got ${JSON.stringify(i.input)}` }).default("testnet"),
@@ -171,6 +248,9 @@ export const EnvSchema = z.object({
   ARB_MAX_LEG_LOSS: stroopsField(10_000_000n, 0n),
   ARB_MAX_OPEN_LEGS: intField(2, 2, 64),
   ARB_MAX_UNWIND_RETRIES: intField(3, 1, 20),
+  FEE_POLICY_FILE: nonEmptyPath,
+  AGENT_FEE_PAYER_SECRET: secretField,
+  ...FEE_ENV_FIELDS,
   USDC_CONTRACT_ID: contractIdField,
   MARKET_CORE_CONTRACT_ID: contractIdField,
   RESOLVER_CONTRACT_ID: contractIdField,
@@ -204,6 +284,74 @@ export type ValidatedDeployments = Deployments & { network?: NetworkName };
 
 function formatIssues(prefix: string, error: z.ZodError): string[] {
   return error.issues.map((i) => `${prefix}${i.path.join(".") || "(root)"}: ${i.message}`);
+}
+
+function feePolicyFromEnv(e: ParsedEnv): FeePolicy {
+  const rule = (prefix: "TRADE" | "CREATE" | "TRACE" | "MAINTENANCE", fallback: FeeRule): FeeRule => ({
+    percentile: e[`FEE_${prefix}_PERCENTILE`] ?? fallback.percentile,
+    minInclusion: e[`FEE_${prefix}_MIN_INCLUSION`] ?? fallback.minInclusion,
+    maxInclusion: e[`FEE_${prefix}_MAX_INCLUSION`] ?? fallback.maxInclusion,
+    resourceMarginBps: e[`FEE_${prefix}_RESOURCE_MARGIN_BPS`] ?? fallback.resourceMarginBps,
+    maxTotalFee: e[`FEE_${prefix}_MAX_TOTAL_FEE`] ?? fallback.maxTotalFee,
+    bumpMultiplier: e[`FEE_${prefix}_BUMP_MULTIPLIER`] ?? fallback.bumpMultiplier,
+    maxBumps: e[`FEE_${prefix}_MAX_BUMPS`] ?? fallback.maxBumps,
+  });
+  return {
+    policyFile: e.FEE_POLICY_FILE,
+    feePayerSecret: e.AGENT_FEE_PAYER_SECRET,
+    policies: {
+      trade: rule("TRADE", DEFAULT_FEE_POLICY.trade),
+      create: rule("CREATE", DEFAULT_FEE_POLICY.create),
+      trace: rule("TRACE", DEFAULT_FEE_POLICY.trace),
+      maintenance: rule("MAINTENANCE", DEFAULT_FEE_POLICY.maintenance),
+    },
+    maxDailyFees: {
+      trade: e.FEE_TRADE_MAX_DAILY_FEES ?? DEFAULT_MAX_DAILY_FEES.trade,
+      create: e.FEE_CREATE_MAX_DAILY_FEES ?? DEFAULT_MAX_DAILY_FEES.create,
+      trace: e.FEE_TRACE_MAX_DAILY_FEES ?? DEFAULT_MAX_DAILY_FEES.trace,
+      maintenance: e.FEE_MAINTENANCE_MAX_DAILY_FEES ?? DEFAULT_MAX_DAILY_FEES.maintenance,
+    },
+  };
+}
+
+function applyFeePolicyFile(
+  fee: FeePolicy,
+  path: string | undefined,
+  readFile: (path: string) => string,
+  issues: string[],
+): FeePolicy {
+  if (!path) return fee;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFile(path));
+  } catch (err) {
+    issues.push(`FEE_POLICY_FILE cannot be read: ${err instanceof Error ? err.message : String(err)}`);
+    return fee;
+  }
+  const parsed = FeePolicyFileSchema.safeParse(raw);
+  if (!parsed.success) {
+    issues.push(...formatIssues("FEE_POLICY_FILE: ", parsed.error));
+    return fee;
+  }
+  const file: FeePolicyFile = parsed.data;
+  const merged: FeePolicy = {
+    ...fee,
+    policies: { ...fee.policies },
+    maxDailyFees: { ...fee.maxDailyFees },
+  };
+  for (const cls of ["trade", "create", "trace", "maintenance"] as const) {
+    const override = file.policies?.[cls] ?? file[cls];
+    if (override) merged.policies[cls] = { ...merged.policies[cls], ...override };
+    const daily = file.maxDailyFees?.[cls];
+    if (daily !== undefined) merged.maxDailyFees[cls] = daily;
+  }
+  for (const cls of ["trade", "create", "trace", "maintenance"] as const) {
+    const r = merged.policies[cls];
+    if (r.minInclusion > r.maxInclusion) issues.push(`FEE_POLICY_FILE: ${cls}.minInclusion exceeds maxInclusion`);
+    if (r.bumpMultiplier < 10) issues.push(`FEE_POLICY_FILE: ${cls}.bumpMultiplier must be at least 10`);
+    if (r.maxTotalFee < r.maxInclusion) issues.push(`FEE_POLICY_FILE: ${cls}.maxTotalFee is below maxInclusion`);
+  }
+  return merged;
 }
 
 // ─── Probes ──────────────────────────────────────────────────────────────────
@@ -319,6 +467,7 @@ export interface MakerConfig {
 export interface Tunables {
   rpcUrl: string;
   traceStoreDir: string;
+  fee: FeePolicy;
   trading: TradingConfig;
   maker: MakerConfig;
   events: EventsConfig;
@@ -370,6 +519,7 @@ function tunablesFrom(e: ParsedEnv, env: NodeJS.ProcessEnv): Tunables {
   return {
     rpcUrl: e.STELLAR_RPC_URL ?? NETWORKS[e.STELLAR_NETWORK].rpcUrl ?? "",
     traceStoreDir: e.TRACE_STORE_DIR ?? "./.traces",
+    fee: feePolicyFromEnv(e),
     trading: {
       minEdgeBps: e.MIN_EDGE_BPS!,
       tradeSizeStroops: e.TRADE_SIZE_STROOPS,
@@ -505,10 +655,13 @@ export async function loadAgentConfig(o: LoadAgentConfigOptions): Promise<AgentC
 
   if (network === "mainnet") issues.push(...mainnetInterlock(e, deploymentsFile, deployments));
 
+  const tunables = tunablesFrom(e, env);
+  tunables.fee = applyFeePolicyFile(tunables.fee, e.FEE_POLICY_FILE, readFile, issues);
+  if (mode === "dry-run") tunables.fee.feePayerSecret = undefined;
   if (issues.length > 0 || !deployments) throw new AgentConfigError(issues);
 
   const cfg: AgentConfig = {
-    ...tunablesFrom(e, env),
+    ...tunables,
     role: o.role,
     mode,
     network,
@@ -561,10 +714,20 @@ async function verifyNetwork(cfg: AgentConfig, probe: NetworkProbe, log: (m: str
 /** A printable copy of the config. The secret becomes its public key; the raw
  * environment is dropped entirely. */
 export function describeConfig(cfg: AgentConfig): Record<string, unknown> {
-  const { env: _env, agentSecret, trading, maker, events, arb, ...rest } = cfg;
+  const { env: _env, agentSecret, fee, trading, maker, events, arb, ...rest } = cfg;
+  const { feePayerSecret, ...feeRest } = fee;
   const strings = (o: object) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, typeof v === "bigint" ? v.toString() : v]));
+  const printableFee = {
+    ...feeRest,
+    policies: Object.fromEntries(
+      Object.entries(feeRest.policies).map(([cls, rule]) => [cls, strings(rule as FeeRule)]),
+    ),
+    maxDailyFees: strings(feeRest.maxDailyFees),
+  };
   return {
     ...rest,
+    fee: printableFee,
+    feePayerSecret: feePayerSecret ? { publicKey: Keypair.fromSecret(feePayerSecret).publicKey(), redacted: true } : null,
     arb: strings(arb),
     events: { ...events, tradeThresholdStroops: events.tradeThresholdStroops.toString() },
     agentSecret: agentSecret ? { publicKey: Keypair.fromSecret(agentSecret).publicKey(), redacted: true } : null,

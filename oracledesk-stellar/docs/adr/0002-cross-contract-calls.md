@@ -107,5 +107,15 @@ The generated `Outcome` (and other imported enums) do **not** derive `Copy`
   verifying cryptographic traces for attestation evidence (#34) without pulling
   the reasoning-registry crate into cdylib builds, `contracts/resolver/reasoning_registry.wasm`
   is imported via `soroban_sdk::contractimport!(file = "reasoning_registry.wasm")`.
-  `make build` ensures both `market_core.wasm` and `reasoning_registry.wasm` are
-  compiled and placed prior to resolver compilation.
+   `make build` ensures both `market_core.wasm` and `reasoning_registry.wasm` are
+   compiled and placed prior to resolver compilation.
+ - **Router's registry calls are dynamic (#260).** The router's vendored
+   `reasoning_registry.wasm` is an older build whose `publish_trace` still takes
+   a `String`, so generating a typed client from it would hard-code a stale
+   interface. The router imports the wasm only for its `WASM` constant (tests)
+   and invokes the four current publish entrypoints plus `agent_chain_head` by
+   name with `env.invoke_contract`, using a local `TraceAction`/`ChainHead`
+   definition whose XDR shape matches the registry. Its `market_core.wasm` and
+   `treasury.wasm` imports remain generated; the treasury wasm is refreshed by
+   `scripts/sync-vendored-wasm.sh` and all four router vendored files are pinned
+   by `contracts/router/build.rs`. See [ADR 0009](0009-atomic-router.md).
