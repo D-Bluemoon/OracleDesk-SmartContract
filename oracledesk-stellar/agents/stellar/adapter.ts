@@ -100,6 +100,22 @@ export type AdapterResult<T> = DryRunResult | LiveResult<T>;
 
 export type Side = "Yes" | "No";
 
+export type TradeStatusRead = {
+  spec: "None" | "Price" | "ScaledPrice" | "Twap" | "Signers" | "Disputable" | "WeightedKeys" | "Committee" | "Hybrid";
+  state: string;
+  closeTime: bigint;
+  deadline: bigint;
+  openProposal: boolean;
+};
+
+export type ResolvabilityPolicyRead = {
+  requireRevealed: boolean;
+  blockWhenDisputed: boolean;
+  blockWithOpenProposal: boolean;
+  minSecsToClose: bigint;
+  allowedSpecs: number;
+};
+
 /** The treasury's effective operating mode (`Treasury::mode`, issue #272). */
 export type TreasuryMode = "Normal" | "AgentsHalted" | "AdminPaused" | "Emergency";
 
@@ -396,6 +412,58 @@ export class StellarAdapter {
   async treasuryMode(): Promise<TreasuryMode> {
     const r = (await this.simulateRead(this.opts.deployments.contracts.treasury, "mode", [])) as [TreasuryMode] | TreasuryMode;
     return Array.isArray(r) ? r[0] : r;
+  }
+
+  /** The resolver's `trade_status` for `marketId` (#273): what the treasury's pre-buy check reads. */
+  async tradeStatus(marketId: bigint): Promise<TradeStatusRead> {
+    const client = await this.client<any>("resolver", "@oracledesk/bindings-resolver");
+    const r = unwrapContractResult("trade_status", (await client.trade_status({ market_id: marketId })).result) as {
+      spec: { tag: TradeStatusRead["spec"] };
+      state: { tag: string };
+      close_time: bigint;
+      deadline: bigint;
+      open_proposal: boolean;
+    };
+    return { spec: r.spec.tag, state: r.state.tag, closeTime: BigInt(r.close_time), deadline: BigInt(r.deadline), openProposal: r.open_proposal };
+  }
+
+  /** The treasury's `ResolvabilityPolicy` (all-permissive until the admin tightens it). */
+  async resolvabilityPolicy(): Promise<ResolvabilityPolicyRead> {
+    const p = (await this.simulateRead(this.opts.deployments.contracts.treasury, "get_resolvability_policy", [])) as {
+      require_revealed: boolean;
+      block_when_disputed: boolean;
+      block_with_open_proposal: boolean;
+      min_secs_to_close: bigint;
+      allowed_specs: number;
+    };
+    return {
+      requireRevealed: p.require_revealed,
+      blockWhenDisputed: p.block_when_disputed,
+      blockWithOpenProposal: p.block_with_open_proposal,
+      minSecsToClose: BigInt(p.min_secs_to_close),
+      allowedSpecs: Number(p.allowed_specs),
+    };
+  }
+
+  /**
+   * Atomic create-and-reveal through `agent_create_and_reveal_v2`: the treasury
+   * reveals to the resolver market-core is configured with, so there is no
+   * resolver argument to misuse (the older `agent_create_market_and_reveal`
+   * requires it to equal that resolver).
+   */
+  async agentCreateAndReveal(args: {
+    question_hash: Buffer;
+    meta_uri: string;
+    category: { tag: string; values: void };
+    close_time: bigint;
+    seed_amount: bigint;
+    initial_yes_bps: number;
+    spec_v2: unknown;
+  }): Promise<AdapterResult<bigint>> {
+    const call = { agent: this.agent, ...args };
+    return this.run("treasury", "@oracledesk/bindings-treasury", "agent_create_and_reveal_v2", call, (client) =>
+      client.agent_create_and_reveal_v2(call),
+    );
   }
 
   /** market-core `market_count` (read-only simulation; also runs in dry-run). */

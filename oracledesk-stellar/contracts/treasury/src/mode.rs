@@ -248,7 +248,10 @@ mod tests {
     #[test]
     fn only_emergency_opens_the_emergency_exit() {
         for mode in ALL_MODES {
-            assert_eq!(allowed(mode, Op::EmergencyWithdraw), mode == Mode::Emergency);
+            assert_eq!(
+                allowed(mode, Op::EmergencyWithdraw),
+                mode == Mode::Emergency
+            );
         }
     }
 

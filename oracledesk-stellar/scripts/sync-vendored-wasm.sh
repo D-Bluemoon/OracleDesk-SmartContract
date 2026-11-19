@@ -11,6 +11,14 @@
 #
 # Run it after any change to market-core or reasoning-registry, *before*
 # building resolver/treasury (`make build` does this automatically).
+#
+#   ./scripts/sync-vendored-wasm.sh            # market_core -> resolver + treasury,
+#                                              # reasoning_registry -> resolver
+#   ./scripts/sync-vendored-wasm.sh resolver   # resolver -> treasury (#273). Run it
+#                                              # only after resolver.wasm was built
+#                                              # against the already-synced
+#                                              # market_core / reasoning_registry,
+#                                              # then rebuild the treasury.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -27,7 +35,12 @@ else
   exit 1
 fi
 
-for f in market_core reasoning_registry; do
+if [ "${1:-}" = "resolver" ]; then
+  needed="resolver"
+else
+  needed="market_core reasoning_registry"
+fi
+for f in $needed; do
   if [ ! -f "$WASM_DIR/$f.wasm" ]; then
     echo "error: $WASM_DIR/$f.wasm is missing — run 'stellar contract build' first" >&2
     exit 1
@@ -41,6 +54,10 @@ sync() { # <built wasm> <vendored wasm>
   echo "synced $vendored -> $(cat "$vendored.sha256")"
 }
 
-sync "$WASM_DIR/market_core.wasm" contracts/resolver/market_core.wasm
-sync "$WASM_DIR/market_core.wasm" contracts/treasury/market_core.wasm
-sync "$WASM_DIR/reasoning_registry.wasm" contracts/resolver/reasoning_registry.wasm
+if [ "${1:-}" = "resolver" ]; then
+  sync "$WASM_DIR/resolver.wasm" contracts/treasury/resolver.wasm
+else
+  sync "$WASM_DIR/market_core.wasm" contracts/resolver/market_core.wasm
+  sync "$WASM_DIR/market_core.wasm" contracts/treasury/market_core.wasm
+  sync "$WASM_DIR/reasoning_registry.wasm" contracts/resolver/reasoning_registry.wasm
+fi

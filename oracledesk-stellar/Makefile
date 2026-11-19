@@ -24,6 +24,8 @@ build:
 	stellar contract build
 	./scripts/sync-vendored-wasm.sh
 	stellar contract build
+	./scripts/sync-vendored-wasm.sh resolver
+	stellar contract build --package treasury
 	cp target/wasm32v1-none/release/market_core.wasm contracts/integration-tests/wasm/
 	cp target/wasm32v1-none/release/resolver.wasm contracts/integration-tests/wasm/
 	cp target/wasm32v1-none/release/treasury.wasm contracts/integration-tests/wasm/
@@ -39,12 +41,14 @@ verify-wasm:
 # Same check, but only against the current target dir (no clean rebuild).
 check-wasm:
 	./scripts/sync-vendored-wasm.sh
+	./scripts/sync-vendored-wasm.sh resolver
 	git diff --exit-code -- \
 		contracts/resolver/market_core.wasm contracts/treasury/market_core.wasm \
-		contracts/resolver/reasoning_registry.wasm \
+		contracts/resolver/reasoning_registry.wasm contracts/treasury/resolver.wasm \
 		contracts/resolver/market_core.wasm.sha256 \
 		contracts/treasury/market_core.wasm.sha256 \
-		contracts/resolver/reasoning_registry.wasm.sha256
+		contracts/resolver/reasoning_registry.wasm.sha256 \
+		contracts/treasury/resolver.wasm.sha256
 
 test: build
 	cargo test --workspace

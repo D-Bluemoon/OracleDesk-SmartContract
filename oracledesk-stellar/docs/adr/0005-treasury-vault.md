@@ -225,6 +225,50 @@ tasks unless it is `Normal`). The pre-#272 flags are read as a fallback when
 and are deleted on the first write; the treasury has no upgrade entrypoint, so
 existing deployments move by redeploying.
 
+### Resolvability policy (#273)
+
+The caps bound how much the agents can spend; nothing used to bound *where*.
+Two holes: `agent_create_market_and_reveal` took the resolver from the caller, so
+a compromised or buggy agent key could name a contract that accepts
+`register_spec_v2` and does nothing, leaving a seeded market whose real resolver
+never heard of its spec (it could then only end by expiry voiding, 30 days after
+close); and `agent_buy` never asked whether a market could be resolved at all
+(spec never revealed, `Disputed`, minutes from `close_time`).
+
+- **The reveal is bound to market-core's resolver.** The treasury reads
+  `market_core.get_config().resolver` and reveals there. The new
+  `agent_create_and_reveal_v2` has no resolver argument; the older entrypoint is
+  kept but fails with `ResolverMismatch` if given any other. After the reveal it
+  asks `resolver.spec_kind(market_id)` and fails with `SpecNotRevealed` if it is
+  still `None`, so a resolver that silently no-ops reverts the whole creation.
+- **`resolver.spec_kind` / `trade_status`.** `state()` cannot tell "revealed" from
+  "not revealed" (a revealed price or signer market still reads `Unconfigured`),
+  so the resolver now reports which spec entry exists, and `trade_status` returns
+  kind, state, `close_time`, deadline (`close_time + 30 days`) and whether a
+  proposal is pending in one call.
+- **`ResolvabilityPolicy`**, checked in `agent_buy`/`agent_buy_v2` after the cheap
+  local checks and before any other market-core call: `require_revealed`,
+  `block_when_disputed`, `block_with_open_proposal` (off by default: opening a
+  proposal needs a signer), `min_secs_to_close` (buys only, so seed-and-reveal
+  creation far from close is unaffected) and `allowed_specs` (a bitmask over
+  `SpecKind`). The deadline is always enforced. The default is fully permissive and
+  makes no cross-contract call at all, so an upgraded deployment behaves as before
+  until the admin tightens it. Tightening is immediate; loosening any knob waits
+  `config_delay` (`set/execute/cancel_resolvability_policy`, with events).
+- **Sells, redemptions and settlement are never gated** by it: the treasury must
+  always be able to exit or settle.
+- **The resolver is read on every buy, not cached.** An admin resolver swap in
+  market-core changes it for all markets; a cached address would consult the old
+  resolver's view.
+- **Griefing.** `block_when_disputed` freezes new buys in one market only, never
+  exits. A dispute needs an open proposal and a bond (`dispute`, then
+  `claim_dispute_bond`), forfeited if wrong, so freezing buys is not free.
+- **Legacy cores** are not consulted: positions in a `LegacyCore` are only
+  redeemable and no buy path reaches them; the check uses `global.market_core`.
+- **Archived entries.** `trade_status` never panics on a missing entry (an
+  archived `State` reads as the default), but a transaction whose footprint needs
+  an archived entry fails; agents must restore before trading.
+
 ### Custody migration
 
 - The constructor mints any balance the treasury already holds to `admin` as

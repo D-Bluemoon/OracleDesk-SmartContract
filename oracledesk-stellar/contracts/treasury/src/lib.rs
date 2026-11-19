@@ -120,10 +120,7 @@ fn map_market_core_code(error: soroban_sdk::Error) -> Error {
 /// name-dispatched trade calls); the panicking generated methods are never
 /// used.
 fn core_call<T, C>(
-    result: Result<
-        Result<T, C>,
-        Result<market_core::Error, soroban_sdk::InvokeError>,
-    >,
+    result: Result<Result<T, C>, Result<market_core::Error, soroban_sdk::InvokeError>>,
 ) -> Result<T, Error> {
     match result {
         Ok(Ok(value)) => Ok(value),
@@ -144,6 +141,17 @@ fn core_view<T, C>(
     match result {
         Ok(Ok(value)) => Ok(value),
         _ => Err(Error::MarketCoreCallFailed),
+    }
+}
+
+/// Runs a generated `try_*` resolver call: any failure (a resolver error, a
+/// trap, a reply that does not convert) is `ResolverCallFailed`.
+fn resolver_call<T, C, E>(
+    result: Result<Result<T, C>, Result<E, soroban_sdk::InvokeError>>,
+) -> Result<T, Error> {
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        _ => Err(Error::ResolverCallFailed),
     }
 }
 
@@ -252,6 +260,86 @@ pub struct PendingPricePolicy {
     pub policy: PricePolicy,
     pub proposed_at: u64,
     pub executable_at: u64,
+}
+
+/// Bits of [`ResolvabilityPolicy::allowed_specs`], one per `resolver::SpecKind`
+/// (bit = the kind's position in that enum). All nine set means "any kind".
+pub const ALL_SPEC_BITS: u32 = 0x1FF;
+
+/// Pre-trade resolvability policy for `agent_buy` / `agent_buy_v2` (#273): the
+/// treasury will not put depositor capital into a market that cannot be
+/// resolved, whatever the agent believes. Sells, redemptions and settlement are
+/// never gated by it (the treasury must always be able to exit or settle).
+///
+/// Tightening is immediate (a flag set to `true`, a larger `min_secs_to_close`,
+/// fewer `allowed_specs` bits); everything else waits `config_delay`, like the
+/// other policies. The default is fully permissive, so an upgraded deployment
+/// behaves as before until the admin tightens it.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvabilityPolicy {
+    /// The market's resolution spec must have been revealed to its resolver.
+    pub require_revealed: bool,
+    /// No buys while the resolver reports `Disputed` (finalization frozen).
+    pub block_when_disputed: bool,
+    /// No buys while a signer proposal is pending. Off by default: opening a
+    /// proposal needs a signer, but a quorum can still use it to freeze buys.
+    pub block_with_open_proposal: bool,
+    /// Minimum seconds between now and `close_time` for a buy (0 = none). Does
+    /// not apply to seed-and-reveal creation, which happens far from close.
+    pub min_secs_to_close: u64,
+    /// Bitmask over `resolver::SpecKind`: kinds that may be bought into.
+    pub allowed_specs: u32,
+}
+
+pub const OPEN_RESOLVABILITY: ResolvabilityPolicy = ResolvabilityPolicy {
+    require_revealed: false,
+    block_when_disputed: false,
+    block_with_open_proposal: false,
+    min_secs_to_close: 0,
+    allowed_specs: ALL_SPEC_BITS,
+};
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingResolvability {
+    pub policy: ResolvabilityPolicy,
+    pub proposed_at: u64,
+    pub executable_at: u64,
+}
+
+/// How a spec kind maps to its bit in [`ResolvabilityPolicy::allowed_specs`].
+/// An exhaustive match: a new `SpecKind` does not compile until it has a bit.
+fn spec_bit(kind: &resolver::SpecKind) -> u32 {
+    use resolver::SpecKind as K;
+    1 << match kind {
+        K::None => 0,
+        K::Price => 1,
+        K::ScaledPrice => 2,
+        K::Twap => 3,
+        K::Signers => 4,
+        K::Disputable => 5,
+        K::WeightedKeys => 6,
+        K::Committee => 7,
+        K::Hybrid => 8,
+    }
+}
+
+/// Classifies a policy change. Tightening a knob is immediate; loosening any
+/// knob, even in a change that also tightens another, waits `config_delay`.
+fn classify_resolvability(old: &ResolvabilityPolicy, new: &ResolvabilityPolicy) -> Change {
+    let loosens = (old.require_revealed && !new.require_revealed)
+        || (old.block_when_disputed && !new.block_when_disputed)
+        || (old.block_with_open_proposal && !new.block_with_open_proposal)
+        || new.min_secs_to_close < old.min_secs_to_close
+        || new.allowed_specs & !old.allowed_specs != 0;
+    if loosens {
+        Change::NeedsDelay
+    } else if old == new {
+        Change::None
+    } else {
+        Change::TightenOnly
+    }
 }
 
 #[contracttype]
@@ -516,6 +604,9 @@ pub enum DataKey {
     YieldPrincipal,
     /// The operating mode's independent reasons ([`ModeState`], issue #272).
     ModeState,
+    /// The pre-trade resolvability policy ([`ResolvabilityPolicy`], #273).
+    ResolvabilityPolicy,
+    PendingResolvability,
 }
 
 /// Note that market-core errors reach callers of treasury entrypoints with
@@ -594,6 +685,24 @@ pub enum Error {
     /// `resume_agents`: the realized window PnL has not recovered above
     /// `-max_drawdown` (reset the window or wait for old losses to expire) (#272).
     NotRecovered = 65,
+    /// `agent_create_market_and_reveal` named a resolver other than the one
+    /// market-core is configured with (#273).
+    ResolverMismatch = 66,
+    /// The market's resolution spec was never revealed to its resolver, or a
+    /// resolver accepted `register_spec_v2` and stored nothing (#273).
+    SpecNotRevealed = 67,
+    /// The market's spec kind is not in `allowed_specs` (#273).
+    SpecKindNotAllowed = 68,
+    /// The market is `Disputed`: finalization is frozen (#273).
+    MarketDisputed = 69,
+    /// A signer proposal is pending and the policy blocks buys then (#273).
+    ProposalOpen = 70,
+    /// Past `close_time + RESOLUTION_GRACE_SECS`: the market can already be voided (#273).
+    PastResolutionDeadline = 71,
+    /// Closer to `close_time` than `min_secs_to_close` (#273).
+    TooCloseToClose = 72,
+    /// A call to the resolver failed (#273).
+    ResolverCallFailed = 73,
     // ---- market-core errors, mirrored by `map_core_error` (#60). A distinct
     // code per market-core error keeps the cause visible to the caller; the
     // 2000s are the canonical cross-contract range (ADR 0004).
@@ -771,6 +880,28 @@ pub struct PricePolicySet {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PricePolicyCancelled {
     pub policy: PricePolicy,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvabilityPolicyProposed {
+    pub old: ResolvabilityPolicy,
+    pub new: ResolvabilityPolicy,
+    pub executable_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvabilityPolicySet {
+    pub old: ResolvabilityPolicy,
+    pub new: ResolvabilityPolicy,
+    pub immediate: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvabilityPolicyCancelled {
+    pub policy: ResolvabilityPolicy,
 }
 
 #[contractevent]
@@ -1661,6 +1792,104 @@ impl Treasury {
         env.storage().instance().get(&DataKey::PendingPrice)
     }
 
+    // ----- resolvability policy (#273) --------------------------------------------
+
+    pub fn get_resolvability_policy(env: Env) -> ResolvabilityPolicy {
+        Self::load_resolvability_policy(&env)
+    }
+
+    /// Admin only. Tightening (a flag to `true`, a larger `min_secs_to_close`,
+    /// fewer `allowed_specs` bits) applies at once; anything that loosens a knob
+    /// waits `config_delay` (`execute_resolvability_policy`).
+    pub fn set_resolvability_policy(env: Env, policy: ResolvabilityPolicy) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if policy.allowed_specs & !ALL_SPEC_BITS != 0 {
+            return Err(Error::InvalidConfig);
+        }
+        let old = Self::load_resolvability_policy(&env);
+        match classify_resolvability(&old, &policy) {
+            Change::None => Err(Error::InvalidConfig),
+            Change::TightenOnly => {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::ResolvabilityPolicy, &policy);
+                ResolvabilityPolicySet {
+                    old,
+                    new: policy,
+                    immediate: true,
+                }
+                .publish(&env);
+                Ok(())
+            }
+            Change::NeedsDelay => {
+                if env.storage().instance().has(&DataKey::PendingResolvability) {
+                    return Err(Error::ProposalPending);
+                }
+                let executable_at = Self::unlock_time(&env)?;
+                env.storage().instance().set(
+                    &DataKey::PendingResolvability,
+                    &PendingResolvability {
+                        policy,
+                        proposed_at: env.ledger().timestamp(),
+                        executable_at,
+                    },
+                );
+                ResolvabilityPolicyProposed {
+                    old,
+                    new: policy,
+                    executable_at,
+                }
+                .publish(&env);
+                Ok(())
+            }
+        }
+    }
+
+    /// Applies the pending resolvability policy once its delay has passed.
+    /// Permissionless.
+    pub fn execute_resolvability_policy(env: Env) -> Result<(), Error> {
+        let pending: PendingResolvability = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingResolvability)
+            .ok_or(Error::NoPendingConfig)?;
+        if env.ledger().timestamp() < pending.executable_at {
+            return Err(Error::TimelockActive);
+        }
+        let old = Self::load_resolvability_policy(&env);
+        let storage = env.storage().instance();
+        storage.set(&DataKey::ResolvabilityPolicy, &pending.policy);
+        storage.remove(&DataKey::PendingResolvability);
+        ResolvabilityPolicySet {
+            old,
+            new: pending.policy,
+            immediate: false,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn cancel_resolvability_policy(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let pending: PendingResolvability = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingResolvability)
+            .ok_or(Error::NoPendingConfig)?;
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingResolvability);
+        ResolvabilityPolicyCancelled {
+            policy: pending.policy,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn pending_resolvability_policy(env: Env) -> Option<PendingResolvability> {
+        env.storage().instance().get(&DataKey::PendingResolvability)
+    }
+
     // ----- vault -------------------------------------------------------------------
     // Deposits mint shares against a conservative NAV and withdrawals burn
     // them; see docs/adr/0005-treasury-vault.md for the valuation choice.
@@ -1979,20 +2208,60 @@ impl Treasury {
         spec_v2: ResolutionSpecV2,
     ) -> Result<u64, Error> {
         Self::gate(&env, Op::AgentOpen)?;
-        let resolution_hash = Self::resolve_commitment(&env, &spec_v2)?;
-        let market_id = Self::agent_create_market(
-            env.clone(),
-            agent.clone(),
+        // The caller no longer picks where the spec is revealed: a compromised
+        // or buggy agent key could otherwise name a contract that accepts the
+        // call and does nothing, leaving a seeded market the resolver market-core
+        // actually trusts never hears about. Kept for interface stability; prefer
+        // `agent_create_and_reveal_v2`, which has no such argument.
+        let global = Self::load_global(&env)?;
+        let configured = Self::core_resolver(&env, &global)?;
+        if resolver != configured {
+            return Err(Error::ResolverMismatch);
+        }
+        Self::create_and_reveal(
+            env,
+            agent,
+            configured,
             question_hash,
-            resolution_hash,
             meta_uri,
             category,
             close_time,
             seed_amount,
             initial_yes_bps,
-        )?;
-        ResolverClient::new(&env, &resolver).register_spec_v2(&market_id, &spec_v2);
-        Ok(market_id)
+            spec_v2,
+        )
+    }
+
+    /// [`Self::agent_create_market_and_reveal`] without the `resolver` argument:
+    /// the spec is revealed to the resolver market-core is configured with,
+    /// read on-chain, so there is nothing for a caller to misuse.
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_create_and_reveal_v2(
+        env: Env,
+        agent: Address,
+        question_hash: BytesN<32>,
+        meta_uri: String,
+        category: Category,
+        close_time: u64,
+        seed_amount: i128,
+        initial_yes_bps: u32,
+        spec_v2: ResolutionSpecV2,
+    ) -> Result<u64, Error> {
+        Self::gate(&env, Op::AgentOpen)?;
+        let global = Self::load_global(&env)?;
+        let resolver = Self::core_resolver(&env, &global)?;
+        Self::create_and_reveal(
+            env,
+            agent,
+            resolver,
+            question_hash,
+            meta_uri,
+            category,
+            close_time,
+            seed_amount,
+            initial_yes_bps,
+            spec_v2,
+        )
     }
 
     /// Buys `outcome` shares in an existing market using treasury capital
@@ -3032,6 +3301,8 @@ impl Treasury {
         let policy = Self::require_agent(&env, &agent, ROLE_TRADE)?;
         Self::check_trade_size(&global, &policy, collateral_in)?;
         Self::ensure_unreserved(&env, &global, collateral_in)?;
+        // After the cheap local checks, before any other market-core call.
+        Self::check_resolvable(&env, &global, market_id)?;
 
         let prices = Self::load_price_policy(&env);
         let client = MarketCoreClient::new(&env, &global.market_core);
@@ -3198,6 +3469,95 @@ impl Treasury {
         let mut preimage = Bytes::from_slice(env, SPEC_DOMAIN);
         preimage.append(&spec.clone().to_xdr(env));
         Ok(env.crypto().sha256(&preimage).into())
+    }
+
+    /// The resolver market-core currently trusts, read from its own config on
+    /// every call (not cached: an admin resolver swap changes it for all markets,
+    /// and a stale cache would check the old resolver's view).
+    fn core_resolver(env: &Env, global: &GlobalConfig) -> Result<Address, Error> {
+        Ok(core_call(MarketCoreClient::new(env, &global.market_core).try_get_config())?.resolver)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_and_reveal(
+        env: Env,
+        agent: Address,
+        resolver: Address,
+        question_hash: BytesN<32>,
+        meta_uri: String,
+        category: Category,
+        close_time: u64,
+        seed_amount: i128,
+        initial_yes_bps: u32,
+        spec_v2: ResolutionSpecV2,
+    ) -> Result<u64, Error> {
+        let resolution_hash = Self::resolve_commitment(&env, &spec_v2)?;
+        let market_id = Self::agent_create_market(
+            env.clone(),
+            agent,
+            question_hash,
+            resolution_hash,
+            meta_uri,
+            category,
+            close_time,
+            seed_amount,
+            initial_yes_bps,
+        )?;
+        let client = ResolverClient::new(&env, &resolver);
+        resolver_call(client.try_register_spec_v2(&market_id, &spec_v2))?;
+        // A resolver that accepts the call and stores nothing is caught here:
+        // the whole transaction (market and seed included) reverts.
+        if matches!(
+            resolver_call(client.try_spec_kind(&market_id))?,
+            resolver::SpecKind::None
+        ) {
+            return Err(Error::SpecNotRevealed);
+        }
+        Ok(market_id)
+    }
+
+    fn load_resolvability_policy(env: &Env) -> ResolvabilityPolicy {
+        env.storage()
+            .instance()
+            .get(&DataKey::ResolvabilityPolicy)
+            .unwrap_or(OPEN_RESOLVABILITY)
+    }
+
+    /// The pre-trade resolvability check of `agent_buy` (#273). Reads
+    /// market-core's configured resolver and one resolver view
+    /// (`trade_status`); a fully permissive policy (the default) makes no
+    /// cross-contract call at all. Sells, redemptions and settlement never come
+    /// through here. Legacy cores are not consulted: no buy path reaches them
+    /// (their positions are only redeemable), so this uses `global.market_core`.
+    fn check_resolvable(env: &Env, global: &GlobalConfig, market_id: u64) -> Result<(), Error> {
+        let policy = Self::load_resolvability_policy(env);
+        if policy == OPEN_RESOLVABILITY {
+            return Ok(());
+        }
+        let resolver = Self::core_resolver(env, global)?;
+        let st = resolver_call(ResolverClient::new(env, &resolver).try_trade_status(&market_id))?;
+        let now = env.ledger().timestamp();
+        if policy.require_revealed && matches!(st.spec, resolver::SpecKind::None) {
+            return Err(Error::SpecNotRevealed);
+        }
+        if policy.allowed_specs & spec_bit(&st.spec) == 0 {
+            return Err(Error::SpecKindNotAllowed);
+        }
+        if policy.block_when_disputed && matches!(st.state, resolver::ResolutionState::Disputed) {
+            return Err(Error::MarketDisputed);
+        }
+        if policy.block_with_open_proposal && st.open_proposal {
+            return Err(Error::ProposalOpen);
+        }
+        if now >= st.deadline {
+            return Err(Error::PastResolutionDeadline);
+        }
+        if policy.min_secs_to_close > 0
+            && st.close_time.saturating_sub(now) < policy.min_secs_to_close
+        {
+            return Err(Error::TooCloseToClose);
+        }
+        Ok(())
     }
 
     fn ensure_unreserved(env: &Env, global: &GlobalConfig, amount: i128) -> Result<(), Error> {
@@ -4305,6 +4665,72 @@ mod test {
         token: Address,
         market_core: MarketCoreClient<'static>,
         market_id: u64,
+        /// The resolver market-core is configured with.
+        resolver: Address,
+    }
+
+    /// Which resolver market-core is deployed against in a fixture.
+    #[derive(Clone, Copy)]
+    enum ResolverKind {
+        /// The real resolver wasm (the vendored copy the treasury imports).
+        Wasm,
+        /// [`MockResolver`]: `trade_status` is whatever the test sets.
+        Mock,
+        /// [`NoopResolver`]: accepts `register_spec_v2` and stores nothing.
+        Noop,
+    }
+
+    /// A resolver whose `trade_status` / `spec_kind` the test controls.
+    #[contract]
+    pub struct MockResolver;
+
+    #[contractimpl]
+    impl MockResolver {
+        pub fn set_status(env: Env, status: resolver::TradeStatus) {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, "st"), &status);
+        }
+        pub fn trade_status(env: Env, _market_id: u64) -> resolver::TradeStatus {
+            env.storage()
+                .instance()
+                .get(&Symbol::new(&env, "st"))
+                .unwrap()
+        }
+        /// Reveals as a price rule.
+        pub fn register_spec_v2(env: Env, _market_id: u64, _spec: resolver::ResolutionSpecV2) {
+            let mut st: resolver::TradeStatus = env
+                .storage()
+                .instance()
+                .get(&Symbol::new(&env, "st"))
+                .unwrap_or(resolver::TradeStatus {
+                    spec: resolver::SpecKind::None,
+                    state: resolver::ResolutionState::Unconfigured,
+                    close_time: u64::MAX,
+                    deadline: u64::MAX,
+                    open_proposal: false,
+                });
+            st.spec = resolver::SpecKind::Price;
+            env.storage().instance().set(&Symbol::new(&env, "st"), &st);
+        }
+        pub fn spec_kind(env: Env, _market_id: u64) -> resolver::SpecKind {
+            let st: Option<resolver::TradeStatus> =
+                env.storage().instance().get(&Symbol::new(&env, "st"));
+            st.map(|s| s.spec).unwrap_or(resolver::SpecKind::None)
+        }
+    }
+
+    /// A resolver that accepts the reveal and stores nothing (a compromised or
+    /// misconfigured contract).
+    #[contract]
+    pub struct NoopResolver;
+
+    #[contractimpl]
+    impl NoopResolver {
+        pub fn register_spec_v2(_env: Env, _market_id: u64, _spec: resolver::ResolutionSpecV2) {}
+        pub fn spec_kind(_env: Env, _market_id: u64) -> resolver::SpecKind {
+            resolver::SpecKind::None
+        }
     }
 
     fn fixture() -> Fixture {
@@ -4370,6 +4796,47 @@ mod test {
         prefund: bool,
         creation_policy: CreationPolicy,
     ) -> Fixture {
+        fixture_build(
+            max_trade,
+            max_market,
+            max_daily,
+            max_net_exposure,
+            prefund,
+            creation_policy,
+            ResolverKind::Wasm,
+        )
+    }
+
+    /// A prefunded fixture deployed against the resolver `kind`, with room for
+    /// market-core's minimum 100 USDC seed (`max_trade` stays 20 USDC).
+    fn fixture_with_resolver(kind: ResolverKind) -> Fixture {
+        fixture_build(
+            20 * USDC,
+            300 * USDC,
+            1_000 * USDC,
+            1_000 * USDC,
+            true,
+            CreationPolicy {
+                max_seed: 200 * USDC,
+                max_markets_per_window: 100,
+                creation_window_secs: 86_400,
+                min_close_horizon: 60,
+                max_close_horizon: 365 * DAY_SECONDS,
+                allowed_categories: 0x3F,
+            },
+            kind,
+        )
+    }
+
+    fn fixture_build(
+        max_trade: i128,
+        max_market: i128,
+        max_daily: i128,
+        max_net_exposure: i128,
+        prefund: bool,
+        creation_policy: CreationPolicy,
+        resolver_kind: ResolverKind,
+    ) -> Fixture {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().set_timestamp(1_000);
@@ -4386,7 +4853,11 @@ mod test {
             token.mint(&treasury_id, &(1_000 * 10_000_000_i128));
         }
 
-        let resolver = Address::generate(&env);
+        let resolver = match resolver_kind {
+            ResolverKind::Wasm => Address::generate(&env), // registered below, once market-core exists
+            ResolverKind::Mock => env.register(MockResolver, ()),
+            ResolverKind::Noop => env.register(NoopResolver, ()),
+        };
         let market_core_id = register_market_core(
             &env,
             (
@@ -4400,6 +4871,13 @@ mod test {
                 10_000u32,
             ),
         );
+        if matches!(resolver_kind, ResolverKind::Wasm) {
+            env.register_at(
+                &resolver,
+                resolver::WASM,
+                (admin.clone(), market_core_id.clone()),
+            );
+        }
         let market_core = MarketCoreClient::new(&env, &market_core_id);
         let market_id = market_core.create_market(
             &creator,
@@ -4443,6 +4921,7 @@ mod test {
             token: collateral.address(),
             market_core,
             market_id,
+            resolver,
         }
     }
 
@@ -6901,7 +7380,8 @@ mod test {
             Err(Ok(Error::Paused))
         );
         // Only an explicit emergency does.
-        f.treasury.declare_emergency(&Symbol::new(&f.env, "core_down"));
+        f.treasury
+            .declare_emergency(&Symbol::new(&f.env, "core_down"));
         let supply = f.treasury.total_shares();
         let expected = shares * (10 * USDC) / (supply + VIRTUAL_SHARES);
         assert_eq!(f.treasury.emergency_withdraw(&alice, &shares), expected);
@@ -8462,7 +8942,8 @@ mod test {
         assert_eq!(f.treasury.mode(), Mode::AgentsHalted);
         assert!(f.treasury.drawdown_status().tripped);
         assert_eq!(
-            f.treasury.try_agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &USDC, &0),
+            f.treasury
+                .try_agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &USDC, &0),
             Err(Ok(Error::DrawdownTripped))
         );
         // ...and the reverse: resuming agents leaves an admin pause standing.
@@ -8505,17 +8986,26 @@ mod test {
     fn declare_emergency_requires_admin_pause_first() {
         let f = fixture();
         let why = sym(&f, "core_down");
-        assert_eq!(f.treasury.try_declare_emergency(&why), Err(Ok(Error::NotPaused)));
+        assert_eq!(
+            f.treasury.try_declare_emergency(&why),
+            Err(Ok(Error::NotPaused))
+        );
         trip_drawdown(&f);
         // A drawdown halt alone is not enough either: two deliberate steps.
-        assert_eq!(f.treasury.try_declare_emergency(&why), Err(Ok(Error::NotPaused)));
+        assert_eq!(
+            f.treasury.try_declare_emergency(&why),
+            Err(Ok(Error::NotPaused))
+        );
         f.treasury.set_paused(&true);
         f.treasury.declare_emergency(&why);
         assert_eq!(f.treasury.mode(), Mode::Emergency);
         // Idempotent, and the admin pause cannot be lifted underneath it.
         f.treasury.declare_emergency(&why);
         assert_eq!(f.treasury.try_unpause(), Err(Ok(Error::EmergencyMode)));
-        assert_eq!(f.treasury.try_set_paused(&false), Err(Ok(Error::EmergencyMode)));
+        assert_eq!(
+            f.treasury.try_set_paused(&false),
+            Err(Ok(Error::EmergencyMode))
+        );
         // Ending it returns to the admin pause, and the halt is still recorded.
         f.treasury.end_emergency();
         assert_eq!(f.treasury.mode(), Mode::AdminPaused);
@@ -8597,7 +9087,10 @@ mod test {
         // DrawdownTripped => a drawdown halt (the Paused it set is its own).
         set_legacy(true, false, true);
         let st = f.treasury.mode_state();
-        assert_eq!((f.treasury.mode(), st.drawdown_halt), (Mode::AgentsHalted, Some(0)));
+        assert_eq!(
+            (f.treasury.mode(), st.drawdown_halt),
+            (Mode::AgentsHalted, Some(0))
+        );
         assert_eq!(st.admin_pause_at, None);
         // AdminPaused => an admin pause with reason `legacy`.
         set_legacy(true, true, false);
@@ -8644,19 +9137,34 @@ mod test {
             at,
         };
         f.treasury.pause(&sym(&f, "maintenance"));
-        assert!(has_event(&f, &ev(Mode::Normal, Mode::AdminPaused, "maintenance")));
+        assert!(has_event(
+            &f,
+            &ev(Mode::Normal, Mode::AdminPaused, "maintenance")
+        ));
         f.treasury.declare_emergency(&sym(&f, "core_down"));
-        assert!(has_event(&f, &ev(Mode::AdminPaused, Mode::Emergency, "core_down")));
+        assert!(has_event(
+            &f,
+            &ev(Mode::AdminPaused, Mode::Emergency, "core_down")
+        ));
         f.treasury.end_emergency();
-        assert!(has_event(&f, &ev(Mode::Emergency, Mode::AdminPaused, "end_emerg")));
+        assert!(has_event(
+            &f,
+            &ev(Mode::Emergency, Mode::AdminPaused, "end_emerg")
+        ));
         f.treasury.unpause();
-        assert!(has_event(&f, &ev(Mode::AdminPaused, Mode::Normal, "unpause")));
+        assert!(has_event(
+            &f,
+            &ev(Mode::AdminPaused, Mode::Normal, "unpause")
+        ));
         // set_paused(true) is `pause(admin)`: the timelock's emergency path.
         f.treasury.set_paused(&true);
         assert!(has_event(&f, &ev(Mode::Normal, Mode::AdminPaused, "admin")));
         // Idempotent calls change nothing and emit nothing new.
         f.treasury.set_paused(&true);
-        assert_eq!(f.treasury.mode_state().admin_pause_reason, Some(sym(&f, "admin")));
+        assert_eq!(
+            f.treasury.mode_state().admin_pause_reason,
+            Some(sym(&f, "admin"))
+        );
     }
 
     #[test]
@@ -8680,7 +9188,10 @@ mod test {
                 at: MARKET_CLOSE + 1,
             }
         ));
-        assert_eq!(f.treasury.mode_state().drawdown_halt, Some(MARKET_CLOSE + 1));
+        assert_eq!(
+            f.treasury.mode_state().drawdown_halt,
+            Some(MARKET_CLOSE + 1)
+        );
 
         f.treasury.reset_pnl_window();
         f.treasury.resume_agents();
@@ -8728,6 +9239,7 @@ mod test {
         ("emergency_withdraw", Row::Gated(Op::EmergencyWithdraw)),
         ("agent_create_market", Row::Gated(Op::AgentOpen)),
         ("agent_create_market_and_reveal", Row::Gated(Op::AgentOpen)),
+        ("agent_create_and_reveal_v2", Row::Gated(Op::AgentOpen)),
         ("agent_buy", Row::Gated(Op::AgentOpen)),
         ("agent_buy_v2", Row::Gated(Op::AgentOpen)),
         ("agent_sell", Row::Gated(Op::AgentReduce)),
@@ -8791,6 +9303,11 @@ mod test {
         ("execute_price_policy", Row::Ungated),
         ("cancel_price_policy", Row::Ungated),
         ("pending_price_policy", Row::Ungated),
+        ("get_resolvability_policy", Row::Ungated),
+        ("set_resolvability_policy", Row::Ungated),
+        ("execute_resolvability_policy", Row::Ungated),
+        ("cancel_resolvability_policy", Row::Ungated),
+        ("pending_resolvability_policy", Row::Ungated),
         ("nav", Row::Ungated),
         ("shares_of", Row::Ungated),
         ("total_shares", Row::Ungated),
@@ -8817,7 +9334,9 @@ mod test {
     #[test]
     fn every_entrypoint_has_a_matrix_row() {
         let src = include_str!("lib.rs");
-        let start = src.find("#[contractimpl]\nimpl Treasury {").expect("impl Treasury");
+        let start = src
+            .find("#[contractimpl]\nimpl Treasury {")
+            .expect("impl Treasury");
         let end = src.find("\n#[cfg(test)]\nmod test").expect("test module");
         let mut missing = std::vec::Vec::new();
         for line in src[start..end].lines() {
@@ -8879,9 +9398,16 @@ mod test {
             "claim_withdraw" => ok(flat(t.try_claim_withdraw(&1))),
             "emergency_withdraw" => ok(flat(t.try_emergency_withdraw(who, &1))),
             "agent_create_market" => ok(flat(t.try_agent_create_market(
-                agent, &qh, &rh, &uri, &Category::Crypto, &(MARKET_CLOSE + 5_000), &USDC, &5_000,
+                agent,
+                &qh,
+                &rh,
+                &uri,
+                &Category::Crypto,
+                &(MARKET_CLOSE + 5_000),
+                &USDC,
+                &5_000,
             ))),
-            "agent_create_market_and_reveal" => {
+            "agent_create_market_and_reveal" | "agent_create_and_reveal_v2" => {
                 // The gate precedes the envelope check, so any envelope will do.
                 let spec = ResolutionSpecV2 {
                     version: 1,
@@ -8896,23 +9422,64 @@ mod test {
                         max_staleness: 1,
                     }),
                 };
-                ok(flat(t.try_agent_create_market_and_reveal(
-                    agent, &core, &qh, &uri, &Category::Crypto, &(MARKET_CLOSE + 5_000), &USDC, &5_000, &spec,
-                )))
+                if name == "agent_create_and_reveal_v2" {
+                    ok(flat(t.try_agent_create_and_reveal_v2(
+                        agent,
+                        &qh,
+                        &uri,
+                        &Category::Crypto,
+                        &(MARKET_CLOSE + 5_000),
+                        &USDC,
+                        &5_000,
+                        &spec,
+                    )))
+                } else {
+                    ok(flat(t.try_agent_create_market_and_reveal(
+                        agent,
+                        &core,
+                        &qh,
+                        &uri,
+                        &Category::Crypto,
+                        &(MARKET_CLOSE + 5_000),
+                        &USDC,
+                        &5_000,
+                        &spec,
+                    )))
+                }
             }
             "agent_buy" => ok(flat(t.try_agent_buy(agent, &id, &Outcome::Yes, &USDC, &0))),
             "agent_buy_v2" => ok(flat(t.try_agent_buy_v2(
-                agent, &id, &Outcome::Yes, &USDC, &0, &0, &(f.env.ledger().timestamp() + 60),
+                agent,
+                &id,
+                &Outcome::Yes,
+                &USDC,
+                &0,
+                &0,
+                &(f.env.ledger().timestamp() + 60),
             ))),
-            "agent_sell" => ok(flat(t.try_agent_sell(agent, &id, &Outcome::Yes, &1, &i128::MAX))),
+            "agent_sell" => ok(flat(t.try_agent_sell(
+                agent,
+                &id,
+                &Outcome::Yes,
+                &1,
+                &i128::MAX,
+            ))),
             "agent_sell_v2" => ok(flat(t.try_agent_sell_v2(
-                agent, &id, &Outcome::Yes, &1, &i128::MAX, &0, &(f.env.ledger().timestamp() + 60),
+                agent,
+                &id,
+                &Outcome::Yes,
+                &1,
+                &i128::MAX,
+                &0,
+                &(f.env.ledger().timestamp() + 60),
             ))),
             "close_trade" => ok(flat(t.try_close_trade(agent, &id))),
             "redeem" => ok(flat(t.try_redeem(agent, &id))),
             "claim_pool_remainder" => ok(flat(t.try_claim_pool_remainder(agent, &id))),
             "legacy_redeem" => ok(flat(t.try_legacy_redeem(agent, &core, &id))),
-            "legacy_claim_pool_remainder" => ok(flat(t.try_legacy_claim_pool_remainder(agent, &core, &id))),
+            "legacy_claim_pool_remainder" => {
+                ok(flat(t.try_legacy_claim_pool_remainder(agent, &core, &id)))
+            }
             "redeem_many" => ok(flat(t.try_redeem_many(agent, &ids))),
             "claim_pool_remainders" => ok(flat(t.try_claim_pool_remainders(agent, &ids))),
             "agent_claim_lp_fees" => ok(flat(t.try_agent_claim_lp_fees(agent, &id))),
@@ -8957,7 +9524,11 @@ mod test {
                     // Allowed: it may still fail for its own reasons, but never
                     // with the gate's error.
                     if let Err(Some(e)) = &got {
-                        assert_ne!(*e, gate_error(mode), "{name} in {mode:?}: the gate refused an allowed op");
+                        assert_ne!(
+                            *e,
+                            gate_error(mode),
+                            "{name} in {mode:?}: the gate refused an allowed op"
+                        );
                     }
                     assert_ne!(got, Err(None), "{name} in {mode:?} trapped");
                 } else {
@@ -8965,5 +9536,499 @@ mod test {
                 }
             }
         }
+    }
+
+    // ----- resolvability (#273) ----------------------------------------------------
+
+    fn signers_spec(f: &Fixture, salt: u8) -> ResolutionSpecV2 {
+        ResolutionSpecV2 {
+            version: SPEC_V2_VERSION,
+            network_id: f.env.ledger().network_id(),
+            market_core: f.market_core.address.clone(),
+            salt: BytesN::from_array(&f.env, &[salt; 32]),
+            rule: resolver::ResolutionSpec::Signers(resolver::SignerConfig {
+                signers: vec![&f.env, Address::generate(&f.env), Address::generate(&f.env)],
+                threshold: 2,
+                dispute_window: 100,
+            }),
+        }
+    }
+
+    fn create_and_reveal(f: &Fixture, salt: u8) -> Result<u64, Error> {
+        let (qh, _, uri) = create_args(f, salt);
+        match f.treasury.try_agent_create_and_reveal_v2(
+            &f.agent,
+            &qh,
+            &uri,
+            &Category::Crypto,
+            &(MARKET_CLOSE + 5_000),
+            &(100 * USDC),
+            &5_000,
+            &signers_spec(f, salt),
+        ) {
+            Ok(Ok(id)) => Ok(id),
+            Err(Ok(e)) => Err(e),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Applies `p` (it must be a tightening: it takes effect at once). Does not
+    /// read the policy back, so the caller can still check the event it emitted.
+    fn tighten(f: &Fixture, p: ResolvabilityPolicy) {
+        f.treasury.set_resolvability_policy(&p);
+    }
+
+    fn status(
+        f: &Fixture,
+        spec: resolver::SpecKind,
+        state: resolver::ResolutionState,
+    ) -> resolver::TradeStatus {
+        let st = resolver::TradeStatus {
+            spec,
+            state,
+            close_time: MARKET_CLOSE,
+            deadline: MARKET_CLOSE + 30 * DAY_SECONDS,
+            open_proposal: false,
+        };
+        MockResolverClient::new(&f.env, &f.resolver).set_status(&st);
+        st
+    }
+
+    fn buy(f: &Fixture) -> Result<(), Option<Error>> {
+        match f
+            .treasury
+            .try_agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &USDC, &0)
+        {
+            Ok(Ok(_)) => Ok(()),
+            Err(Ok(e)) => Err(Some(e)),
+            _ => Err(None),
+        }
+    }
+
+    #[test]
+    fn create_and_reveal_rejects_foreign_resolver() {
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        let (qh, _, uri) = create_args(&f, 41);
+        let foreign = Address::generate(&f.env);
+        let before = f.market_core.market_count();
+        // The agent may not pick where the spec is revealed.
+        assert_eq!(
+            f.treasury.try_agent_create_market_and_reveal(
+                &f.agent,
+                &foreign,
+                &qh,
+                &uri,
+                &Category::Crypto,
+                &(MARKET_CLOSE + 5_000),
+                &(100 * USDC),
+                &5_000,
+                &signers_spec(&f, 41),
+            ),
+            Err(Ok(Error::ResolverMismatch))
+        );
+        assert_eq!(
+            f.market_core.market_count(),
+            before,
+            "no market was created"
+        );
+        // The configured resolver is accepted (the old entrypoint, kept for
+        // interface stability), and the v2 entrypoint needs no argument at all.
+        let id = f.treasury.agent_create_market_and_reveal(
+            &f.agent,
+            &f.resolver,
+            &qh,
+            &uri,
+            &Category::Crypto,
+            &(MARKET_CLOSE + 5_000),
+            &(100 * USDC),
+            &5_000,
+            &signers_spec(&f, 41),
+        );
+        assert_eq!(id, before);
+        assert_eq!(create_and_reveal(&f, 42), Ok(before + 1));
+    }
+
+    #[test]
+    fn create_and_reveal_detects_noop_resolver() {
+        // market-core trusts a resolver that accepts register_spec_v2 and
+        // stores nothing: the market could only end by expiry voiding.
+        let f = fixture_with_resolver(ResolverKind::Noop);
+        let before = f.market_core.market_count();
+        assert_eq!(create_and_reveal(&f, 43), Err(Error::SpecNotRevealed));
+        assert_eq!(
+            f.market_core.market_count(),
+            before,
+            "the seeded market was rolled back"
+        );
+        assert_eq!(
+            balance(&f, &f.treasury_id),
+            1_000 * USDC,
+            "and so was the seed"
+        );
+    }
+
+    #[test]
+    fn create_and_reveal_reveals_to_the_real_resolver() {
+        let f = fixture_with_resolver(ResolverKind::Wasm);
+        let id = create_and_reveal(&f, 44).unwrap();
+        let resolver = resolver::Client::new(&f.env, &f.resolver);
+        assert_eq!(resolver.spec_kind(&id), resolver::SpecKind::Signers);
+        assert_eq!(
+            resolver.state(&id),
+            resolver::ResolutionState::SignersPending
+        );
+    }
+
+    #[test]
+    fn default_policy_makes_no_resolver_call() {
+        // The mock has no status set, so any trade_status call would panic: a
+        // fully permissive policy must not even look.
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        assert_eq!(f.treasury.get_resolvability_policy(), OPEN_RESOLVABILITY);
+        assert_eq!(buy(&f), Ok(()));
+    }
+
+    #[test]
+    fn buy_rejected_when_spec_unrevealed() {
+        let f = fixture_with_resolver(ResolverKind::Wasm);
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                require_revealed: true,
+                ..OPEN_RESOLVABILITY
+            },
+        );
+        // The fixture's market has a commitment nobody revealed.
+        assert_eq!(buy(&f), Err(Some(Error::SpecNotRevealed)));
+        // A market created through the atomic flow is revealed, so it trades.
+        let id = create_and_reveal(&f, 45).unwrap();
+        assert!(f
+            .treasury
+            .try_agent_buy(&f.agent, &id, &Outcome::Yes, &USDC, &0)
+            .is_ok());
+    }
+
+    #[test]
+    fn buy_rejected_when_spec_kind_not_allowed() {
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        status(
+            &f,
+            resolver::SpecKind::Twap,
+            resolver::ResolutionState::Unconfigured,
+        );
+        // Only price and signer rules may be bought into.
+        let allowed = (1 << 1) | (1 << 4);
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                allowed_specs: allowed,
+                ..OPEN_RESOLVABILITY
+            },
+        );
+        assert_eq!(buy(&f), Err(Some(Error::SpecKindNotAllowed)));
+        status(
+            &f,
+            resolver::SpecKind::Signers,
+            resolver::ResolutionState::SignersPending,
+        );
+        assert_eq!(buy(&f), Ok(()));
+    }
+
+    #[test]
+    fn buy_rejected_when_disputed() {
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        status(
+            &f,
+            resolver::SpecKind::Disputable,
+            resolver::ResolutionState::Disputed,
+        );
+        // Off by default: a dispute freezes the market, not the treasury.
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                require_revealed: true,
+                ..OPEN_RESOLVABILITY
+            },
+        );
+        assert_eq!(buy(&f), Ok(()));
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                require_revealed: true,
+                block_when_disputed: true,
+                ..OPEN_RESOLVABILITY
+            },
+        );
+        assert_eq!(buy(&f), Err(Some(Error::MarketDisputed)));
+        // The block is per market and per state: it lifts when the ruling lands.
+        status(
+            &f,
+            resolver::SpecKind::Disputable,
+            resolver::ResolutionState::Finalized,
+        );
+        assert_eq!(buy(&f), Ok(()));
+    }
+
+    #[test]
+    fn buy_rejected_with_open_proposal_only_when_asked() {
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        let mut st = status(
+            &f,
+            resolver::SpecKind::Signers,
+            resolver::ResolutionState::SignersPending,
+        );
+        st.open_proposal = true;
+        MockResolverClient::new(&f.env, &f.resolver).set_status(&st);
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                require_revealed: true,
+                ..OPEN_RESOLVABILITY
+            },
+        );
+        assert_eq!(buy(&f), Ok(()), "off by default");
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                require_revealed: true,
+                block_with_open_proposal: true,
+                ..OPEN_RESOLVABILITY
+            },
+        );
+        assert_eq!(buy(&f), Err(Some(Error::ProposalOpen)));
+    }
+
+    #[test]
+    fn buy_rejected_too_close_to_close() {
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        let now = f.env.ledger().timestamp();
+        let mut st = status(
+            &f,
+            resolver::SpecKind::Price,
+            resolver::ResolutionState::Unconfigured,
+        );
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                min_secs_to_close: 60,
+                ..OPEN_RESOLVABILITY
+            },
+        );
+        st.close_time = now + 59;
+        MockResolverClient::new(&f.env, &f.resolver).set_status(&st);
+        assert_eq!(buy(&f), Err(Some(Error::TooCloseToClose)));
+        st.close_time = now + 60;
+        MockResolverClient::new(&f.env, &f.resolver).set_status(&st);
+        assert_eq!(buy(&f), Ok(()), "exactly min_secs_to_close away is allowed");
+    }
+
+    #[test]
+    fn buy_rejected_past_resolution_deadline() {
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        let now = f.env.ledger().timestamp();
+        let mut st = status(
+            &f,
+            resolver::SpecKind::Price,
+            resolver::ResolutionState::Unconfigured,
+        );
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                require_revealed: true,
+                ..OPEN_RESOLVABILITY
+            },
+        );
+        st.deadline = now;
+        MockResolverClient::new(&f.env, &f.resolver).set_status(&st);
+        assert_eq!(buy(&f), Err(Some(Error::PastResolutionDeadline)));
+    }
+
+    #[test]
+    fn creation_is_not_blocked_by_min_secs_to_close() {
+        // Seed-and-reveal happens far from close and must not be held to the
+        // buy-side minimum.
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                min_secs_to_close: 10 * DAY_SECONDS,
+                ..OPEN_RESOLVABILITY
+            },
+        );
+        assert!(create_and_reveal(&f, 46).is_ok());
+    }
+
+    #[test]
+    fn sell_and_redeem_never_gated() {
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        status(
+            &f,
+            resolver::SpecKind::None,
+            resolver::ResolutionState::Disputed,
+        );
+        assert_eq!(buy(&f), Ok(())); // under the open default policy
+                                     // Now the strictest policy, against a market that fails every check.
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                require_revealed: true,
+                block_when_disputed: true,
+                block_with_open_proposal: true,
+                min_secs_to_close: 365 * DAY_SECONDS,
+                allowed_specs: 0,
+            },
+        );
+        assert!(buy(&f).is_err());
+        // Exits and settlement still work: the treasury must always be able to
+        // get out and bring collateral home.
+        let sold = f.treasury.try_agent_sell(
+            &f.agent,
+            &f.market_id,
+            &Outcome::Yes,
+            &(USDC / 4),
+            &i128::MAX,
+        );
+        assert!(sold.is_ok(), "{sold:?}");
+        f.env.ledger().set_timestamp(MARKET_CLOSE + 1);
+        f.market_core.resolve(&f.market_id, &Outcome::Yes);
+        let caller = Address::generate(&f.env);
+        assert!(f.treasury.try_settle_market(&caller, &f.market_id).is_ok());
+        assert!(f.treasury.try_redeem(&f.agent, &f.market_id).is_ok());
+    }
+
+    #[test]
+    fn loosening_policy_waits_delay() {
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        let strict = ResolvabilityPolicy {
+            require_revealed: true,
+            block_when_disputed: true,
+            block_with_open_proposal: false,
+            min_secs_to_close: 120,
+            allowed_specs: (1 << 1) | (1 << 4),
+        };
+        tighten(&f, strict);
+        assert!(has_event(
+            &f,
+            &ResolvabilityPolicySet {
+                old: OPEN_RESOLVABILITY,
+                new: strict,
+                immediate: true
+            }
+        ));
+        assert_eq!(f.treasury.get_resolvability_policy(), strict);
+
+        // Tightening further is immediate, in every dimension.
+        let stricter = ResolvabilityPolicy {
+            block_with_open_proposal: true,
+            min_secs_to_close: 300,
+            allowed_specs: 1 << 1,
+            ..strict
+        };
+        tighten(&f, stricter);
+        assert_eq!(f.treasury.get_resolvability_policy(), stricter);
+
+        // Loosening any knob waits config_delay, even alongside a tightening.
+        let mixed = ResolvabilityPolicy {
+            require_revealed: false,
+            min_secs_to_close: 600,
+            ..stricter
+        };
+        f.treasury.set_resolvability_policy(&mixed);
+        let executable_at = f.env.ledger().timestamp() + DELAY;
+        assert!(has_event(
+            &f,
+            &ResolvabilityPolicyProposed {
+                old: stricter,
+                new: mixed,
+                executable_at
+            }
+        ));
+        assert_eq!(
+            f.treasury.get_resolvability_policy(),
+            stricter,
+            "not applied yet"
+        );
+        let pending = f.treasury.pending_resolvability_policy().unwrap();
+        assert_eq!(pending.policy, mixed);
+        assert_eq!(pending.executable_at, executable_at);
+        // One proposal at a time, and it cannot run early.
+        assert_eq!(
+            f.treasury
+                .try_set_resolvability_policy(&ResolvabilityPolicy {
+                    allowed_specs: ALL_SPEC_BITS,
+                    ..stricter
+                }),
+            Err(Ok(Error::ProposalPending))
+        );
+        assert_eq!(
+            f.treasury.try_execute_resolvability_policy(),
+            Err(Ok(Error::TimelockActive))
+        );
+
+        f.env.ledger().set_timestamp(pending.executable_at);
+        f.treasury.execute_resolvability_policy();
+        assert_eq!(f.treasury.get_resolvability_policy(), mixed);
+        assert_eq!(f.treasury.pending_resolvability_policy(), None);
+
+        // A pending change can be cancelled by the admin.
+        f.treasury.set_resolvability_policy(&OPEN_RESOLVABILITY);
+        f.treasury.cancel_resolvability_policy();
+        assert_eq!(f.treasury.get_resolvability_policy(), mixed);
+        assert_eq!(
+            f.treasury.try_cancel_resolvability_policy(),
+            Err(Ok(Error::NoPendingConfig))
+        );
+    }
+
+    #[test]
+    fn resolvability_policy_rejects_noops_and_unknown_spec_bits() {
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        assert_eq!(
+            f.treasury.try_set_resolvability_policy(&OPEN_RESOLVABILITY),
+            Err(Ok(Error::InvalidConfig)),
+            "no change"
+        );
+        assert_eq!(
+            f.treasury
+                .try_set_resolvability_policy(&ResolvabilityPolicy {
+                    allowed_specs: ALL_SPEC_BITS | (1 << 9),
+                    ..OPEN_RESOLVABILITY
+                }),
+            Err(Ok(Error::InvalidConfig)),
+            "a bit past the last SpecKind"
+        );
+    }
+
+    #[test]
+    fn spec_bits_cover_every_kind_exactly_once() {
+        use resolver::SpecKind as K;
+        let kinds = [
+            K::None,
+            K::Price,
+            K::ScaledPrice,
+            K::Twap,
+            K::Signers,
+            K::Disputable,
+            K::WeightedKeys,
+            K::Committee,
+            K::Hybrid,
+        ];
+        let mut seen = 0u32;
+        for k in &kinds {
+            let bit = spec_bit(k);
+            assert_eq!(bit.count_ones(), 1);
+            assert_eq!(seen & bit, 0, "bits are distinct");
+            seen |= bit;
+        }
+        assert_eq!(seen, ALL_SPEC_BITS);
+    }
+
+    #[test]
+    fn resolution_grace_mirrors_the_resolvers_constant() {
+        // The deadline comes from the resolver's trade_status; this pins the
+        // 30-day grace that the ADRs and the policy docs quote.
+        let f = fixture_with_resolver(ResolverKind::Wasm);
+        let st = resolver::Client::new(&f.env, &f.resolver).trade_status(&f.market_id);
+        assert_eq!(st.deadline, st.close_time + 30 * DAY_SECONDS);
     }
 }
