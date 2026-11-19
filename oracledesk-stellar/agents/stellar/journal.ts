@@ -1,10 +1,10 @@
 import { open, readFile, mkdir, truncate } from "node:fs/promises";
 import { dirname } from "node:path";
 
-export type JournalStage = "signed" | "submitting" | "submitted" | "confirmed" | "failed" | "uncertain" | "cancelled";
+export type JournalStage = "signed" | "submitting" | "submitted" | "bumped" | "confirmed" | "failed" | "uncertain" | "cancelled";
 
 export interface TransactionJournalRecord {
-  version: 1;
+  version: 1 | 2;
   id: string;
   stage: JournalStage;
   hash: string;
@@ -12,6 +12,10 @@ export interface TransactionJournalRecord {
   timestamp: string;
   attempt?: number;
   detail?: string;
+  innerHash?: string;
+  outerHash?: string;
+  feeOffered?: string;
+  feeCharged?: string;
 }
 
 export interface TransactionJournalOptions {
@@ -23,17 +27,23 @@ const stages = new Set<JournalStage>([
   "signed",
   "submitting",
   "submitted",
+  "bumped",
   "confirmed",
   "failed",
   "uncertain",
   "cancelled",
 ]);
+const DECIMAL = /^(0|[1-9][0-9]*)$/;
+
+function optionalDecimal(value: unknown): boolean {
+  return value === undefined || (typeof value === "string" && DECIMAL.test(value));
+}
 
 function isJournalRecord(value: unknown): value is TransactionJournalRecord {
   if (value === null || typeof value !== "object") return false;
   const record = value as Partial<TransactionJournalRecord>;
   return (
-    record.version === 1 &&
+    (record.version === 1 || record.version === 2) &&
     typeof record.id === "string" &&
     record.id.length > 0 &&
     typeof record.stage === "string" &&
@@ -42,7 +52,11 @@ function isJournalRecord(value: unknown): value is TransactionJournalRecord {
     typeof record.envelopeXdr === "string" &&
     typeof record.timestamp === "string" &&
     (record.attempt === undefined || (Number.isInteger(record.attempt) && record.attempt > 0)) &&
-    (record.detail === undefined || typeof record.detail === "string")
+    (record.detail === undefined || typeof record.detail === "string") &&
+    (record.innerHash === undefined || typeof record.innerHash === "string") &&
+    (record.outerHash === undefined || typeof record.outerHash === "string") &&
+    optionalDecimal(record.feeOffered) &&
+    optionalDecimal(record.feeCharged)
   );
 }
 
@@ -162,7 +176,7 @@ export function createJournalRecord(
 ): TransactionJournalRecord {
   return {
     ...fields,
-    version: 1,
+    version: 2,
     timestamp: fields.timestamp ?? new Date().toISOString(),
   };
 }

@@ -142,6 +142,23 @@ restarts. Use exec-form `CMD`, so the signal reaches node rather than a shell.
 | `STATE_FLUSH_DEBOUNCE_MS` | 250 | state write debounce |
 | `MARKET_CLOSE_IN_SECS` | 3600 | close time of markets the maker creates |
 
+## Fees
+
+In live mode the adapter reads `getFeeStats` before each submission and sets
+the generated binding's `fee` / `timeoutInSeconds` from the configured
+percentile for the action class (`trade`, `create`, `trace`, `maintenance`).
+The simulated Soroban resource fee is increased by `resourceMarginBps` before
+signing. Per-transaction and rolling daily caps are enforced; a JSON
+`FEE_POLICY_FILE` can override any class, and `AGENT_FEE_PAYER_SECRET` names the
+separate key that signs fee bumps.
+
+Fee bumps keep the signed inner transaction and sequence number unchanged:
+only the outer fee-bump envelope changes, so a bump has a new outer hash. The
+transaction journal records both hashes plus the offered and charged fees;
+`onFeeCharged` receives the same report for metrics. `txINSUFFICIENT_FEE`,
+`txFEE_BUMP_INNER_FAILED` and `ResourceLimitExceeded` are classified as
+retriable fee errors, while `txBAD_AUTH` and `txBAD_SEQ` remain terminal.
+
 ## Extending
 
 A task is `{name, intervalMs, jitterMs?, mode?, run(ctx)}`. Its `ctx`

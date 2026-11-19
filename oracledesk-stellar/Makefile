@@ -12,6 +12,7 @@ setup:
 	done
 	cd agents && npm install
 	cd x402 && npm install
+	cd scripts/governance && npm install
 
 # Builds all four Soroban contracts to wasm via the Stellar CLI. The vendored
 # cross-contract copies (resolver/treasury's market_core.wasm, resolver's
@@ -55,6 +56,7 @@ test: build
 	python3 scripts/coverage-gate.py --self-test
 	cd x402 && npm test
 	cd agents && npm test
+	cd scripts/governance && npm test
 
 lint:
 	./scripts/check-no-mock-all-auths.sh

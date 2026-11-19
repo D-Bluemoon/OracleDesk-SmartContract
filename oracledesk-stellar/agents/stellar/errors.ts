@@ -1,4 +1,4 @@
-export type SorobanErrorKind = "contract" | "auth" | "transient" | "unknown";
+export type SorobanErrorKind = "contract" | "auth" | "fee" | "transient" | "unknown";
 
 export interface SorobanErrorClassification {
   kind: SorobanErrorKind;
@@ -45,6 +45,14 @@ export function classifySorobanError(value: unknown): SorobanErrorClassification
     /\bauth[_ -](error|failed|invalid|missing|denied)\b/.test(normalized)
   ) {
     return { kind: "auth", terminal: true, message };
+  }
+  if (
+    /\b(tx_insufficient_fee|txinsufficient_fee|txfeebumpinnerfailed|tx_fee_bump_inner_failed|resourcelimitexceeded|resource_limit_exceeded)\b/.test(
+      normalized,
+    ) ||
+    /\bresource limit exceeded\b/.test(normalized)
+  ) {
+    return { kind: "fee", terminal: false, message };
   }
   if (
     /\b(contract error|contract_error|contracterror|contract trap|hosterror|scerror|contract invocation failed|invokehostfunctionfailed)\b/.test(
