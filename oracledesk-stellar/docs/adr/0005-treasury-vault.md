@@ -68,7 +68,7 @@ on-chain gave that list. The treasury keeps an index:
 - A market joins the index on its first buy or creation.
 - It leaves once the treasury holds nothing in it: no shares and no unclaimed
   LP role. This is checked after `redeem`, `claim_pool_remainder` and their
-  `legacy_*` variants. `migrate_market` also removes it.
+  `legacy_*` variants. `migrate_markets` also removes it.
 - Each entry records its market-core, so positions left in a market-core the
   treasury has since switched away from (see "Timelocked configuration" in
   `docs/architecture.md`) keep counting.
@@ -156,14 +156,15 @@ The treasury has no upgrade path, so existing deployments move by
 redeploying:
 
 1. Deploy the new treasury.
-2. Admin `withdraw` from the old (pre-vault) treasury.
-3. `deposit` into the new treasury.
-4. Call `market_core.propose_treasury`, then the new treasury's
+2. On the old treasury, `set_successor(new)`, then queue and execute
+   `migrate_markets` after `config_delay`.
+3. Call `market_core.propose_treasury`, then the new treasury's
    `accept_market_core_role` (the `set_treasury` API this ADR predates was
    replaced by the authenticated handshake in ADR 0006).
 
-Positions moved with `migrate_market` are not in the successor's index and
-count as zero in its NAV until they are redeemed.
+Positions moved with `migrate_markets` are not in the successor's index and
+count as zero in its NAV until they are redeemed. The old pre-vault flow's
+admin `withdraw` no longer exists.
 
 ## Consequences
 
@@ -178,7 +179,7 @@ count as zero in its NAV until they are redeemed.
   - **Fee sweeps.** `collect_market_fees` (admin) raises NAV for every
     shareholder at the moment fees arrive. A depositor who knows a sweep is
     imminent gets a slightly better entry. Sweep often.
-  - **Admin custody.** `set_successor` + `migrate_market` can move positions
+  - **Admin custody.** `set_successor` + `migrate_markets` can move positions
     out of the vault without compensation (SECURITY.md).
   - **Unindexed positions** (pre-migration, or received from a predecessor)
     are valued at zero until redeemed.

@@ -299,6 +299,28 @@ pub struct Config {
     pub paused: bool,
 }
 
+/// Admin-managed collateral allow-list entry (#151).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CollateralParams {
+    pub decimals: u32,
+    pub min_seed: i128,
+    pub max_sets: i128,
+    pub enabled: bool,
+}
+
+/// Per-market collateral snapshot (#151). Lives beside `Market` so its XDR
+/// shape (and every generated client) is unchanged; a missing entry falls
+/// back to the legacy `DataKey::Collateral`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketCollateralInfo {
+    pub token: Address,
+    /// `max_sets` snapshotted at creation, so a later allow-list change never
+    /// silently changes an existing market's size limit.
+    pub max_sets: i128,
+}
+
 /// A proposed admin handover (#62). Absent when no transfer is pending.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -336,6 +358,10 @@ pub enum DataKey {
     FeeTerms(u64),
     LpFees(u64),
     Breaker(u64),
+    // per-token collateral allow-list and solvency accounting (#151)
+    CollateralParams(Address),
+    MarketCollateral(u64),
+    Locked(Address),
     // temporary storage (expires on its own, one entry per market)
     Band(u64),
 }
@@ -395,6 +421,11 @@ pub enum Error {
     NotSupported = 30,
     /// A batch call carried no ids or more than `MAX_BATCH` of them.
     BatchTooLarge = 31,
+    /// `create_market` used a token missing from, or disabled in, the
+    /// admin collateral allow-list (#151).
+    CollateralNotAllowed = 32,
+    /// Allow-list parameters failed validation (decimals, seed bounds).
+    InvalidCollateralParams = 33,
 }
 
 impl From<MathError> for Error {
@@ -569,6 +600,30 @@ pub struct LpTransferred {
     pub to: Address,
 }
 
+#[contractevent]
+pub struct CollateralAdded {
+    #[topic]
+    pub token: Address,
+    pub decimals: u32,
+    pub min_seed: i128,
+    pub max_sets: i128,
+}
+
+#[contractevent]
+pub struct CollateralEnabledSet {
+    #[topic]
+    pub token: Address,
+    pub enabled: bool,
+}
+
+#[contractevent]
+pub struct MarketCollateralSet {
+    #[topic]
+    pub market_id: u64,
+    #[topic]
+    pub collateral: Address,
+}
+
 // ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
@@ -607,6 +662,100 @@ impl MarketCore {
         s.set(&DataKey::Paused, &false);
         s.set(&DataKey::NextId, &0u64);
         s.set(&DataKey::DefaultRedeemHorizon, &DEFAULT_REDEEM_HORIZON_SECS);
+        let default_params = CollateralParams {
+            decimals: 7,
+            min_seed: MIN_SEED,
+            max_sets: MAX_SETS,
+            enabled: true,
+        };
+        env.storage().persistent().set(
+            &DataKey::CollateralParams(collateral.clone()),
+            &default_params,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Locked(collateral.clone()), &0i128);
+        CollateralAdded {
+            token: collateral,
+            decimals: default_params.decimals,
+            min_seed: default_params.min_seed,
+            max_sets: default_params.max_sets,
+        }
+        .publish(&env);
+    }
+
+    /// Adds or updates a collateral on the allow-list (#151). `token` must be
+    /// a SEP-41 token whose `decimals()` matches `params.decimals`; until the
+    /// decimals-aware math lands only 7-decimal tokens are accepted.
+    pub fn add_collateral(env: Env, token: Address, params: CollateralParams) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let actual = token::TokenClient::new(&env, &token).decimals();
+        if params.decimals != 7 || actual != params.decimals {
+            return Err(Error::InvalidCollateralParams);
+        }
+        if params.min_seed <= 0
+            || params.min_seed > params.max_sets
+            || params.max_sets > i128::MAX / BPS
+        {
+            return Err(Error::InvalidCollateralParams);
+        }
+        let key = DataKey::CollateralParams(token.clone());
+        env.storage().persistent().set(&key, &params);
+        ttl::bump_persistent(&env, &key, ttl::long_lived_target(&env));
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Locked(token.clone()))
+        {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Locked(token.clone()), &0i128);
+        }
+        CollateralAdded {
+            token,
+            decimals: params.decimals,
+            min_seed: params.min_seed,
+            max_sets: params.max_sets,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Disables new markets for `token`; sells, redemptions, claims and fee
+    /// sweeps for existing markets keep working.
+    pub fn set_collateral_enabled(env: Env, token: Address, enabled: bool) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let mut p =
+            Self::load_collateral_params(&env, &token).ok_or(Error::CollateralNotAllowed)?;
+        p.enabled = enabled;
+        let key = DataKey::CollateralParams(token.clone());
+        env.storage().persistent().set(&key, &p);
+        ttl::bump_persistent(&env, &key, ttl::long_lived_target(&env));
+        CollateralEnabledSet { token, enabled }.publish(&env);
+        Ok(())
+    }
+
+    pub fn collateral_params(env: Env, token: Address) -> Option<CollateralParams> {
+        Self::load_collateral_params(&env, &token)
+    }
+
+    /// The token a market settles and trades in. Legacy markets (created
+    /// before #151) fall back to the contract's default collateral.
+    pub fn get_market_collateral(env: Env, market_id: u64) -> Address {
+        Self::market_token(&env, market_id)
+    }
+
+    pub fn market_collateral_info(env: Env, market_id: u64) -> MarketCollateralInfo {
+        Self::load_market_collateral(&env, market_id)
+    }
+
+    /// Collateral locked by all markets of `token`: `Σ(sets_minted +
+    /// fees_accrued)` maintained on every money path.
+    pub fn locked(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Locked(token))
+            .unwrap_or(0)
     }
 
     // ----- admin ----------------------------------------------------------
@@ -784,9 +933,9 @@ impl MarketCore {
 
     // ----- market lifecycle -----------------------------------------------
 
-    /// Creates a market and seeds the pool. `creator` becomes the sole LP.
-    /// `initial_yes_bps` in [100, 9900] sets the opening YES probability;
-    /// the creator receives the leftover shares of the likelier outcome.
+    /// Creates a market in the contract's legacy/default collateral.
+    /// Kept for compatibility; `create_market_with_collateral` selects an
+    /// allow-listed token per market (#151).
     #[allow(clippy::too_many_arguments)]
     pub fn create_market(
         env: Env,
@@ -799,13 +948,74 @@ impl MarketCore {
         seed_amount: i128,
         initial_yes_bps: u32,
     ) -> Result<u64, Error> {
+        let collateral: Address = Self::instance_get(&env, &DataKey::Collateral)?;
+        Self::do_create_market(
+            env,
+            creator,
+            collateral,
+            question_hash,
+            resolution_hash,
+            meta_uri,
+            category,
+            close_time,
+            seed_amount,
+            initial_yes_bps,
+        )
+    }
+
+    /// Creates a market denominated in an allow-listed `collateral` (#151).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_market_with_collateral(
+        env: Env,
+        creator: Address,
+        collateral: Address,
+        question_hash: BytesN<32>,
+        resolution_hash: BytesN<32>,
+        meta_uri: String,
+        category: Category,
+        close_time: u64,
+        seed_amount: i128,
+        initial_yes_bps: u32,
+    ) -> Result<u64, Error> {
+        Self::do_create_market(
+            env,
+            creator,
+            collateral,
+            question_hash,
+            resolution_hash,
+            meta_uri,
+            category,
+            close_time,
+            seed_amount,
+            initial_yes_bps,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn do_create_market(
+        env: Env,
+        creator: Address,
+        collateral: Address,
+        question_hash: BytesN<32>,
+        resolution_hash: BytesN<32>,
+        meta_uri: String,
+        category: Category,
+        close_time: u64,
+        seed_amount: i128,
+        initial_yes_bps: u32,
+    ) -> Result<u64, Error> {
         Self::assert_not_paused(&env)?;
         creator.require_auth();
 
+        let params =
+            Self::load_collateral_params(&env, &collateral).ok_or(Error::CollateralNotAllowed)?;
+        if !params.enabled {
+            return Err(Error::CollateralNotAllowed);
+        }
         if close_time <= env.ledger().timestamp() {
             return Err(Error::InvalidCloseTime);
         }
-        if !(MIN_SEED..=MAX_SETS).contains(&seed_amount) {
+        if !(params.min_seed..=params.max_sets).contains(&seed_amount) {
             return Err(Error::InvalidAmount);
         }
         if !(math::MIN_PROB_BPS..=math::MAX_PROB_BPS).contains(&initial_yes_bps) {
@@ -844,6 +1054,19 @@ impl MarketCore {
             lp_claimed: false,
         };
         Self::save_market(&env, id, &market);
+        Self::save_market_collateral(
+            &env,
+            id,
+            &MarketCollateralInfo {
+                token: collateral.clone(),
+                max_sets: params.max_sets,
+            },
+        );
+        MarketCollateralSet {
+            market_id: id,
+            collateral: collateral.clone(),
+        }
+        .publish(&env);
         Self::save_fee_terms(
             &env,
             id,
@@ -901,7 +1124,9 @@ impl MarketCore {
             market.close_time,
         );
 
-        Self::token(&env)?.transfer(&creator, env.current_contract_address(), &seed_amount);
+        let token_client = token::TokenClient::new(&env, &collateral);
+        token_client.transfer(&creator, env.current_contract_address(), &seed_amount);
+        Self::add_locked(&env, &collateral, seed_amount)?;
 
         MarketCreated {
             market_id: id,
@@ -1027,7 +1252,8 @@ impl MarketCore {
             q.new_reserve_other,
         )?;
         let new_sets = m.sets_minted.checked_add(q.net).ok_or(Error::Overflow)?;
-        if new_sets > MAX_SETS {
+        let info = Self::load_market_collateral(&env, market_id);
+        if new_sets > info.max_sets {
             return Err(Error::MarketTooLarge);
         }
 
@@ -1071,7 +1297,13 @@ impl MarketCore {
         }
 
         // interaction
-        Self::token(&env)?.transfer(&trader, env.current_contract_address(), &collateral_in);
+        let info = Self::load_market_collateral(&env, market_id);
+        token::TokenClient::new(&env, &info.token).transfer(
+            &trader,
+            env.current_contract_address(),
+            &collateral_in,
+        );
+        Self::add_locked(&env, &info.token, collateral_in)?;
 
         Trade {
             market_id,
@@ -1237,7 +1469,13 @@ impl MarketCore {
         }
 
         // interaction
-        Self::token(&env)?.transfer(&env.current_contract_address(), &trader, &collateral_out);
+        let info = Self::load_market_collateral(&env, market_id);
+        token::TokenClient::new(&env, &info.token).transfer(
+            &env.current_contract_address(),
+            &trader,
+            &collateral_out,
+        );
+        Self::sub_locked(&env, &info.token, collateral_out)?;
 
         Trade {
             market_id,
@@ -1337,7 +1575,13 @@ impl MarketCore {
             Self::save_settle(&env, market_id, &settle);
         }
         if payout > 0 {
-            Self::token(&env)?.transfer(&env.current_contract_address(), &holder, &payout);
+            let info = Self::load_market_collateral(&env, market_id);
+            token::TokenClient::new(&env, &info.token).transfer(
+                &env.current_contract_address(),
+                &holder,
+                &payout,
+            );
+            Self::sub_locked(&env, &info.token, payout)?;
         }
         Redeemed {
             market_id,
@@ -1377,7 +1621,13 @@ impl MarketCore {
             Self::save_settle(&env, market_id, &settle);
         }
         if payout > 0 {
-            Self::token(&env)?.transfer(&env.current_contract_address(), &creator, &payout);
+            let info = Self::load_market_collateral(&env, market_id);
+            token::TokenClient::new(&env, &info.token).transfer(
+                &env.current_contract_address(),
+                &creator,
+                &payout,
+            );
+            Self::sub_locked(&env, &info.token, payout)?;
         }
         PoolRemainderClaimed {
             market_id,
@@ -1408,6 +1658,7 @@ impl MarketCore {
         Self::validate_batch(&market_ids)?;
         let mut total: i128 = 0;
         let mut items: Vec<BatchItem> = Vec::new(&env);
+        let mut pending: Vec<(Address, i128)> = Vec::new(&env);
         for id in market_ids.iter() {
             let key = DataKey::Market(id);
             // Raw read: a market that ends up skipped must not pay a TTL
@@ -1454,6 +1705,11 @@ impl MarketCore {
                 Self::save_settle(&env, id, &settle);
             }
             total = total.checked_add(payout).ok_or(Error::Overflow)?;
+            if payout > 0 {
+                let info = Self::load_market_collateral(&env, id);
+                Self::add_pending(&mut pending, &info.token, payout);
+                Self::sub_locked(&env, &info.token, payout)?;
+            }
             Redeemed {
                 market_id: id,
                 holder: holder.clone(),
@@ -1466,9 +1722,7 @@ impl MarketCore {
                 status: BatchStatus::Settled,
             });
         }
-        if total > 0 {
-            Self::token(&env)?.transfer(&env.current_contract_address(), &holder, &total);
-        }
+        Self::flush_pending(&env, &pending, &holder);
         Ok(BatchResult { total, items })
     }
 
@@ -1485,6 +1739,7 @@ impl MarketCore {
         Self::validate_batch(&market_ids)?;
         let mut total: i128 = 0;
         let mut items: Vec<BatchItem> = Vec::new(&env);
+        let mut pending: Vec<(Address, i128)> = Vec::new(&env);
         for id in market_ids.iter() {
             let mut m = match env
                 .storage()
@@ -1526,6 +1781,11 @@ impl MarketCore {
                 Self::save_settle(&env, id, &settle);
             }
             total = total.checked_add(payout).ok_or(Error::Overflow)?;
+            if payout > 0 {
+                let info = Self::load_market_collateral(&env, id);
+                Self::add_pending(&mut pending, &info.token, payout);
+                Self::sub_locked(&env, &info.token, payout)?;
+            }
             PoolRemainderClaimed {
                 market_id: id,
                 creator: creator.clone(),
@@ -1538,9 +1798,7 @@ impl MarketCore {
                 status: BatchStatus::Settled,
             });
         }
-        if total > 0 {
-            Self::token(&env)?.transfer(&env.current_contract_address(), &creator, &total);
-        }
+        Self::flush_pending(&env, &pending, &creator);
         Ok(BatchResult { total, items })
     }
 
@@ -1610,7 +1868,13 @@ impl MarketCore {
         Self::save_settle(&env, market_id, &settle);
         Self::save_lp_fees(&env, market_id, 0);
         let treasury: Address = Self::instance_get(&env, &DataKey::Treasury)?;
-        Self::token(&env)?.transfer(&env.current_contract_address(), &treasury, &swept);
+        let info = Self::load_market_collateral(&env, market_id);
+        token::TokenClient::new(&env, &info.token).transfer(
+            &env.current_contract_address(),
+            &treasury,
+            &swept,
+        );
+        Self::sub_locked(&env, &info.token, swept)?;
         MarketFinalized {
             market_id,
             swept,
@@ -1632,7 +1896,12 @@ impl MarketCore {
             return Ok(0);
         }
         Self::save_lp_fees(&env, market_id, 0);
-        Self::token(&env)?.transfer(&env.current_contract_address(), &m.creator, &amount);
+        let info = Self::load_market_collateral(&env, market_id);
+        token::TokenClient::new(&env, &info.token).transfer(
+            &env.current_contract_address(),
+            &m.creator,
+            &amount,
+        );
         LpFeesClaimed {
             market_id,
             creator: m.creator.clone(),
@@ -1659,7 +1928,13 @@ impl MarketCore {
             Some(t) => t.recipient,
             None => Self::instance_get(&env, &DataKey::Treasury)?,
         };
-        Self::token(&env)?.transfer(&env.current_contract_address(), &recipient, &amount);
+        let info = Self::load_market_collateral(&env, market_id);
+        token::TokenClient::new(&env, &info.token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
+        Self::sub_locked(&env, &info.token, amount)?;
         FeesSwept { market_id, amount }.publish(&env);
         FeesSweptTo {
             market_id,
@@ -1984,9 +2259,93 @@ impl MarketCore {
             .ok_or(Error::NotInitialized)
     }
 
-    fn token(env: &Env) -> Result<token::TokenClient<'_>, Error> {
-        let addr: Address = Self::instance_get(env, &DataKey::Collateral)?;
-        Ok(token::TokenClient::new(env, &addr))
+    fn load_collateral_params(env: &Env, token: &Address) -> Option<CollateralParams> {
+        let key = DataKey::CollateralParams(token.clone());
+        let params: Option<CollateralParams> = env.storage().persistent().get(&key);
+        if params.is_some() {
+            ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
+        }
+        params
+    }
+
+    fn load_market_collateral(env: &Env, market_id: u64) -> MarketCollateralInfo {
+        let key = DataKey::MarketCollateral(market_id);
+        if let Some(info) = env.storage().persistent().get(&key) {
+            ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
+            return info;
+        }
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Collateral)
+            .unwrap_or_else(|| env.current_contract_address());
+        let max_sets = Self::load_collateral_params(env, &token)
+            .map(|p| p.max_sets)
+            .unwrap_or(MAX_SETS);
+        MarketCollateralInfo { token, max_sets }
+    }
+
+    fn save_market_collateral(env: &Env, market_id: u64, info: &MarketCollateralInfo) {
+        let key = DataKey::MarketCollateral(market_id);
+        env.storage().persistent().set(&key, info);
+        ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
+    }
+
+    fn market_token(env: &Env, market_id: u64) -> Address {
+        Self::load_market_collateral(env, market_id).token
+    }
+
+    fn add_locked(env: &Env, token: &Address, amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Ok(());
+        }
+        let key = DataKey::Locked(token.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&key, &current.checked_add(amount).ok_or(Error::Overflow)?);
+        ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
+        Ok(())
+    }
+
+    fn sub_locked(env: &Env, token: &Address, amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Ok(());
+        }
+        let key = DataKey::Locked(token.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        // LP fees and rounding dust are outside `Locked`, so a payout can
+        // legitimately exceed it; the floor keeps the solvency invariant
+        // `balance >= locked` one-sided and honest.
+        env.storage()
+            .persistent()
+            .set(&key, &current.saturating_sub(amount));
+        ttl::bump_persistent(env, &key, ttl::long_lived_target(env));
+        Ok(())
+    }
+
+    fn add_pending(pending: &mut Vec<(Address, i128)>, token: &Address, amount: i128) {
+        for i in 0..pending.len() {
+            let (t, a) = pending.get(i).unwrap();
+            if t == *token {
+                pending.set(i, (t, a.saturating_add(amount)));
+                return;
+            }
+        }
+        pending.push_back((token.clone(), amount));
+    }
+
+    fn flush_pending(env: &Env, pending: &Vec<(Address, i128)>, to: &Address) {
+        for i in 0..pending.len() {
+            let (token_addr, amount) = pending.get(i).unwrap();
+            if amount > 0 {
+                token::TokenClient::new(env, &token_addr).transfer(
+                    &env.current_contract_address(),
+                    to,
+                    &amount,
+                );
+            }
+        }
     }
 
     fn require_admin(env: &Env) -> Result<(), Error> {
@@ -2594,6 +2953,127 @@ mod test {
         assert_eq!(market.category, Category::Crypto);
         assert_eq!(market.status, MarketStatus::Open);
         assert!(client.get_price(&market_id, &Outcome::Yes) > 6000);
+    }
+
+    #[test]
+    fn default_collateral_is_allow_listed_and_locked_on_creation() {
+        let (env, client, creator, _, _, collateral) = setup_market();
+        let id = new_market(&env, &client, &creator, 5_000);
+        assert_eq!(client.get_market_collateral(&id), collateral);
+        assert_eq!(client.locked(&collateral), 100 * 10_000_000_i128);
+        let info = client.market_collateral_info(&id);
+        assert_eq!(info.token, collateral);
+        assert_eq!(info.max_sets, MAX_SETS);
+        assert!(client.collateral_params(&collateral).unwrap().enabled);
+    }
+
+    #[test]
+    fn create_with_unknown_collateral_is_rejected() {
+        let (env, client, creator, _, _, _) = setup_market();
+        let other = env
+            .register_stellar_asset_contract_v2(creator.clone())
+            .address();
+        let err = client.try_create_market_with_collateral(
+            &creator,
+            &other,
+            &BytesN::from_array(&env, &[9u8; 32]),
+            &BytesN::from_array(&env, &[10u8; 32]),
+            &String::from_str(&env, "ipfs://unknown-token"),
+            &Category::Crypto,
+            &(env.ledger().timestamp() + 60_000),
+            &(100 * 10_000_000_i128),
+            &5_000u32,
+        );
+        assert_eq!(err, Err(Ok(Error::CollateralNotAllowed)));
+    }
+
+    #[test]
+    fn custom_collateral_trades_and_locks_separately() {
+        let (env, client, creator, trader, _, default_token) = setup_market();
+        let custom = env.register_stellar_asset_contract_v2(creator.clone());
+        let custom_token = custom.address();
+        let custom_client = StellarAssetClient::new(&env, &custom_token);
+        custom_client.mint(&creator, &10_000_000_000_i128);
+        custom_client.mint(&trader, &10_000_000_000_i128);
+
+        client.add_collateral(
+            &custom_token,
+            &CollateralParams {
+                decimals: 7,
+                min_seed: 1_000_000_000,
+                max_sets: MAX_SETS,
+                enabled: true,
+            },
+        );
+        let id = client.create_market_with_collateral(
+            &creator,
+            &custom_token,
+            &BytesN::from_array(&env, &[11u8; 32]),
+            &BytesN::from_array(&env, &[12u8; 32]),
+            &String::from_str(&env, "ipfs://custom-token"),
+            &Category::Crypto,
+            &(env.ledger().timestamp() + 60_000),
+            &(100 * 10_000_000_i128),
+            &5_000u32,
+        );
+        assert_eq!(client.get_market_collateral(&id), custom_token);
+        assert_eq!(client.locked(&custom_token), 100 * 10_000_000_i128);
+        assert_eq!(client.locked(&default_token), 0);
+
+        let shares = client.buy(&trader, &id, &Outcome::Yes, &(10 * 10_000_000_i128), &0);
+        assert!(shares > 0);
+        assert_eq!(client.locked(&custom_token), 110 * 10_000_000_i128);
+        assert_eq!(client.locked(&default_token), 0);
+        assert_eq!(
+            TokenClient::new(&env, &default_token).balance(&client.address),
+            0
+        );
+    }
+
+    #[test]
+    fn disabling_collateral_blocks_new_markets_not_existing_trades() {
+        let (env, client, creator, trader, _, _) = setup_market();
+        let custom = env.register_stellar_asset_contract_v2(creator.clone());
+        let custom_token = custom.address();
+        let custom_client = StellarAssetClient::new(&env, &custom_token);
+        custom_client.mint(&creator, &10_000_000_000_i128);
+        custom_client.mint(&trader, &10_000_000_000_i128);
+        client.add_collateral(
+            &custom_token,
+            &CollateralParams {
+                decimals: 7,
+                min_seed: 1_000_000_000,
+                max_sets: MAX_SETS,
+                enabled: true,
+            },
+        );
+        let id = client.create_market_with_collateral(
+            &creator,
+            &custom_token,
+            &BytesN::from_array(&env, &[13u8; 32]),
+            &BytesN::from_array(&env, &[14u8; 32]),
+            &String::from_str(&env, "ipfs://disabled-token"),
+            &Category::Crypto,
+            &(env.ledger().timestamp() + 60_000),
+            &(100 * 10_000_000_i128),
+            &5_000u32,
+        );
+        client.set_collateral_enabled(&custom_token, &false);
+        // Existing markets can still trade and redeem, but no new market may
+        // select the disabled token.
+        assert!(client.buy(&trader, &id, &Outcome::Yes, &10_000_000_i128, &0) > 0);
+        let err = client.try_create_market_with_collateral(
+            &creator,
+            &custom_token,
+            &BytesN::from_array(&env, &[15u8; 32]),
+            &BytesN::from_array(&env, &[16u8; 32]),
+            &String::from_str(&env, "ipfs://disabled-token-2"),
+            &Category::Crypto,
+            &(env.ledger().timestamp() + 60_000),
+            &(100 * 10_000_000_i128),
+            &5_000u32,
+        );
+        assert_eq!(err, Err(Ok(Error::CollateralNotAllowed)));
     }
 
     #[test]
@@ -4061,7 +4541,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #24)")]
+    #[should_panic(expected = "Error(Contract, #28)")]
     fn finalize_before_deadline_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -4184,7 +4664,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #25)")]
+    #[should_panic(expected = "Error(Contract, #29)")]
     fn redeem_after_close_rejected() {
         let (env, client, creator, trader, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 6800, 60_000);
@@ -4205,7 +4685,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #25)")]
+    #[should_panic(expected = "Error(Contract, #29)")]
     fn claim_after_close_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -4219,7 +4699,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #25)")]
+    #[should_panic(expected = "Error(Contract, #29)")]
     fn finalize_twice_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -4233,7 +4713,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #26)")]
+    #[should_panic(expected = "Error(Contract, #30)")]
     fn legacy_market_cannot_finalize() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
