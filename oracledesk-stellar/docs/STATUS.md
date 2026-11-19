@@ -119,7 +119,7 @@ market-creation risk controls (#47), and Blend lending integration with JIT liqu
 are implemented on `feat/issues-45-46-47-48`.
 Key additions:
 - **Permissionless settlement (#45)**: `settle_market(caller, market_id)` allows anyone to settle resolved markets, recovering positions and LP remainders without hot agent keys. Graceful error handling for `market_core` errors (`NothingToRedeem`, `AlreadyClaimed`, `NotFinal`). Emits `MarketSettled`.
-- **Realized PnL & Drawdown Guard (#46)**: Full ledger tracking of cost and proceeds (`MarketPnl`), daily rolling window (`window_pnl`), and automatic `DrawdownPause` when losses exceed `max_drawdown`. Protects open positions by allowing reduce-only `agent_sell` in drawdown mode. Requires admin acknowledgement to resume.
+- **Realized PnL & Drawdown Guard (#46)**: Full ledger tracking of cost and proceeds (`MarketPnl`), daily rolling window (`window_pnl`), and an automatic drawdown halt when losses exceed `max_drawdown`. Protects open positions by allowing reduce-only `agent_sell` in drawdown mode. Since #272 a halt (`Mode::AgentsHalted`) stops agent openings only and is cleared by `resume_agents()`; see the operating-mode state machine below.
 - **Creation Policy (#47)**: `CreationPolicy` bounding `max_seed` independently of `max_trade`, rolling window creation rate limits, horizon constraints (`min_close_horizon`, `max_close_horizon`), and allowed categories bitmask. Tighten-only admin configuration updates.
 - **Blend Lending & JIT Liquidity (#48)**: Idle capital deployment to Blend pool, atomic shortfall withdrawal in `agent_buy` and `agent_create_market` via `ensure_liquid`, fail-closed error handling with `YieldWithdrawFailed`, and comprehensive capital views (`available_capital`, `liquid_capital`, `capital_breakdown`). Documented in `docs/adr/0006-blend-integration.md`.
 
@@ -500,3 +500,22 @@ The pinned x402 Stellar package declares Node >=22, so CI and the documented
 minimum now use Node 22. An additional isolated Node 20 smoke run passed the
 HTTP/SQLite tests but emitted dependency engine warnings and is not a supported
 runtime target.
+
+## Treasury operating modes (#272)
+
+The treasury's four pause/drawdown booleans are replaced by an explicit state
+machine (`ModeState`, derived `Mode`: `Normal`, `AgentsHalted`, `AdminPaused`,
+`Emergency`) and one gate table (`mode::allowed`), documented cell by cell in
+[ADR 0005](adr/0005-treasury-vault.md). What changed for operators:
+
+- A drawdown halt no longer opens `emergency_withdraw`. That exit needs an
+  explicit `declare_emergency`, which only works from an admin pause.
+- Admin pause and drawdown halt are independent: `unpause()` never clears a
+  halt, `resume_agents()` never clears a pause.
+- `resume_agents()` replaces `acknowledge_drawdown()` (now a no-op) plus the
+  unpause, and requires the window PnL to have recovered.
+- `close_trade` is refused while admin-paused (it is an agent reduction).
+- New events: `ModeChanged`. New views: `mode`, `mode_state`, `allowed`. New
+  errors: `EmergencyMode` (64), `NotRecovered` (65).
+- The mode x entrypoint matrix is an in-crate test (`mode_by_entrypoint_matrix`)
+  that fails when a new entrypoint has no row.

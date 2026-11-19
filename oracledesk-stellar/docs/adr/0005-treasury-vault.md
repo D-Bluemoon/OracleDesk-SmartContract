@@ -139,18 +139,105 @@ Tickets wait while capital stays deployed, which is bounded by the close
 times of the open markets. UIs can read `queue_reserved()`,
 `queue_bounds()` and `withdraw_ticket(id)`.
 
+### Operating modes and the gate table (#272)
+
+Before #272 the treasury tracked four booleans (`Paused`, `AdminPaused`,
+`DrawdownTripped`, `DrawdownAcknowledged`) and each entrypoint read a different
+combination of them. The most serious result: a drawdown trip (the agents lost
+money) set `Paused`, and `emergency_withdraw` checked only `Paused`, so an
+ordinary risk event opened the exit meant for "market-core is broken". Whoever
+left first took their share of idle collateral and forfeited their share of open
+positions to the stayers, so a trip started a run.
+
+The treasury now stores each *reason* it is not running normally on its own
+(`ModeState`), and derives one effective `Mode` with the priority
+`Emergency > AdminPaused > AgentsHalted > Normal`:
+
+| Reason | Set by | Cleared by | Auth |
+|---|---|---|---|
+| drawdown halt | `check_drawdown` (internal, on realized loss) | `resume_agents()` | admin, and only once the window PnL is back above `-max_drawdown` (or after `reset_pnl_window`) |
+| admin pause | `set_paused(true)` / `pause(reason)` | `set_paused(false)` / `unpause()` | admin (the timelock's emergency path calls `set_paused(true)`, ADR 0008) |
+| emergency | `declare_emergency(reason)`, only from `AdminPaused` | `end_emergency()` | admin (production: route through `timelock.schedule`) |
+
+Because the reasons are independent, clearing one never clears another:
+unpausing during a drawdown leaves the agents halted, and resuming the agents
+leaves an admin pause standing. `unpause` is refused while an emergency is
+declared. Every change emits `ModeChanged { from, to, reason, at }`, so off-chain
+monitors can tell *why* the treasury stopped. `acknowledge_drawdown` is a
+deprecated no-op (the error code `NotAcknowledged` stays allocated).
+
+Every state-changing entrypoint asks one function, `gate(Op)`, which is the
+exhaustive `mode::allowed(mode, op)` below (a new `Op` does not compile until it
+has a cell for every mode). A denied call returns `DrawdownTripped` (agents
+halted), `Paused` (admin pause) or `EmergencyMode`; `emergency_withdraw` outside
+an emergency returns `NotPaused` when running normally.
+
+| Op (entrypoints) | Normal | AgentsHalted | AdminPaused | Emergency |
+|---|---|---|---|---|
+| `Deposit` (`deposit`) | yes | no | no | no |
+| `RequestWithdraw` (`request_withdraw`) | yes | yes | yes | no |
+| `ClaimWithdraw` (`claim_withdraw`) | yes | yes | yes | yes |
+| `EmergencyWithdraw` (`emergency_withdraw`) | no | no | no | yes |
+| `AgentOpen` (`agent_create_market`, `agent_create_market_and_reveal`, `agent_buy`, `agent_buy_v2`) | yes | no | no | no |
+| `AgentReduce` (`agent_sell`, `agent_sell_v2`, `close_trade`) | yes | yes | no | no |
+| `AgentSettle` (`redeem`, `claim_pool_remainder`, `legacy_*`, `redeem_many`, `claim_pool_remainders`, `agent_claim_lp_fees`) | yes | yes | yes | yes |
+| `PermissionlessSettle` (`settle_market`, `realize`, `collect_market_fees`) | yes | yes | yes | yes |
+| `YieldAllocate` (`allocate_to_yield`) | yes | no | no | no |
+| `YieldRecall` (`recall_from_yield`) | yes | yes | yes | yes |
+| `AdminWithdraw` (`withdraw`) | yes | no | no | no |
+| `Migrate` (`migrate_market`) | yes | no | no | yes |
+
+Depositor exit rights, mode by mode:
+
+- **Normal.** Everything runs. A depositor exits through `request_withdraw` (paid
+  at NAV, the remainder queued FIFO) and `claim_withdraw`.
+- **AgentsHalted** (drawdown). Only *openings* stop: agents cannot create markets
+  or buy, and the yield venue takes no new allocation, because a halt means the
+  agents lost money and NAV is in doubt. Reductions (`agent_sell`, `close_trade`)
+  and every settlement stay open, so positions can be unwound. Deposits close
+  (a new depositor would buy in at a NAV nobody trusts yet). The depositor's
+  exit is unchanged, and `emergency_withdraw` stays closed: opening the forfeiting
+  exit on a risk event is the bug this section fixes, and it would hand the first
+  leavers a larger share at the stayers' expense.
+- **AdminPaused.** Deposits and all agent trading close (including reductions:
+  an admin pause is a "stop touching things" lever). Settlement, recalls from the
+  yield venue and queued withdrawals (`request_withdraw`, `claim_withdraw`) stay
+  open, because they only bring collateral home or honour what was already
+  priced. `emergency_withdraw` is still closed.
+- **Emergency.** Entered only from `AdminPaused`, so one admin call cannot flip
+  straight into the forfeiting exit (with the timelock as admin the extra step is
+  delayed too). `emergency_withdraw` opens: the owner is paid their share of free
+  idle collateral (`idle - queue_reserved`, as before, so tickets that already
+  exist stay covered) and forfeits their share of open positions. New
+  `request_withdraw` closes, because a new request is priced at a NAV that
+  `emergency_withdraw` makes meaningless; tickets that already exist stay
+  claimable. `migrate_market` is open so positions can be moved to a successor.
+- **Settlement is open in every mode.** `settle_market`, `realize`, `redeem`,
+  `claim_pool_remainder` and `collect_market_fees` only bring collateral home. In
+  particular a drawdown can trip *inside* `settle_market`/`realize`; the halt is
+  recorded and the call that tripped it still succeeds.
+
+`mode()`, `mode_state()` and `allowed(op)` are views for agents and frontends to
+pre-check (the agent runtime reads `mode()` once per tick and skips open-position
+tasks unless it is `Normal`). The pre-#272 flags are read as a fallback when
+`ModeState` is absent (`DrawdownTripped` becomes a halt; `AdminPaused`, or a bare
+`Paused` from a pre-#46 deployment, becomes an admin pause with reason `legacy`)
+and are deleted on the first write; the treasury has no upgrade entrypoint, so
+existing deployments move by redeploying.
+
 ### Custody migration
 
 - The constructor mints any balance the treasury already holds to `admin` as
   shares.
 - A stored pre-vault config is migrated lazily and does the same with the
   balance it finds.
-- Admin `withdraw` is removed. The admin is an ordinary shareholder.
-- `emergency_withdraw(owner, shares)` works only while paused. It pays the
-  owner their pro-rata part of free idle collateral without reading
-  market-core, for the case where market-core is what broke. The owner
-  forfeits their part of open positions, which stays with the remaining
-  shareholders.
+- Admin `withdraw` still exists (idle collateral only, subject to
+  `ensure_liquid`), but the admin is otherwise an ordinary shareholder. It is
+  closed whenever the treasury is not in `Normal` (see the gate table below).
+- `emergency_withdraw(owner, shares)` works only in `Mode::Emergency` (below).
+  It pays the owner their pro-rata part of free idle collateral without reading
+  market-core, for the case where market-core is what broke. The owner forfeits
+  their part of open positions, which stays with the remaining shareholders.
 
 The treasury has no upgrade path, so existing deployments move by
 redeploying:

@@ -572,9 +572,10 @@ donation-based share inflation; deposits must be at least `MIN_DEPOSIT`
 collateral allows and queues the remainder as a FIFO ticket;
 `claim_withdraw(ticket)` (permissionless, pays the owner) settles the head
 ticket as capital returns, and agents can never spend `queue_reserved()`.
-While paused, `emergency_withdraw` pays shareholders their pro-rata part of
-free idle collateral without touching market-core. See
-[ADR 0005](adr/0005-treasury-vault.md).
+In `Mode::Emergency` (declared by the admin, only from an admin pause),
+`emergency_withdraw` pays shareholders their pro-rata part of free idle
+collateral without touching market-core; a drawdown halt or an ordinary pause
+never opens it. See [ADR 0005](adr/0005-treasury-vault.md), "Operating modes".
 
 **Migration to a successor treasury.** The treasury has no upgrade path, so
 redeploying it (a bug fix, or anything the timelocked setters above do not
@@ -632,8 +633,8 @@ any, claims the LP remainder if the treasury created the market, marks market ex
 closed (`open = false`), and records realized proceeds under `Realized(market_id)`.
 Calls to `market-core` use generated `try_` client methods so expected core errors
 (`NothingToRedeem`, `AlreadyClaimed`, `NotFinal`) map cleanly to 0 or distinct treasury
-errors without unhandled transaction aborts. Settlement operates even when the treasury
-is paused (stopping trading, not fund recovery).
+errors without unhandled transaction aborts. Settlement operates in every operating mode
+(stopping trading, not fund recovery).
 
 **Realized PnL & auto-pause on drawdown (#46).** Cumulative losses across markets
 are bounded by an automated drawdown guard. The treasury tracks collateral cost
@@ -641,9 +642,11 @@ are bounded by an automated drawdown guard. The treasury tracks collateral cost
 (`MarketPnl`). PnL is realized once a market is final and all positions/LP claims are settled
 (or via permissionless `realize(market_id)` for pre-close exits). A rolling window of daily
 buckets advances lazily, summing net realized PnL across `window_days`. If `window_pnl < -max_drawdown`,
-the contract trips into drawdown pause (`DrawdownTripped` instance flag, emitting `DrawdownPause`).
-In this mode, buys and creations are blocked, but `agent_sell` remains open (reduce-only) to avoid
-trapping positions. Resuming requires admin `acknowledge_drawdown()` before unpausing. Third parties
+the contract records a drawdown halt in `ModeState` (emitting `DrawdownPause` and `ModeChanged`).
+In `Mode::AgentsHalted`, buys and creations are blocked, but `agent_sell` and `close_trade` remain
+open (reduce-only) to avoid trapping positions, and depositors keep their normal exit; the halt does
+**not** open `emergency_withdraw`. Resuming is `resume_agents()` (admin), allowed only once the window PnL
+has recovered or after `reset_pnl_window`, and it leaves any admin pause standing. Third parties
 triggering settlements cannot manipulate loss magnitude, only realization timing. Protocol fees and
 external donations are strictly excluded from PnL accounting.
 
@@ -691,7 +694,7 @@ behaviour is covered by each contract's own tests.
 | I2 per market | Cumulative agent spend into one market, seed included, is at most `max_market`, for the market's whole life: it is never freed by sells or `close_trade`. `MarketExposure.amount` equals the observed sum of spends. |
 | I3 daily | The treasury's reported window (`daily_usage`) never exceeds `max_daily` and equals the spends observed since its reported start. |
 | I4 sliding 24h | In **any** interval `[t, t + 86_400)` the agent spends at most `max_daily`. The window is hourly buckets summed over the trade's hour and the 24 hours before it: effectively 24-25h, conservative and never permissive. |
-| I5 pause | While the admin has paused, `agent_buy`, `agent_create_market` and `agent_sell` all fail with `Paused`. `close_trade`, `redeem` and `claim_pool_remainder` stay callable: they spend nothing and return capital. (An automatic drawdown pause differs: reduce-only sells stay allowed; not part of this search.) |
+| I5 pause | While the admin has paused, `agent_buy`, `agent_create_market`, `agent_sell` and `close_trade` all fail with `Paused`. `redeem` and `claim_pool_remainder` stay callable: they spend nothing and return capital. (A drawdown halt differs: reduce-only sells and `close_trade` stay allowed; not part of this search.) |
 | I6 accounting | Treasury token balance = initial - Σ spends + Σ returns (sells, redeems, claims), from the operations' own parameters. |
 | I7 sell neutrality | `agent_sell` changes neither the daily window nor any `MarketExposure`. |
 | I8 | Net exposure stays within `max_net_exposure`. |

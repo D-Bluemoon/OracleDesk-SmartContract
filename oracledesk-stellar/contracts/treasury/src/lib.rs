@@ -1,5 +1,8 @@
 #![no_std]
 
+mod mode;
+pub use mode::{allowed, Mode, ModeState, Op};
+
 use soroban_sdk::{
     auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
@@ -460,6 +463,7 @@ pub enum DataKey {
     /// Legacy fixed-window `DailyUsage`; migrated into `UsageWindow` and
     /// removed on the first trade after an upgrade.
     Daily,
+    /// Legacy flag (see `DrawdownTripped`).
     Paused,
     Successor,
     UsageWindow,
@@ -499,13 +503,19 @@ pub enum DataKey {
     Pnl(u64),
     DrawdownCfg,
     PnlDays,
+    /// Legacy flag, read only as a fallback by `load_mode_state` and deleted on
+    /// the first mode write (issue #272).
     DrawdownTripped,
+    /// Legacy flag (see `DrawdownTripped`).
     DrawdownAcknowledged,
+    /// Legacy flag (see `DrawdownTripped`).
     AdminPaused,
     CreationPolicy,
     CreationBuckets,
     YieldVenue,
     YieldPrincipal,
+    /// The operating mode's independent reasons ([`ModeState`], issue #272).
+    ModeState,
 }
 
 /// Note that market-core errors reach callers of treasury entrypoints with
@@ -578,6 +588,12 @@ pub enum Error {
     /// `agent_create_market_and_reveal` was given a malformed resolution
     /// envelope or a rule outside the two primary modes (#64).
     InvalidResolution = 63,
+    /// The treasury is in `Mode::Emergency`: only settlement, claiming existing
+    /// withdrawal tickets and `emergency_withdraw` are open (#272).
+    EmergencyMode = 64,
+    /// `resume_agents`: the realized window PnL has not recovered above
+    /// `-max_drawdown` (reset the window or wait for old losses to expire) (#272).
+    NotRecovered = 65,
     // ---- market-core errors, mirrored by `map_core_error` (#60). A distinct
     // code per market-core error keeps the cause visible to the caller; the
     // 2000s are the canonical cross-contract range (ADR 0004).
@@ -825,6 +841,20 @@ pub struct DrawdownPause {
     pub triggered_by_market: u64,
 }
 
+/// Every change to the operating mode's reasons (#272). `from`/`to` are the
+/// effective modes; they are equal when a reason was added or cleared under a
+/// higher-priority one (e.g. a drawdown trips while the admin pause stands).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModeChanged {
+    pub from: Mode,
+    pub to: Mode,
+    /// `drawdown`, `resume`, `admin`, `unpause`, `legacy`, `emergency`,
+    /// `end_emerg`, or the admin's own reason for `pause` / `declare_emergency`.
+    pub reason: Symbol,
+    pub at: u64,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PnlWindowReset {
@@ -993,10 +1023,7 @@ impl Treasury {
             &DataKey::UsageWindow,
             &Self::empty_window(&env, env.ledger().timestamp() / BUCKET_SECONDS),
         );
-        storage.set(&DataKey::Paused, &false);
-        storage.set(&DataKey::AdminPaused, &false);
-        storage.set(&DataKey::DrawdownTripped, &false);
-        storage.set(&DataKey::DrawdownAcknowledged, &false);
+        storage.set(&DataKey::ModeState, &ModeState::normal());
         storage.set(
             &DataKey::DrawdownCfg,
             &DrawdownConfig {
@@ -1149,24 +1176,128 @@ impl Treasury {
         })
     }
 
+    // ----- operating mode (issue #272) -------------------------------------------
+    // `ModeState` holds each reason the treasury is not running normally; the
+    // effective `Mode` is derived from them (Emergency > AdminPaused >
+    // AgentsHalted > Normal). Every state-changing entrypoint asks `gate` (the
+    // `allowed` table in `mode.rs`); ADR 0005 explains each cell. Admin pause
+    // and drawdown halt are independent: clearing one never clears the other.
+
+    /// `set_paused(true)` is `pause(admin)`, `set_paused(false)` is `unpause()`.
+    /// Kept for the timelock's emergency path (ADR 0008), which calls
+    /// `set_paused(true)`.
     pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
-        Self::require_admin(&env)?;
-        let storage = env.storage().instance();
         if paused {
-            storage.set(&DataKey::Paused, &true);
-            storage.set(&DataKey::AdminPaused, &true);
+            let reason = Symbol::new(&env, "admin");
+            Self::pause(env, reason)
         } else {
-            if storage.get(&DataKey::DrawdownTripped).unwrap_or(false) {
-                if !storage.get(&DataKey::DrawdownAcknowledged).unwrap_or(false) {
-                    return Err(Error::NotAcknowledged);
-                }
-                storage.set(&DataKey::DrawdownTripped, &false);
-                storage.set(&DataKey::DrawdownAcknowledged, &false);
-            }
-            storage.set(&DataKey::Paused, &false);
-            storage.set(&DataKey::AdminPaused, &false);
+            Self::unpause(env)
         }
+    }
+
+    /// Admin pause: no deposits and no agent trading (settlement, queued
+    /// withdrawals and recalls stay open). Idempotent.
+    pub fn pause(env: Env, reason: Symbol) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let mut state = Self::load_mode_state(&env);
+        if state.admin_pause_at.is_some() {
+            return Ok(());
+        }
+        let from = state.mode();
+        state.admin_pause_at = Some(env.ledger().timestamp());
+        state.admin_pause_reason = Some(reason.clone());
+        Self::save_mode_state(&env, &state, from, reason);
         Ok(())
+    }
+
+    /// Clears the admin pause only. A drawdown halt, if any, stands, so the
+    /// agents stay halted; clear it with `resume_agents`. Refused while an
+    /// emergency is declared (`end_emergency` first).
+    pub fn unpause(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let mut state = Self::load_mode_state(&env);
+        if state.emergency_at.is_some() {
+            return Err(Error::EmergencyMode);
+        }
+        if state.admin_pause_at.is_none() {
+            return Ok(());
+        }
+        let from = state.mode();
+        state.admin_pause_at = None;
+        state.admin_pause_reason = None;
+        Self::save_mode_state(&env, &state, from, Symbol::new(&env, "unpause"));
+        Ok(())
+    }
+
+    /// Clears a drawdown halt. Allowed only once the realized window PnL is back
+    /// above `-max_drawdown` (waiting for old losses to leave the window, or an
+    /// explicit `reset_pnl_window`), so an admin cannot simply wave a real loss
+    /// through. Leaves any admin pause or emergency untouched. Replaces
+    /// `acknowledge_drawdown` + `set_paused(false)`.
+    pub fn resume_agents(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let mut state = Self::load_mode_state(&env);
+        if state.drawdown_halt.is_none() {
+            return Err(Error::NotPaused);
+        }
+        let cfg = Self::load_drawdown_cfg(&env)?;
+        if Self::calc_window_pnl(&env)? < -cfg.max_drawdown {
+            return Err(Error::NotRecovered);
+        }
+        let from = state.mode();
+        state.drawdown_halt = None;
+        Self::save_mode_state(&env, &state, from, Symbol::new(&env, "resume"));
+        Ok(())
+    }
+
+    /// Declares an emergency: opens `emergency_withdraw` (the idle-only,
+    /// position-forfeiting exit) and closes new withdrawal requests. Only from
+    /// `AdminPaused`, so one admin call cannot flip straight into the forfeiting
+    /// exit; with the timelock as admin the extra step is delayed too.
+    pub fn declare_emergency(env: Env, reason: Symbol) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let mut state = Self::load_mode_state(&env);
+        match state.mode() {
+            Mode::Emergency => return Ok(()),
+            Mode::AdminPaused => {}
+            Mode::Normal | Mode::AgentsHalted => return Err(Error::NotPaused),
+        }
+        state.emergency_at = Some(env.ledger().timestamp());
+        state.emergency_reason = Some(reason.clone());
+        Self::save_mode_state(&env, &state, Mode::AdminPaused, reason);
+        Ok(())
+    }
+
+    /// Ends the emergency. The admin pause stands (`AdminPaused`); `unpause`
+    /// then resumes. In production route it through `timelock.schedule`.
+    pub fn end_emergency(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let mut state = Self::load_mode_state(&env);
+        if state.emergency_at.is_none() {
+            return Err(Error::NotPaused);
+        }
+        let from = state.mode();
+        state.emergency_at = None;
+        state.emergency_reason = None;
+        Self::save_mode_state(&env, &state, from, Symbol::new(&env, "end_emerg"));
+        Ok(())
+    }
+
+    /// The effective operating mode.
+    pub fn mode(env: Env) -> Mode {
+        Self::load_mode_state(&env).mode()
+    }
+
+    /// Each stored reason (drawdown halt, admin pause, emergency) with when it
+    /// began and, for the admin's, why.
+    pub fn mode_state(env: Env) -> ModeState {
+        Self::load_mode_state(&env)
+    }
+
+    /// Whether `op` is permitted in the current mode: the gate's answer, for
+    /// agents and frontends to pre-check.
+    pub fn allowed(env: Env, op: Op) -> bool {
+        allowed(Self::load_mode_state(&env).mode(), op)
     }
 
     // ----- agent registry ------------------------------------------------------
@@ -1581,7 +1712,7 @@ impl Treasury {
     /// Deposits `amount` of collateral and mints shares to `from` at the NAV
     /// as it was before the deposit. Returns the shares minted.
     pub fn deposit(env: Env, from: Address, amount: i128) -> Result<i128, Error> {
-        Self::assert_not_paused(&env)?;
+        Self::gate(&env, Op::Deposit)?;
         let global = Self::load_global(&env)?;
         from.require_auth();
         if amount <= 0 {
@@ -1614,6 +1745,7 @@ impl Treasury {
     pub fn request_withdraw(env: Env, owner: Address, shares: i128) -> Result<(i128, u64), Error> {
         let global = Self::load_global(&env)?;
         owner.require_auth();
+        Self::gate(&env, Op::RequestWithdraw)?;
         if shares <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -1674,6 +1806,7 @@ impl Treasury {
     /// allows. Permissionless: the money always goes to the ticket's owner.
     /// Only the head ticket can be paid (`NothingToPay` for later ones).
     pub fn claim_withdraw(env: Env, ticket_id: u64) -> Result<i128, Error> {
+        Self::gate(&env, Op::ClaimWithdraw)?;
         let global = Self::load_global(&env)?;
         let key = DataKey::Ticket(ticket_id);
         let mut ticket: WithdrawTicket = env
@@ -1707,16 +1840,16 @@ impl Treasury {
         Ok(amount)
     }
 
-    /// While paused only: burns `shares` for their pro-rata part of the free
-    /// idle collateral, without reading market-core (for when it is the
-    /// thing that broke). The owner forfeits their part of open positions,
-    /// which stays with the remaining shareholders.
+    /// `Mode::Emergency` only (`declare_emergency`, itself only from an admin
+    /// pause): burns `shares` for their pro-rata part of the free idle
+    /// collateral, without reading market-core (for when it is the thing that
+    /// broke). The owner forfeits their part of open positions, which stays with
+    /// the remaining shareholders. A drawdown halt or an ordinary admin pause
+    /// never opens it: the normal queued exit pays at NAV (ADR 0005).
     pub fn emergency_withdraw(env: Env, owner: Address, shares: i128) -> Result<i128, Error> {
         let global = Self::load_global(&env)?;
         owner.require_auth();
-        if !Self::is_paused(&env) {
-            return Err(Error::NotPaused);
-        }
+        Self::gate(&env, Op::EmergencyWithdraw)?;
         if shares <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -1771,7 +1904,7 @@ impl Treasury {
         seed_amount: i128,
         initial_yes_bps: u32,
     ) -> Result<u64, Error> {
-        Self::assert_not_paused(&env)?;
+        Self::gate(&env, Op::AgentOpen)?;
         let global = Self::load_global(&env)?;
         let policy = Self::require_agent(&env, &agent, ROLE_CREATE)?;
         if seed_amount <= 0 {
@@ -1845,6 +1978,7 @@ impl Treasury {
         initial_yes_bps: u32,
         spec_v2: ResolutionSpecV2,
     ) -> Result<u64, Error> {
+        Self::gate(&env, Op::AgentOpen)?;
         let resolution_hash = Self::resolve_commitment(&env, &spec_v2)?;
         let market_id = Self::agent_create_market(
             env.clone(),
@@ -1964,6 +2098,7 @@ impl Treasury {
     /// move funds or free either the cumulative per-market cap or net
     /// headroom.
     pub fn close_trade(env: Env, agent: Address, market_id: u64) -> Result<i128, Error> {
+        Self::gate(&env, Op::AgentReduce)?;
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
         let core = global.market_core;
@@ -1981,6 +2116,7 @@ impl Treasury {
     /// Redeems the treasury's position in a resolved/voided market
     /// (`ROLE_SETTLE`).
     pub fn redeem(env: Env, agent: Address, market_id: u64) -> Result<i128, Error> {
+        Self::gate(&env, Op::AgentSettle)?;
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
         Self::settle_redeem(&env, &global.market_core, market_id)
@@ -1989,6 +2125,7 @@ impl Treasury {
     /// Claims the LP pool remainder for a market the treasury created
     /// (`ROLE_SETTLE`).
     pub fn claim_pool_remainder(env: Env, agent: Address, market_id: u64) -> Result<i128, Error> {
+        Self::gate(&env, Op::AgentSettle)?;
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
         Self::settle_claim(&env, &global.market_core, market_id)
@@ -2002,6 +2139,7 @@ impl Treasury {
         core: Address,
         market_id: u64,
     ) -> Result<i128, Error> {
+        Self::gate(&env, Op::AgentSettle)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
         Self::require_legacy(&env, &core)?;
         Self::settle_redeem(&env, &core, market_id)
@@ -2014,6 +2152,7 @@ impl Treasury {
         core: Address,
         market_id: u64,
     ) -> Result<i128, Error> {
+        Self::gate(&env, Op::AgentSettle)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
         Self::require_legacy(&env, &core)?;
         Self::settle_claim(&env, &core, market_id)
@@ -2031,6 +2170,7 @@ impl Treasury {
         agent: Address,
         market_ids: Vec<u64>,
     ) -> Result<BatchResult, Error> {
+        Self::gate(&env, Op::AgentSettle)?;
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
         let treasury_addr = env.current_contract_address();
@@ -2048,6 +2188,7 @@ impl Treasury {
         agent: Address,
         market_ids: Vec<u64>,
     ) -> Result<BatchResult, Error> {
+        Self::gate(&env, Op::AgentSettle)?;
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
         let treasury_addr = env.current_contract_address();
@@ -2059,6 +2200,7 @@ impl Treasury {
     /// (`ROLE_SETTLE`). The LP portion accrues separately on market-core
     /// (see its `claim_lp_fees`).
     pub fn agent_claim_lp_fees(env: Env, agent: Address, market_id: u64) -> Result<i128, Error> {
+        Self::gate(&env, Op::AgentSettle)?;
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
         let amount = core_call(
@@ -2077,6 +2219,7 @@ impl Treasury {
     /// moment they arrive.
     pub fn collect_market_fees(env: Env, market_id: u64) -> Result<i128, Error> {
         Self::require_admin(&env)?;
+        Self::gate(&env, Op::PermissionlessSettle)?;
         let global = Self::load_global(&env)?;
         let amount =
             core_call(MarketCoreClient::new(&env, &global.market_core).try_sweep_fees(&market_id))?;
@@ -2093,6 +2236,7 @@ impl Treasury {
         caller: Address,
         market_id: u64,
     ) -> Result<SettlementReport, Error> {
+        Self::gate(&env, Op::PermissionlessSettle)?;
         caller.require_auth();
         let mut r = Self::load_realized(&env, market_id);
         if r.settled {
@@ -2184,6 +2328,7 @@ impl Treasury {
     }
 
     pub fn realize(env: Env, market_id: u64) -> Result<(), Error> {
+        Self::gate(&env, Op::PermissionlessSettle)?;
         let global = Self::load_global(&env)?;
         Self::try_realize(&env, &global.market_core, market_id)
     }
@@ -2199,11 +2344,7 @@ impl Treasury {
     pub fn drawdown_status(env: Env) -> Result<DrawdownStatus, Error> {
         let cfg = Self::load_drawdown_cfg(&env)?;
         let wpnl = Self::calc_window_pnl(&env)?;
-        let tripped = env
-            .storage()
-            .instance()
-            .get(&DataKey::DrawdownTripped)
-            .unwrap_or(false);
+        let tripped = Self::load_mode_state(&env).drawdown_halt.is_some();
         Ok(DrawdownStatus {
             tripped,
             window_pnl: wpnl,
@@ -2211,12 +2352,10 @@ impl Treasury {
         })
     }
 
+    /// Deprecated no-op, kept so existing callers and bindings keep working:
+    /// acknowledging is no longer a separate step. Use `resume_agents`.
     pub fn acknowledge_drawdown(env: Env) -> Result<(), Error> {
         Self::require_admin(&env)?;
-        let storage = env.storage().instance();
-        if storage.get(&DataKey::DrawdownTripped).unwrap_or(false) {
-            storage.set(&DataKey::DrawdownAcknowledged, &true);
-        }
         Ok(())
     }
 
@@ -2331,6 +2470,7 @@ impl Treasury {
 
     pub fn allocate_to_yield(env: Env, amount: i128) -> Result<(), Error> {
         Self::require_admin(&env)?;
+        Self::gate(&env, Op::YieldAllocate)?;
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -2385,6 +2525,7 @@ impl Treasury {
 
     pub fn recall_from_yield(env: Env, amount: i128) -> Result<(), Error> {
         Self::require_admin(&env)?;
+        Self::gate(&env, Op::YieldRecall)?;
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -2442,6 +2583,7 @@ impl Treasury {
 
     pub fn withdraw(env: Env, to: Address, amount: i128) -> Result<(), Error> {
         Self::require_admin(&env)?;
+        Self::gate(&env, Op::AdminWithdraw)?;
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -2491,6 +2633,7 @@ impl Treasury {
     /// token transfer in `agent_buy`, see `docs/adr/0002-treasury-nested-auth.md`).
     pub fn migrate_market(env: Env, market_id: u64) -> Result<(), Error> {
         Self::require_admin(&env)?;
+        Self::gate(&env, Op::Migrate)?;
         let successor: Address = env
             .storage()
             .instance()
@@ -2555,22 +2698,69 @@ impl Treasury {
         Ok(())
     }
 
-    fn is_paused(env: &Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
+    /// The stored reasons, falling back to the pre-#272 flags when the
+    /// `ModeState` key is absent. A deployment that predates #272 cannot be
+    /// upgraded in place (ADR 0005) and moves by redeploying, so this only has
+    /// to read the flags if they are present:
+    /// - `DrawdownTripped` becomes a drawdown halt;
+    /// - `AdminPaused`, or a bare `Paused` with neither other flag (a pre-#46
+    ///   deployment), becomes an admin pause with reason `legacy`.
+    /// The legacy timestamp is 0: it was never recorded.
+    fn load_mode_state(env: &Env) -> ModeState {
+        let storage = env.storage().instance();
+        if let Some(state) = storage.get::<_, ModeState>(&DataKey::ModeState) {
+            return state;
+        }
+        let flag = |k: &DataKey| storage.get::<_, bool>(k).unwrap_or(false);
+        let tripped = flag(&DataKey::DrawdownTripped);
+        let admin = flag(&DataKey::AdminPaused) || (flag(&DataKey::Paused) && !tripped);
+        ModeState {
+            drawdown_halt: if tripped { Some(0) } else { None },
+            admin_pause_at: if admin { Some(0) } else { None },
+            admin_pause_reason: if admin {
+                Some(Symbol::new(env, "legacy"))
+            } else {
+                None
+            },
+            emergency_at: None,
+            emergency_reason: None,
+        }
     }
 
-    fn assert_not_paused(env: &Env) -> Result<(), Error> {
+    /// Persists `state`, deletes the legacy flags (first write migrates), and
+    /// emits `ModeChanged { from, to: state.mode(), reason }`.
+    fn save_mode_state(env: &Env, state: &ModeState, from: Mode, reason: Symbol) {
         let storage = env.storage().instance();
-        if storage.get(&DataKey::Paused).unwrap_or(false) {
-            if storage.get(&DataKey::DrawdownTripped).unwrap_or(false) {
-                return Err(Error::DrawdownTripped);
-            }
-            return Err(Error::Paused);
+        storage.set(&DataKey::ModeState, state);
+        storage.remove(&DataKey::Paused);
+        storage.remove(&DataKey::AdminPaused);
+        storage.remove(&DataKey::DrawdownTripped);
+        storage.remove(&DataKey::DrawdownAcknowledged);
+        ModeChanged {
+            from,
+            to: state.mode(),
+            reason,
+            at: env.ledger().timestamp(),
         }
-        Ok(())
+        .publish(env);
+    }
+
+    /// The one gate. Every state-changing entrypoint calls this with its [`Op`]
+    /// (the table is `mode::allowed`). The error says why the treasury is not
+    /// accepting `op`: `DrawdownTripped` (agents halted), `Paused` (admin pause),
+    /// `EmergencyMode`, or, for `EmergencyWithdraw` outside an emergency while
+    /// running normally, `NotPaused`.
+    fn gate(env: &Env, op: Op) -> Result<(), Error> {
+        let mode = Self::load_mode_state(env).mode();
+        if allowed(mode, op) {
+            return Ok(());
+        }
+        Err(match mode {
+            Mode::Normal => Error::NotPaused,
+            Mode::AgentsHalted => Error::DrawdownTripped,
+            Mode::AdminPaused => Error::Paused,
+            Mode::Emergency => Error::EmergencyMode,
+        })
     }
 
     fn put_persistent<V: IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &DataKey, value: &V) {
@@ -2837,7 +3027,7 @@ impl Treasury {
         min_shares_out: i128,
         bound: Option<(u32, u64)>,
     ) -> Result<i128, Error> {
-        Self::assert_not_paused(&env)?;
+        Self::gate(&env, Op::AgentOpen)?;
         let global = Self::load_global(&env)?;
         let policy = Self::require_agent(&env, &agent, ROLE_TRADE)?;
         Self::check_trade_size(&global, &policy, collateral_in)?;
@@ -2902,15 +3092,7 @@ impl Treasury {
         max_shares_in: i128,
         bound: Option<(u32, u64)>,
     ) -> Result<i128, Error> {
-        let storage = env.storage().instance();
-        if storage.get(&DataKey::AdminPaused).unwrap_or(false) {
-            return Err(Error::Paused);
-        }
-        if storage.get(&DataKey::Paused).unwrap_or(false)
-            && !storage.get(&DataKey::DrawdownTripped).unwrap_or(false)
-        {
-            return Err(Error::Paused);
-        }
+        Self::gate(&env, Op::AgentReduce)?;
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_TRADE)?;
         let prices = Self::load_price_policy(&env);
@@ -3876,11 +4058,13 @@ impl Treasury {
         let wpnl = Self::calc_window_pnl(env)?;
         let cfg = Self::load_drawdown_cfg(env)?;
         if wpnl < -cfg.max_drawdown {
-            let storage = env.storage().instance();
-            if !storage.get(&DataKey::DrawdownTripped).unwrap_or(false) {
-                storage.set(&DataKey::Paused, &true);
-                storage.set(&DataKey::DrawdownTripped, &true);
-                storage.set(&DataKey::DrawdownAcknowledged, &false);
+            let mut state = Self::load_mode_state(env);
+            if state.drawdown_halt.is_none() {
+                // Halts agents only; settlement (including the call that
+                // tripped this) stays open in every mode.
+                let from = state.mode();
+                state.drawdown_halt = Some(env.ledger().timestamp());
+                Self::save_mode_state(env, &state, from, Symbol::new(env, "drawdown"));
                 let now_day = env.ledger().timestamp() / DAY_SECONDS;
                 let window_start_day = now_day.saturating_sub((cfg.window_days - 1) as u64);
                 DrawdownPause {
@@ -6702,14 +6886,22 @@ mod test {
     }
 
     #[test]
-    fn emergency_withdraw_only_while_paused_and_pro_rata_of_idle() {
+    fn emergency_withdraw_only_in_emergency() {
         let (f, alice, _) = deployed_vault();
         let shares = f.treasury.shares_of(&alice);
+        // Normal: no exit by this path.
         assert_eq!(
             f.treasury.try_emergency_withdraw(&alice, &shares),
             Err(Ok(Error::NotPaused))
         );
+        // An ordinary admin pause does not open it either.
         f.treasury.set_paused(&true);
+        assert_eq!(
+            f.treasury.try_emergency_withdraw(&alice, &shares),
+            Err(Ok(Error::Paused))
+        );
+        // Only an explicit emergency does.
+        f.treasury.declare_emergency(&Symbol::new(&f.env, "core_down"));
         let supply = f.treasury.total_shares();
         let expected = shares * (10 * USDC) / (supply + VIRTUAL_SHARES);
         assert_eq!(f.treasury.emergency_withdraw(&alice, &shares), expected);
@@ -6717,7 +6909,7 @@ mod test {
         assert_eq!(f.treasury.shares_of(&alice), 0);
         assert_eq!(
             f.treasury.try_deposit(&alice, &MIN_DEPOSIT),
-            Err(Ok(Error::Paused))
+            Err(Ok(Error::EmergencyMode))
         );
     }
 
@@ -7555,30 +7747,33 @@ mod test {
         assert!(sold > 0);
     }
 
-    #[test]
-    fn resume_requires_acknowledgement_after_drawdown() {
-        let f = fixture();
+    /// Trips the drawdown through a real loss: a 20 USDC position resolves
+    /// against the treasury with a 15 USDC `max_drawdown`.
+    fn trip_drawdown(f: &Fixture) {
         f.treasury.set_drawdown_config(&(15 * USDC), &7u32);
-        let cost = 20 * USDC;
         f.treasury
-            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &cost, &0);
+            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(20 * USDC), &0);
         f.env.ledger().set_timestamp(MARKET_CLOSE + 1);
         f.market_core.resolve(&f.market_id, &Outcome::No);
-
         let caller = Address::generate(&f.env);
+        // The settle that trips the halt must itself succeed.
         f.treasury.settle_market(&caller, &f.market_id);
+        assert!(f.treasury.drawdown_status().tripped);
+    }
 
-        // Attempting to set_paused(false) without acknowledging fails
-        assert_eq!(
-            f.treasury.try_set_paused(&false),
-            Err(Ok(Error::NotAcknowledged))
-        );
-
-        // Admin acknowledges drawdown
+    #[test]
+    fn acknowledge_drawdown_is_a_deprecated_no_op() {
+        let f = fixture();
+        trip_drawdown(&f);
+        assert_eq!(f.treasury.mode(), Mode::AgentsHalted);
+        // The old two-step is gone: neither acknowledging nor "unpausing"
+        // changes a drawdown halt, and set_paused(false) no longer errors.
         f.treasury.acknowledge_drawdown();
-
-        // Now resuming succeeds
+        assert_eq!(f.treasury.mode(), Mode::AgentsHalted);
         assert!(f.treasury.try_set_paused(&false).is_ok());
+        assert_eq!(f.treasury.mode(), Mode::AgentsHalted);
+        // The halt clears only through resume_agents, once the window recovers.
+        assert_eq!(f.treasury.try_resume_agents(), Err(Ok(Error::NotRecovered)));
     }
 
     #[test]
@@ -8230,5 +8425,545 @@ mod test {
 
         let err = f.treasury.try_set_yield_venue(&pool2, &(200 * USDC));
         assert_eq!(err, Err(Ok(Error::VenueHasPrincipal)));
+    }
+
+    // ----- operating mode (issue #272) ------------------------------------------
+
+    fn sym(f: &Fixture, s: &str) -> Symbol {
+        Symbol::new(&f.env, s)
+    }
+
+    #[test]
+    fn drawdown_trip_does_not_enable_emergency_withdraw() {
+        // The bug: an ordinary risk event opened the forfeiting exit, so a trip
+        // started a run in which the first leavers dumped their share of open
+        // positions on the stayers.
+        let f = fixture();
+        let alice = depositor(&f, 10 * USDC);
+        let shares = f.treasury.deposit(&alice, &(10 * USDC));
+        trip_drawdown(&f);
+        assert_eq!(f.treasury.mode(), Mode::AgentsHalted);
+        assert_eq!(
+            f.treasury.try_emergency_withdraw(&alice, &shares),
+            Err(Ok(Error::DrawdownTripped))
+        );
+        // The ordinary exit stays open: a queued withdrawal, at NAV.
+        assert!(f.treasury.try_request_withdraw(&alice, &shares).is_ok());
+    }
+
+    #[test]
+    fn admin_unpause_during_drawdown_keeps_agents_halted() {
+        let f = fixture();
+        trip_drawdown(&f);
+        f.treasury.pause(&sym(&f, "maintenance"));
+        assert_eq!(f.treasury.mode(), Mode::AdminPaused);
+        // Clearing the admin pause must not clear the drawdown halt.
+        f.treasury.unpause();
+        assert_eq!(f.treasury.mode(), Mode::AgentsHalted);
+        assert!(f.treasury.drawdown_status().tripped);
+        assert_eq!(
+            f.treasury.try_agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &USDC, &0),
+            Err(Ok(Error::DrawdownTripped))
+        );
+        // ...and the reverse: resuming agents leaves an admin pause standing.
+        f.treasury.pause(&sym(&f, "again"));
+        f.treasury.reset_pnl_window();
+        f.treasury.resume_agents();
+        assert_eq!(f.treasury.mode(), Mode::AdminPaused);
+        assert!(!f.treasury.drawdown_status().tripped);
+        f.treasury.unpause();
+        assert_eq!(f.treasury.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn resume_agents_requires_recovered_window_or_reset() {
+        let f = fixture();
+        // Nothing to resume while running normally.
+        assert_eq!(f.treasury.try_resume_agents(), Err(Ok(Error::NotPaused)));
+        trip_drawdown(&f);
+        // The loss is still inside the window: the admin cannot wave it through.
+        assert_eq!(f.treasury.try_resume_agents(), Err(Ok(Error::NotRecovered)));
+        // Recovery by an explicit window reset...
+        f.treasury.reset_pnl_window();
+        f.treasury.resume_agents();
+        assert_eq!(f.treasury.mode(), Mode::Normal);
+        assert_eq!(f.treasury.mode_state().drawdown_halt, None);
+    }
+
+    #[test]
+    fn resume_agents_after_the_loss_leaves_the_window() {
+        let f = fixture();
+        trip_drawdown(&f);
+        f.env
+            .ledger()
+            .set_timestamp(f.env.ledger().timestamp() + 8 * DAY_SECONDS);
+        f.treasury.resume_agents();
+        assert_eq!(f.treasury.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn declare_emergency_requires_admin_pause_first() {
+        let f = fixture();
+        let why = sym(&f, "core_down");
+        assert_eq!(f.treasury.try_declare_emergency(&why), Err(Ok(Error::NotPaused)));
+        trip_drawdown(&f);
+        // A drawdown halt alone is not enough either: two deliberate steps.
+        assert_eq!(f.treasury.try_declare_emergency(&why), Err(Ok(Error::NotPaused)));
+        f.treasury.set_paused(&true);
+        f.treasury.declare_emergency(&why);
+        assert_eq!(f.treasury.mode(), Mode::Emergency);
+        // Idempotent, and the admin pause cannot be lifted underneath it.
+        f.treasury.declare_emergency(&why);
+        assert_eq!(f.treasury.try_unpause(), Err(Ok(Error::EmergencyMode)));
+        assert_eq!(f.treasury.try_set_paused(&false), Err(Ok(Error::EmergencyMode)));
+        // Ending it returns to the admin pause, and the halt is still recorded.
+        f.treasury.end_emergency();
+        assert_eq!(f.treasury.mode(), Mode::AdminPaused);
+        f.treasury.unpause();
+        assert_eq!(f.treasury.mode(), Mode::AgentsHalted);
+    }
+
+    #[test]
+    fn queued_ticket_claimable_in_emergency() {
+        let (f, alice, bob) = deployed_vault();
+        let (_, t1) = f
+            .treasury
+            .request_withdraw(&alice, &f.treasury.shares_of(&alice));
+        f.env.ledger().set_timestamp(MARKET_CLOSE);
+        f.market_core.resolve(&f.market_id, &Outcome::Yes);
+        f.treasury.redeem(&f.agent, &f.market_id);
+        let owed = f.treasury.withdraw_ticket(&t1).unwrap().remaining;
+        let reserved_before = f.treasury.queue_reserved();
+        assert!(reserved_before > 0);
+
+        f.treasury.set_paused(&true);
+        f.treasury.declare_emergency(&sym(&f, "core_down"));
+        // New requests are closed in an emergency...
+        assert_eq!(
+            f.treasury
+                .try_request_withdraw(&bob, &f.treasury.shares_of(&bob)),
+            Err(Ok(Error::EmergencyMode))
+        );
+        // ...but a ticket that already exists is still honoured, at NAV.
+        assert_eq!(f.treasury.claim_withdraw(&t1), owed);
+        // Reserved capital stays out of the emergency pro-rata base: bob's exit
+        // is computed on idle minus what the queue still reserves.
+        let free = (balance(&f, &f.treasury_id) - f.treasury.queue_reserved()).max(0);
+        let shares = f.treasury.shares_of(&bob);
+        let expected = shares * free / (f.treasury.total_shares() + VIRTUAL_SHARES);
+        assert_eq!(f.treasury.emergency_withdraw(&bob, &shares), expected);
+    }
+
+    #[test]
+    fn settle_market_allowed_in_every_mode() {
+        for step in 0..4 {
+            let f = fixture();
+            f.treasury
+                .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+            f.env.ledger().set_timestamp(MARKET_CLOSE + 1);
+            f.market_core.resolve(&f.market_id, &Outcome::Yes);
+            match step {
+                0 => {}
+                1 => f.treasury.pause(&sym(&f, "m")),
+                2 => {
+                    f.treasury.pause(&sym(&f, "m"));
+                    f.treasury.declare_emergency(&sym(&f, "e"));
+                }
+                _ => {
+                    // AgentsHalted is reached by the settle itself in
+                    // `trip_drawdown`; here a second market settles after it.
+                    trip_drawdown(&fixture());
+                }
+            }
+            let caller = Address::generate(&f.env);
+            let report = f.treasury.settle_market(&caller, &f.market_id);
+            assert!(report.redeemed > 0, "step {step}");
+        }
+    }
+
+    #[test]
+    fn legacy_flags_map_to_mode_state() {
+        let f = fixture();
+        let set_legacy = |paused: bool, admin: bool, tripped: bool| {
+            f.env.as_contract(&f.treasury_id, || {
+                let s = f.env.storage().instance();
+                s.remove(&DataKey::ModeState);
+                s.set(&DataKey::Paused, &paused);
+                s.set(&DataKey::AdminPaused, &admin);
+                s.set(&DataKey::DrawdownTripped, &tripped);
+                s.set(&DataKey::DrawdownAcknowledged, &false);
+            });
+        };
+        // DrawdownTripped => a drawdown halt (the Paused it set is its own).
+        set_legacy(true, false, true);
+        let st = f.treasury.mode_state();
+        assert_eq!((f.treasury.mode(), st.drawdown_halt), (Mode::AgentsHalted, Some(0)));
+        assert_eq!(st.admin_pause_at, None);
+        // AdminPaused => an admin pause with reason `legacy`.
+        set_legacy(true, true, false);
+        let st = f.treasury.mode_state();
+        assert_eq!(f.treasury.mode(), Mode::AdminPaused);
+        assert_eq!(st.admin_pause_reason, Some(sym(&f, "legacy")));
+        // A bare Paused (a pre-#46 deployment) is also an admin pause.
+        set_legacy(true, false, false);
+        assert_eq!(f.treasury.mode(), Mode::AdminPaused);
+        // Both at once: independent reasons, pause outranks the halt.
+        set_legacy(true, true, true);
+        assert_eq!(f.treasury.mode(), Mode::AdminPaused);
+        assert_eq!(f.treasury.mode_state().drawdown_halt, Some(0));
+        // Nothing set => Normal.
+        set_legacy(false, false, false);
+        assert_eq!(f.treasury.mode(), Mode::Normal);
+
+        // The first write migrates: the legacy keys are deleted, the halt kept.
+        set_legacy(true, true, true);
+        f.treasury.unpause();
+        assert_eq!(f.treasury.mode(), Mode::AgentsHalted);
+        f.env.as_contract(&f.treasury_id, || {
+            let s = f.env.storage().instance();
+            for k in [
+                DataKey::Paused,
+                DataKey::AdminPaused,
+                DataKey::DrawdownTripped,
+                DataKey::DrawdownAcknowledged,
+            ] {
+                assert!(!s.has(&k));
+            }
+            assert!(s.has(&DataKey::ModeState));
+        });
+    }
+
+    #[test]
+    fn mode_changed_events_carry_reason() {
+        let f = fixture();
+        let at = f.env.ledger().timestamp();
+        let ev = |from, to, reason: &str| ModeChanged {
+            from,
+            to,
+            reason: sym(&f, reason),
+            at,
+        };
+        f.treasury.pause(&sym(&f, "maintenance"));
+        assert!(has_event(&f, &ev(Mode::Normal, Mode::AdminPaused, "maintenance")));
+        f.treasury.declare_emergency(&sym(&f, "core_down"));
+        assert!(has_event(&f, &ev(Mode::AdminPaused, Mode::Emergency, "core_down")));
+        f.treasury.end_emergency();
+        assert!(has_event(&f, &ev(Mode::Emergency, Mode::AdminPaused, "end_emerg")));
+        f.treasury.unpause();
+        assert!(has_event(&f, &ev(Mode::AdminPaused, Mode::Normal, "unpause")));
+        // set_paused(true) is `pause(admin)`: the timelock's emergency path.
+        f.treasury.set_paused(&true);
+        assert!(has_event(&f, &ev(Mode::Normal, Mode::AdminPaused, "admin")));
+        // Idempotent calls change nothing and emit nothing new.
+        f.treasury.set_paused(&true);
+        assert_eq!(f.treasury.mode_state().admin_pause_reason, Some(sym(&f, "admin")));
+    }
+
+    #[test]
+    fn drawdown_and_resume_emit_mode_changed() {
+        let f = fixture();
+        // Same steps as `trip_drawdown`, but checking the event right after the
+        // settle that trips the halt (the host keeps only the last call's events).
+        f.treasury.set_drawdown_config(&(15 * USDC), &7u32);
+        f.treasury
+            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+        f.env.ledger().set_timestamp(MARKET_CLOSE + 1);
+        f.market_core.resolve(&f.market_id, &Outcome::No);
+        f.treasury
+            .settle_market(&Address::generate(&f.env), &f.market_id);
+        assert!(has_event(
+            &f,
+            &ModeChanged {
+                from: Mode::Normal,
+                to: Mode::AgentsHalted,
+                reason: sym(&f, "drawdown"),
+                at: MARKET_CLOSE + 1,
+            }
+        ));
+        assert_eq!(f.treasury.mode_state().drawdown_halt, Some(MARKET_CLOSE + 1));
+
+        f.treasury.reset_pnl_window();
+        f.treasury.resume_agents();
+        assert!(has_event(
+            &f,
+            &ModeChanged {
+                from: Mode::AgentsHalted,
+                to: Mode::Normal,
+                reason: sym(&f, "resume"),
+                at: MARKET_CLOSE + 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn allowed_view_answers_from_the_current_mode() {
+        let f = fixture();
+        assert!(f.treasury.allowed(&Op::AgentOpen));
+        assert!(!f.treasury.allowed(&Op::EmergencyWithdraw));
+        f.treasury.set_paused(&true);
+        assert!(!f.treasury.allowed(&Op::AgentOpen));
+        assert!(!f.treasury.allowed(&Op::AgentReduce));
+        assert!(f.treasury.allowed(&Op::PermissionlessSettle));
+        f.treasury.declare_emergency(&sym(&f, "e"));
+        assert!(f.treasury.allowed(&Op::EmergencyWithdraw));
+        assert!(!f.treasury.allowed(&Op::RequestWithdraw));
+    }
+
+    // ----- mode x entrypoint matrix --------------------------------------------
+
+    /// How an entrypoint is classified for the matrix: gated by an `Op`, or pure
+    /// configuration / a view, which is never mode-gated.
+    #[derive(Clone, Copy)]
+    enum Row {
+        Gated(Op),
+        Ungated,
+    }
+
+    /// One row per `pub fn` of `impl Treasury`. `every_entrypoint_has_a_matrix_row`
+    /// fails when a new entrypoint is added without one.
+    const MATRIX: &[(&str, Row)] = &[
+        ("deposit", Row::Gated(Op::Deposit)),
+        ("request_withdraw", Row::Gated(Op::RequestWithdraw)),
+        ("claim_withdraw", Row::Gated(Op::ClaimWithdraw)),
+        ("emergency_withdraw", Row::Gated(Op::EmergencyWithdraw)),
+        ("agent_create_market", Row::Gated(Op::AgentOpen)),
+        ("agent_create_market_and_reveal", Row::Gated(Op::AgentOpen)),
+        ("agent_buy", Row::Gated(Op::AgentOpen)),
+        ("agent_buy_v2", Row::Gated(Op::AgentOpen)),
+        ("agent_sell", Row::Gated(Op::AgentReduce)),
+        ("agent_sell_v2", Row::Gated(Op::AgentReduce)),
+        ("close_trade", Row::Gated(Op::AgentReduce)),
+        ("redeem", Row::Gated(Op::AgentSettle)),
+        ("claim_pool_remainder", Row::Gated(Op::AgentSettle)),
+        ("legacy_redeem", Row::Gated(Op::AgentSettle)),
+        ("legacy_claim_pool_remainder", Row::Gated(Op::AgentSettle)),
+        ("redeem_many", Row::Gated(Op::AgentSettle)),
+        ("claim_pool_remainders", Row::Gated(Op::AgentSettle)),
+        ("agent_claim_lp_fees", Row::Gated(Op::AgentSettle)),
+        ("collect_market_fees", Row::Gated(Op::PermissionlessSettle)),
+        ("settle_market", Row::Gated(Op::PermissionlessSettle)),
+        ("realize", Row::Gated(Op::PermissionlessSettle)),
+        ("allocate_to_yield", Row::Gated(Op::YieldAllocate)),
+        ("recall_from_yield", Row::Gated(Op::YieldRecall)),
+        ("withdraw", Row::Gated(Op::AdminWithdraw)),
+        ("migrate_market", Row::Gated(Op::Migrate)),
+        // Not mode-gated: the mode transitions themselves, views, and admin
+        // configuration (none of it moves capital).
+        ("__constructor", Row::Ungated),
+        ("get_config", Row::Ungated),
+        ("get_global", Row::Ungated),
+        ("available_capital", Row::Ungated),
+        ("liquid_capital", Row::Ungated),
+        ("capital_breakdown", Row::Ungated),
+        ("daily_usage", Row::Ungated),
+        ("daily_usage_detail", Row::Ungated),
+        ("daily_headroom", Row::Ungated),
+        ("agent_daily_usage", Row::Ungated),
+        ("get_net_cap", Row::Ungated),
+        ("net_exposure", Row::Ungated),
+        ("net_position", Row::Ungated),
+        ("market_valuation", Row::Ungated),
+        ("set_paused", Row::Ungated),
+        ("pause", Row::Ungated),
+        ("unpause", Row::Ungated),
+        ("resume_agents", Row::Ungated),
+        ("declare_emergency", Row::Ungated),
+        ("end_emergency", Row::Ungated),
+        ("mode", Row::Ungated),
+        ("mode_state", Row::Ungated),
+        ("allowed", Row::Ungated),
+        ("set_agent", Row::Ungated),
+        ("execute_agent", Row::Ungated),
+        ("cancel_agent", Row::Ungated),
+        ("remove_agent", Row::Ungated),
+        ("get_agent", Row::Ungated),
+        ("pending_agent", Row::Ungated),
+        ("agent_count", Row::Ungated),
+        ("agent_at", Row::Ungated),
+        ("propose_config", Row::Ungated),
+        ("execute_config", Row::Ungated),
+        ("cancel_config", Row::Ungated),
+        ("pending_config", Row::Ungated),
+        ("config_delay", Row::Ungated),
+        ("set_config_delay", Row::Ungated),
+        ("get_price_policy", Row::Ungated),
+        ("set_price_policy", Row::Ungated),
+        ("execute_price_policy", Row::Ungated),
+        ("cancel_price_policy", Row::Ungated),
+        ("pending_price_policy", Row::Ungated),
+        ("nav", Row::Ungated),
+        ("shares_of", Row::Ungated),
+        ("total_shares", Row::Ungated),
+        ("queue_reserved", Row::Ungated),
+        ("withdraw_ticket", Row::Ungated),
+        ("queue_bounds", Row::Ungated),
+        ("open_market_count", Row::Ungated),
+        ("open_market_at", Row::Ungated),
+        ("realized", Row::Ungated),
+        ("market_pnl", Row::Ungated),
+        ("window_pnl", Row::Ungated),
+        ("drawdown_status", Row::Ungated),
+        ("acknowledge_drawdown", Row::Ungated),
+        ("reset_pnl_window", Row::Ungated),
+        ("set_drawdown_config", Row::Ungated),
+        ("get_creation_policy", Row::Ungated),
+        ("creation_usage", Row::Ungated),
+        ("set_creation_policy", Row::Ungated),
+        ("set_yield_venue", Row::Ungated),
+        ("disable_yield", Row::Ungated),
+        ("set_successor", Row::Ungated),
+    ];
+
+    #[test]
+    fn every_entrypoint_has_a_matrix_row() {
+        let src = include_str!("lib.rs");
+        let start = src.find("#[contractimpl]\nimpl Treasury {").expect("impl Treasury");
+        let end = src.find("\n#[cfg(test)]\nmod test").expect("test module");
+        let mut missing = std::vec::Vec::new();
+        for line in src[start..end].lines() {
+            if let Some(rest) = line.strip_prefix("    pub fn ") {
+                let name = rest.split(['(', '<']).next().unwrap();
+                if !MATRIX.iter().any(|(n, _)| *n == name) {
+                    missing.push(name);
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "entrypoints without a mode-matrix row (classify them in MATRIX): {missing:?}"
+        );
+        // And no row for an entrypoint that no longer exists.
+        for (name, _) in MATRIX {
+            assert!(
+                src[start..end].contains(&std::format!("    pub fn {name}(")),
+                "MATRIX row `{name}` has no entrypoint"
+            );
+        }
+    }
+
+    /// The gate's error for a denied op in `mode`.
+    fn gate_error(mode: Mode) -> Error {
+        match mode {
+            Mode::Normal => Error::NotPaused,
+            Mode::AgentsHalted => Error::DrawdownTripped,
+            Mode::AdminPaused => Error::Paused,
+            Mode::Emergency => Error::EmergencyMode,
+        }
+    }
+
+    /// Calls every gated entrypoint once with plausible arguments. The result is
+    /// `Ok(())` for success and the contract error otherwise; a failure that is
+    /// not a contract error (host trap) is reported as `Err(None)`.
+    fn call_gated(f: &Fixture, alice: &Address, name: &str) -> Result<(), Option<Error>> {
+        fn flat<T, C>(
+            r: Result<Result<T, C>, Result<Error, soroban_sdk::InvokeError>>,
+        ) -> Result<(), Option<Error>> {
+            match r {
+                Ok(_) => Ok(()),
+                Err(Ok(e)) => Err(Some(e)),
+                Err(Err(_)) => Err(None),
+            }
+        }
+        fn ok<R>(r: R) -> R {
+            r
+        }
+        let t = &f.treasury;
+        let (agent, id) = (&f.agent, f.market_id);
+        let (core, who) = (Address::generate(&f.env), alice);
+        let ids: Vec<u64> = vec![&f.env, id];
+        let (qh, rh, uri) = create_args(f, 77);
+        let _ = rh;
+        match name {
+            "deposit" => ok(flat(t.try_deposit(who, &MIN_DEPOSIT))),
+            "request_withdraw" => ok(flat(t.try_request_withdraw(who, &1))),
+            "claim_withdraw" => ok(flat(t.try_claim_withdraw(&1))),
+            "emergency_withdraw" => ok(flat(t.try_emergency_withdraw(who, &1))),
+            "agent_create_market" => ok(flat(t.try_agent_create_market(
+                agent, &qh, &rh, &uri, &Category::Crypto, &(MARKET_CLOSE + 5_000), &USDC, &5_000,
+            ))),
+            "agent_create_market_and_reveal" => {
+                // The gate precedes the envelope check, so any envelope will do.
+                let spec = ResolutionSpecV2 {
+                    version: 1,
+                    network_id: BytesN::from_array(&f.env, &[0; 32]),
+                    market_core: f.market_core.address.clone(),
+                    salt: BytesN::from_array(&f.env, &[1; 32]),
+                    rule: resolver::ResolutionSpec::Price(resolver::PriceConfig {
+                        reflector: core.clone(),
+                        asset: resolver::OracleAsset::Other(Symbol::new(&f.env, "X")),
+                        threshold: 1,
+                        direction: resolver::PriceDirection::Above,
+                        max_staleness: 1,
+                    }),
+                };
+                ok(flat(t.try_agent_create_market_and_reveal(
+                    agent, &core, &qh, &uri, &Category::Crypto, &(MARKET_CLOSE + 5_000), &USDC, &5_000, &spec,
+                )))
+            }
+            "agent_buy" => ok(flat(t.try_agent_buy(agent, &id, &Outcome::Yes, &USDC, &0))),
+            "agent_buy_v2" => ok(flat(t.try_agent_buy_v2(
+                agent, &id, &Outcome::Yes, &USDC, &0, &0, &(f.env.ledger().timestamp() + 60),
+            ))),
+            "agent_sell" => ok(flat(t.try_agent_sell(agent, &id, &Outcome::Yes, &1, &i128::MAX))),
+            "agent_sell_v2" => ok(flat(t.try_agent_sell_v2(
+                agent, &id, &Outcome::Yes, &1, &i128::MAX, &0, &(f.env.ledger().timestamp() + 60),
+            ))),
+            "close_trade" => ok(flat(t.try_close_trade(agent, &id))),
+            "redeem" => ok(flat(t.try_redeem(agent, &id))),
+            "claim_pool_remainder" => ok(flat(t.try_claim_pool_remainder(agent, &id))),
+            "legacy_redeem" => ok(flat(t.try_legacy_redeem(agent, &core, &id))),
+            "legacy_claim_pool_remainder" => ok(flat(t.try_legacy_claim_pool_remainder(agent, &core, &id))),
+            "redeem_many" => ok(flat(t.try_redeem_many(agent, &ids))),
+            "claim_pool_remainders" => ok(flat(t.try_claim_pool_remainders(agent, &ids))),
+            "agent_claim_lp_fees" => ok(flat(t.try_agent_claim_lp_fees(agent, &id))),
+            "collect_market_fees" => ok(flat(t.try_collect_market_fees(&id))),
+            "settle_market" => ok(flat(t.try_settle_market(&Address::generate(&f.env), &id))),
+            "realize" => ok(flat(t.try_realize(&id))),
+            "allocate_to_yield" => ok(flat(t.try_allocate_to_yield(&USDC))),
+            "recall_from_yield" => ok(flat(t.try_recall_from_yield(&USDC))),
+            "withdraw" => ok(flat(t.try_withdraw(&Address::generate(&f.env), &USDC))),
+            "migrate_market" => ok(flat(t.try_migrate_market(&id))),
+            other => panic!("no call for gated entrypoint {other}"),
+        }
+    }
+
+    /// Brings a fresh fixture into `mode` through the real entrypoints.
+    fn fixture_in_mode(mode: Mode) -> (Fixture, Address) {
+        let f = fixture();
+        let alice = depositor(&f, 10 * USDC);
+        f.treasury.deposit(&alice, &(10 * USDC));
+        match mode {
+            Mode::Normal => {}
+            Mode::AgentsHalted => trip_drawdown(&f),
+            Mode::AdminPaused => f.treasury.pause(&sym(&f, "matrix")),
+            Mode::Emergency => {
+                f.treasury.pause(&sym(&f, "matrix"));
+                f.treasury.declare_emergency(&sym(&f, "matrix"));
+            }
+        }
+        assert_eq!(f.treasury.mode(), mode);
+        (f, alice)
+    }
+
+    #[test]
+    fn mode_by_entrypoint_matrix() {
+        for mode in crate::mode::ALL_MODES {
+            for (name, row) in MATRIX {
+                let Row::Gated(op) = row else { continue };
+                // Fresh state per call so one entrypoint cannot change another's mode.
+                let (f, alice) = fixture_in_mode(mode);
+                let got = call_gated(&f, &alice, name);
+                if allowed(mode, *op) {
+                    // Allowed: it may still fail for its own reasons, but never
+                    // with the gate's error.
+                    if let Err(Some(e)) = &got {
+                        assert_ne!(*e, gate_error(mode), "{name} in {mode:?}: the gate refused an allowed op");
+                    }
+                    assert_ne!(got, Err(None), "{name} in {mode:?} trapped");
+                } else {
+                    assert_eq!(got, Err(Some(gate_error(mode))), "{name} in {mode:?}");
+                }
+            }
+        }
     }
 }

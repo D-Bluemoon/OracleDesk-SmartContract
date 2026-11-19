@@ -100,6 +100,9 @@ export type AdapterResult<T> = DryRunResult | LiveResult<T>;
 
 export type Side = "Yes" | "No";
 
+/** The treasury's effective operating mode (`Treasury::mode`, issue #272). */
+export type TreasuryMode = "Normal" | "AgentsHalted" | "AdminPaused" | "Emergency";
+
 /** The committed `DisputableSignerConfig` as the watcher reads it. */
 export interface DisputableConfigRead {
   signers: string[];
@@ -382,6 +385,17 @@ export class StellarAdapter {
     return spec.mode === "signers"
       ? this.registerSignerSpec({ market_id: marketId, spec: toContractArg(spec) as SignerConfigArg })
       : this.registerPriceSpec({ market_id: marketId, spec: toContractArg(spec) as PriceConfigArg });
+  }
+
+  /**
+   * The treasury's effective operating mode (read-only simulation; also runs in
+   * dry-run). Unit enum variants decode to `[name]`. Agents read it once per
+   * tick and skip open-position work unless it is `Normal`, instead of
+   * discovering a halt from a failed simulation.
+   */
+  async treasuryMode(): Promise<TreasuryMode> {
+    const r = (await this.simulateRead(this.opts.deployments.contracts.treasury, "mode", [])) as [TreasuryMode] | TreasuryMode;
+    return Array.isArray(r) ? r[0] : r;
   }
 
   /** market-core `market_count` (read-only simulation; also runs in dry-run). */
