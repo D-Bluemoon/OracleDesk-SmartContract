@@ -1,7 +1,7 @@
 import { open, readFile, mkdir, truncate } from "node:fs/promises";
 import { dirname } from "node:path";
 
-export type JournalStage = "signed" | "submitting" | "submitted" | "confirmed" | "failed" | "uncertain";
+export type JournalStage = "signed" | "submitting" | "submitted" | "confirmed" | "failed" | "uncertain" | "cancelled";
 
 export interface TransactionJournalRecord {
   version: 1;
@@ -26,6 +26,7 @@ const stages = new Set<JournalStage>([
   "confirmed",
   "failed",
   "uncertain",
+  "cancelled",
 ]);
 
 function isJournalRecord(value: unknown): value is TransactionJournalRecord {

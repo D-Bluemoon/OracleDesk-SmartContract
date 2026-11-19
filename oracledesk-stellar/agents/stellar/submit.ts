@@ -13,6 +13,7 @@ export interface SorobanSubmitOptions {
   maxPollsPerAttempt?: number;
   retryDelayMs?: number;
   sleep?: (milliseconds: number) => Promise<void>;
+  beforeSend?: () => void | Promise<void>;
 }
 
 export type SorobanSubmitResult = Extract<Awaited<ReturnType<rpc.Server["getTransaction"]>>, { status: "SUCCESS" }>;
@@ -63,6 +64,12 @@ export async function submitSorobanTransaction(options: SorobanSubmitOptions): P
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await beforeSend?.();
+    } catch (error) {
+      await log("cancelled", attempt, errorMessage(error));
+      throw error;
+    }
     await log("submitting", attempt);
     let sendResponse: Awaited<ReturnType<typeof server.sendTransaction>> | undefined;
     try {

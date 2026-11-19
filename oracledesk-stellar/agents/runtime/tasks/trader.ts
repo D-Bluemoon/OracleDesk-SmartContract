@@ -21,6 +21,19 @@ import type { StellarAdapter } from "../../stellar/adapter.js";
 import type { Task, TaskContext } from "../runtime.js";
 import { publishPendingTraces, recordPendingTrace } from "./traces.js";
 
+export interface TraderRiskInput {
+  marketId: bigint;
+  amount: bigint;
+  priceBeforeBps: bigint;
+  priceAfterBps: bigint;
+  quotedShares: bigint;
+  minSharesOut: bigint;
+}
+
+export interface TraderRiskCheck {
+  (input: TraderRiskInput): Promise<{ violations: string[]; unverifiable: string[] }>;
+}
+
 export interface TraderCandidate {
   market: MarketState;
   fairValueBps: number;
@@ -55,6 +68,7 @@ export interface TraderDeps {
    * configuration rejects trades.
    */
   dueDiligence?: (marketId: bigint) => Promise<DueDiligenceVerdict>;
+  riskCheck?: TraderRiskCheck;
 }
 
 export const TRADES = "trader.trades";
@@ -122,6 +136,22 @@ export async function traderTick(deps: TraderDeps, ctx: TaskContext): Promise<vo
         : decision.outcome === "Yes" ? fairValueBps : Number(BPS) - fairValueBps;
       const deadline = BigInt(deps.nowSecs() + deps.deadlineSecs);
       ctx.log.info("TRADER_QUOTE", { quoted, minSharesOut, limitPriceBps, deadline });
+      if (deps.riskCheck && live) {
+        const risk = await deps.riskCheck({
+          marketId: BigInt(market.marketId),
+          amount: collateralIn,
+          priceBeforeBps: BigInt(limitPriceBps),
+          priceAfterBps: BigInt(limitPriceBps),
+          quotedShares: quoted,
+          minSharesOut,
+        });
+        if (risk.unverifiable.length > 0) ctx.log.warn("TRADER_RISK_UNVERIFIABLE", { market: market.marketId, reasons: risk.unverifiable });
+        if (risk.violations.length > 0) {
+          ctx.log.error("TRADER_RISK_VIOLATION", { market: market.marketId, reasons: risk.violations });
+          await ctx.kill({ code: "risk", detail: risk.violations.join("; "), at: ctx.now() });
+          return;
+        }
+      }
       if (ctx.signal.aborted) return;
 
       const verdict = await verifyTrade(deps, BigInt(market.marketId), deps.nowSecs);
