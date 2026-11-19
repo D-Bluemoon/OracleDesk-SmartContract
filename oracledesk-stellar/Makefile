@@ -1,4 +1,4 @@
-.PHONY: setup build test lint fmt deploy-testnet seed-market demo bindings clean interface-check
+.PHONY: setup build test lint fmt deploy-plan deploy-verify deploy-testnet seed-market demo bindings docs-reference docs docs-serve clean interface-check
 
 # Installs Node dependencies for the TypeScript packages. Rust toolchain,
 # the `stellar` CLI, and Python 3 are expected to already be on PATH — see
@@ -7,12 +7,8 @@
 # agents/ and x402/ install, since both depend on them by local file: path
 # and need real type declarations, not just a package.json, to typecheck.
 setup:
-	for pkg in market-core resolver treasury reasoning-registry timelock router; do \
-		(cd packages/bindings/$$pkg && npm install && npm run build) || exit 1; \
-	done
-	cd agents && npm install
-	cd x402 && npm install
-	cd scripts/governance && npm install
+	if [ -f package-lock.json ]; then npm ci; else npm install; fi
+	npm run build
 
 # Builds all four Soroban contracts to wasm via the Stellar CLI. The vendored
 # cross-contract copies (resolver/treasury's market_core.wasm, resolver's
@@ -54,9 +50,8 @@ test: build
 	python3 model/fpmm_bounds.py --quick
 	python3 scripts/coverage-tools.py --self-test
 	python3 scripts/coverage-gate.py --self-test
-	cd x402 && npm test
-	cd agents && npm test
-	cd scripts/governance && npm test
+	node --test scripts/gen-contract-docs/generate.test.mjs
+	npm test
 
 lint:
 	./scripts/check-no-mock-all-auths.sh
@@ -64,6 +59,9 @@ lint:
 	cargo fmt --manifest-path scripts/interface-manifest/Cargo.toml --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	CARGO_TARGET_DIR=target cargo clippy --locked --manifest-path scripts/interface-manifest/Cargo.toml --all-targets -- -D warnings
+	npm run lint
+	npm run format:check
+	npm run typecheck
 
 auth-matrix: build
 	cargo test -p integration-tests --test auth_matrix
@@ -97,8 +95,14 @@ coverage-gate:
 formal:
 	./scripts/formal.sh
 
+deploy-plan: build
+	npx tsx scripts/deployer/src/cli.ts plan
+
+deploy-verify:
+	npx tsx scripts/deployer/src/cli.ts verify
+
 deploy-testnet: build
-	./scripts/deploy-testnet.sh
+	npx tsx scripts/deployer/src/cli.ts apply --yes
 
 seed-market:
 	./scripts/seed-market.sh
@@ -109,10 +113,24 @@ demo:
 bindings: build
 	./scripts/gen-bindings.sh
 
+docs-reference:
+	node scripts/gen-contract-docs/generate.mjs
+
+docs: docs-reference
+	mdbook build docs
+	cargo doc --no-deps -p market-core -p resolver -p treasury -p reasoning-registry
+	mkdir -p docs/book/rustdoc
+	cp -r target/doc/* docs/book/rustdoc/
+	npx --yes typedoc --options typedoc.json
+
+docs-serve: docs-reference
+	mdbook serve docs
+
 clean:
 	cargo clean
-	rm -rf x402/node_modules agents/node_modules
-	rm -rf packages/bindings/*/node_modules packages/bindings/*/dist
+	rm -rf node_modules x402/node_modules agents/node_modules scripts/*/node_modules
+	rm -rf packages/bindings/*/node_modules packages/bindings/*/dist agents/dist x402/dist scripts/deployer/dist
+	rm -f *.tsbuildinfo */*.tsbuildinfo scripts/*/*.tsbuildinfo
 
 # Compare to the PR target, not the contributor fork's tracking branch.
 INTERFACE_BASE_REF ?= upstream/develop

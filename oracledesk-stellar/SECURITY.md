@@ -34,6 +34,8 @@ publishing this repo — do not commit to one without checking. -->
 
 ## Scope
 
+See [`docs/security-ci.md`](docs/security-ci.md) for the automated supply-chain security policy (`cargo-deny`, `npm audit`, `gitleaks`, SBOMs, pinned actions, and Dependabot).
+
 In scope: `contracts/`, `x402/`, `agents/`, `packages/bindings/` (the
 generation script and its templates, not third-party generated code
 itself), and the deployment scripts in `scripts/`.

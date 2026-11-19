@@ -11,6 +11,10 @@
 
 import { Address, Keypair, rpc, TransactionBuilder, xdr, type Transaction } from "@stellar/stellar-sdk";
 import { KeypairSigner, type MethodOptions } from "@stellar/stellar-sdk/contract";
+import type { Client as MarketCoreBindingClient } from "@oracledesk/bindings-market-core";
+import type { Client as ReasoningRegistryBindingClient } from "@oracledesk/bindings-reasoning-registry";
+import type { Client as ResolverBindingClient } from "@oracledesk/bindings-resolver";
+import type { Client as TreasuryBindingClient } from "@oracledesk/bindings-treasury";
 import { toContractArg, type PriceConfigArg, type SignerConfigArg, type SpecJson } from "../core/spec.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -100,13 +104,28 @@ interface CommonAdapterOptions {
   nowUnix?: () => number;
 }
 
-interface AssembledCall<T> {
+interface AssembledCall<T = unknown> {
   built?: Transaction;
   signed?: Transaction;
   simulation?: { error?: string };
-  result?: T;
-  signAndSend(): Promise<{ result: T }>;
+  result?: T | unknown;
+  signAndSend(): Promise<{ result: T | unknown }>;
 }
+
+type DynamicContractMethod = (
+  args: Record<string, unknown>,
+  options?: MethodOptions,
+) => Promise<AssembledCall>;
+
+type TypedMarketCoreClient = MarketCoreBindingClient;
+type TypedResolverClient = ResolverBindingClient;
+type TypedTreasuryClient = TreasuryBindingClient & {
+  agent_buy_traced: DynamicContractMethod;
+  agent_sell_traced: DynamicContractMethod;
+};
+type TypedReasoningRegistryClient = ReasoningRegistryBindingClient & {
+  publish_decision_trace: DynamicContractMethod;
+};
 
 /**
  * "dry-run": builds and logs what would be submitted, never signs or sends,
@@ -339,12 +358,12 @@ export class StellarAdapter {
    * returning its `AssembledTransaction`) either as a dry-run description
    * or a real signed submission, depending on `this.mode`.
    */
-  private async run<T>(
+  private async run<C, T>(
     pkg: keyof Deployments["contracts"],
     moduleName: string,
     methodName: string,
     args: unknown,
-    call: (client: any, options?: MethodOptions) => Promise<AssembledCall<T>>,
+    call: (client: C, options?: MethodOptions) => Promise<AssembledCall<T>>,
     opts: { deadlineUnix?: bigint } = {},
   ): Promise<AdapterResult<T>> {
     const contractId = this.opts.deployments.contracts[pkg];
@@ -360,7 +379,7 @@ export class StellarAdapter {
     let assembled: AssembledCall<T>;
     try {
       const options = await this.feeOptionsFor(methodName, opts.deadlineUnix);
-      const client = await this.client<any>(pkg, moduleName);
+      const client = await this.client<C>(pkg, moduleName);
       assembled = await call(client, options);
     } catch (err) {
       throw new NotSubmittedError(`${methodName}: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
@@ -417,7 +436,7 @@ export class StellarAdapter {
       throw error;
     }
     const { result } = await assembled.signAndSend();
-    return { dryRun: false, value: unwrapContractResult(methodName, result) };
+    return { dryRun: false, value: unwrapContractResult(methodName, result as T) };
   }
 
   private async journalCancelled(methodName: string, assembled: unknown, error: unknown): Promise<void> {
@@ -444,8 +463,12 @@ export class StellarAdapter {
     initial_yes_bps: number;
   }): Promise<AdapterResult<bigint>> {
     const call = { agent: this.agent, ...args };
-    return this.run("treasury", "@oracledesk/bindings-treasury", "agent_create_market", call, (client, options) =>
-      client.agent_create_market(call, options),
+    return this.run<TypedTreasuryClient, bigint>(
+      "treasury",
+      "@oracledesk/bindings-treasury",
+      "agent_create_market",
+      call,
+      (client, options) => client.agent_create_market(call as Parameters<TypedTreasuryClient["agent_create_market"]>[0], options),
     );
   }
 
@@ -456,8 +479,12 @@ export class StellarAdapter {
     min_shares_out: bigint;
   }): Promise<AdapterResult<bigint>> {
     const call = { agent: this.agent, ...args };
-    return this.run("treasury", "@oracledesk/bindings-treasury", "agent_buy", call, (client, options) =>
-      client.agent_buy(call, options),
+    return this.run<TypedTreasuryClient, bigint>(
+      "treasury",
+      "@oracledesk/bindings-treasury",
+      "agent_buy",
+      call,
+      (client, options) => client.agent_buy(call, options),
     );
   }
 
@@ -476,8 +503,12 @@ export class StellarAdapter {
     deadline: bigint;
   }): Promise<AdapterResult<bigint>> {
     const call = { agent: this.agent, ...args };
-    return this.run("treasury", "@oracledesk/bindings-treasury", "agent_buy_v2", call, (client, options) =>
-      client.agent_buy_v2(call, options),
+    return this.run<TypedTreasuryClient, bigint>(
+      "treasury",
+      "@oracledesk/bindings-treasury",
+      "agent_buy_v2",
+      call,
+      (client, options) => client.agent_buy_v2(call, options),
       { deadlineUnix: args.deadline },
     );
   }
@@ -489,8 +520,12 @@ export class StellarAdapter {
     max_shares_in: bigint;
   }): Promise<AdapterResult<bigint>> {
     const call = { agent: this.agent, ...args };
-    return this.run("treasury", "@oracledesk/bindings-treasury", "agent_sell", call, (client, options) =>
-      client.agent_sell(call, options),
+    return this.run<TypedTreasuryClient, bigint>(
+      "treasury",
+      "@oracledesk/bindings-treasury",
+      "agent_sell",
+      call,
+      (client, options) => client.agent_sell(call, options),
     );
   }
 
@@ -508,29 +543,37 @@ export class StellarAdapter {
     deadline: bigint;
   }): Promise<AdapterResult<bigint>> {
     const call = { agent: this.agent, ...args };
-    return this.run("treasury", "@oracledesk/bindings-treasury", "agent_sell_v2", call, (client, options) =>
-      client.agent_sell_v2(call, options),
+    return this.run<TypedTreasuryClient, bigint>(
+      "treasury",
+      "@oracledesk/bindings-treasury",
+      "agent_sell_v2",
+      call,
+      (client, options) => client.agent_sell_v2(call, options),
       { deadlineUnix: args.deadline },
     );
   }
 
   async agentHalt(reason: number): Promise<AdapterResult<void>> {
     const call = { agent: this.agent, reason };
-    return this.run("treasury", "@oracledesk/bindings-treasury", "agent_halt", call, (client) =>
-      client.agent_halt(call),
+    return this.run<TypedTreasuryClient, void>(
+      "treasury",
+      "@oracledesk/bindings-treasury",
+      "agent_halt",
+      call,
+      (client) => client.agent_halt(call),
     );
   }
 
   async getAgent(agent = this.agent): Promise<{ active: boolean; roles: number } | undefined> {
-    const client = await this.client<any>("treasury", "@oracledesk/bindings-treasury");
+    const client = await this.client<TypedTreasuryClient>("treasury", "@oracledesk/bindings-treasury");
     const policy = (await client.get_agent({ agent })).result as { active: boolean; roles: bigint | number } | undefined;
     if (!policy) return undefined;
     return { active: Boolean(policy.active), roles: Number(policy.roles) };
   }
 
   async drawdownStatus(): Promise<{ tripped: boolean; windowPnl: bigint; maxDrawdown: bigint }> {
-    const client = await this.client<any>("treasury", "@oracledesk/bindings-treasury");
-    const status = unwrapContractResult("drawdown_status", (await client.drawdown_status()).result) as {
+    const client = await this.client<TypedTreasuryClient>("treasury", "@oracledesk/bindings-treasury");
+    const status = unwrapContractResult("drawdown_status", (await client.drawdown_status()).result) as unknown as {
       tripped: boolean;
       window_pnl: bigint;
       max_drawdown: bigint;
@@ -597,10 +640,10 @@ export class StellarAdapter {
     outcome: { tag: "Yes" | "No"; values: void };
     collateral_in: bigint;
   }): Promise<bigint> {
-    const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
+    const client = await this.client<TypedMarketCoreClient>("market_core", "@oracledesk/bindings-market-core");
     const { result } = await client.quote_buy(args);
     // quote_buy returns Result<i128, Error>: unwrap it, and surface an Err.
-    return BigInt(unwrapContractResult("quote_buy", result) as bigint);
+    return BigInt(unwrapContractResult("quote_buy", result) as unknown as bigint);
   }
 
   /**
@@ -608,15 +651,23 @@ export class StellarAdapter {
    * Permissionless: the commitment, not the caller, authorizes it.
    */
   async registerSignerSpec(args: { market_id: bigint; spec: SignerConfigArg }): Promise<AdapterResult<void>> {
-    return this.run("resolver", "@oracledesk/bindings-resolver", "register_signer_spec", args, (client, options) =>
-      client.register_signer_spec(args, options),
+    return this.run<TypedResolverClient, void>(
+      "resolver",
+      "@oracledesk/bindings-resolver",
+      "register_signer_spec",
+      args,
+      (client, options) => client.register_signer_spec(args as Parameters<TypedResolverClient["register_signer_spec"]>[0], options),
     );
   }
 
   /** Reveals a price-mode spec (resolver `register_price_spec`). */
   async registerPriceSpec(args: { market_id: bigint; spec: PriceConfigArg }): Promise<AdapterResult<void>> {
-    return this.run("resolver", "@oracledesk/bindings-resolver", "register_price_spec", args, (client, options) =>
-      client.register_price_spec(args, options),
+    return this.run<TypedResolverClient, void>(
+      "resolver",
+      "@oracledesk/bindings-resolver",
+      "register_price_spec",
+      args,
+      (client, options) => client.register_price_spec(args as Parameters<TypedResolverClient["register_price_spec"]>[0], options),
     );
   }
 
@@ -629,7 +680,7 @@ export class StellarAdapter {
 
   /** market-core `market_count` (read-only simulation; also runs in dry-run). */
   async marketCount(): Promise<bigint> {
-    const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
+    const client = await this.client<TypedMarketCoreClient>("market_core", "@oracledesk/bindings-market-core");
     const { result } = await client.market_count();
     return BigInt(result);
   }
@@ -648,10 +699,19 @@ export class StellarAdapter {
       }
     | undefined
   > {
-    const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
+    const client = await this.client<TypedMarketCoreClient>("market_core", "@oracledesk/bindings-market-core");
     const { result } = await client.get_market({ market_id: marketId });
     if (result?.isErr?.()) return undefined;
-    const m = typeof result?.unwrap === "function" ? result.unwrap() : result;
+    const m = typeof result?.unwrap === "function" ? result.unwrap() : (result as unknown as {
+      creator: string;
+      question_hash: Buffer;
+      resolution_hash: Buffer;
+      close_time: bigint;
+      status: { tag: "Open" | "Resolved" | "Void" };
+      reserve_yes: bigint;
+      reserve_no: bigint;
+      fee_bps: bigint | number;
+    });
     return {
       creator: m.creator,
       questionHash: Buffer.from(m.question_hash).toString("hex"),
@@ -675,14 +735,18 @@ export class StellarAdapter {
     dailyUsed: bigint;
     dailyHeadroom?: bigint;
   }> {
-    const client = await this.client<any>("treasury", "@oracledesk/bindings-treasury");
-    const config = unwrapContractResult("get_config", (await client.get_config()).result) as { max_trade: bigint; max_market: bigint; max_daily: bigint };
+    const client = await this.client<TypedTreasuryClient>("treasury", "@oracledesk/bindings-treasury");
+    const config = unwrapContractResult("get_config", (await client.get_config()).result) as unknown as {
+      max_trade: bigint;
+      max_market: bigint;
+      max_daily: bigint;
+    };
     const policy = (await client.get_agent({ agent: this.agent })).result as { max_trade: bigint; max_daily: bigint } | undefined;
     const [usageResult, globalHeadroomResult] = await Promise.all([
       client.agent_daily_usage({ agent: this.agent }),
       client.daily_headroom(),
     ]);
-    const usage = unwrapContractResult("agent_daily_usage", usageResult.result) as { amount: bigint };
+    const usage = unwrapContractResult("agent_daily_usage", usageResult.result) as unknown as { amount: bigint };
     const min = (a: bigint, b?: bigint) => (b !== undefined && BigInt(b) < BigInt(a) ? BigInt(b) : BigInt(a));
     const maxDaily = min(config.max_daily, policy?.max_daily);
     const agentHeadroom = max0(maxDaily - BigInt(usage.amount));
@@ -691,7 +755,7 @@ export class StellarAdapter {
       maxMarket: BigInt(config.max_market),
       maxDaily,
       dailyUsed: BigInt(usage.amount),
-      dailyHeadroom: min(BigInt(unwrapContractResult("daily_headroom", globalHeadroomResult.result) as bigint), agentHeadroom),
+      dailyHeadroom: min(BigInt(unwrapContractResult("daily_headroom", globalHeadroomResult.result) as unknown as bigint), agentHeadroom),
     };
   }
 
@@ -715,8 +779,10 @@ export class StellarAdapter {
 
   /** What the treasury has committed to `marketId` (its cost basis). */
   async marketSpent(marketId: bigint): Promise<bigint> {
-    const client = await this.client<any>("treasury", "@oracledesk/bindings-treasury");
-    const v = unwrapContractResult("market_valuation", (await client.market_valuation({ market_id: marketId })).result) as { cost_basis: bigint };
+    const client = await this.client<TypedTreasuryClient>("treasury", "@oracledesk/bindings-treasury");
+    const v = unwrapContractResult("market_valuation", (await client.market_valuation({ market_id: marketId })).result) as unknown as {
+      cost_basis: bigint;
+    };
     return BigInt(v.cost_basis);
   }
 
@@ -732,14 +798,14 @@ export class StellarAdapter {
 
   /** The treasury's YES/NO shares in `marketId` (zero when it holds none). */
   async treasuryPosition(marketId: bigint): Promise<{ yes: bigint; no: bigint }> {
-    const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
+    const client = await this.client<TypedMarketCoreClient>("market_core", "@oracledesk/bindings-market-core");
     const { result } = await client.get_position({ market_id: marketId, holder: this.opts.deployments.contracts.treasury });
     return { yes: BigInt(result.yes), no: BigInt(result.no) };
   }
 
   /** The resolver's state tag for `marketId`, e.g. "SignersPending". */
   async resolutionState(marketId: bigint): Promise<string> {
-    const client = await this.client<any>("resolver", "@oracledesk/bindings-resolver");
+    const client = await this.client<TypedResolverClient>("resolver", "@oracledesk/bindings-resolver");
     const { result } = await client.state({ market_id: marketId });
     return (result as { tag: string }).tag;
   }
@@ -750,7 +816,7 @@ export class StellarAdapter {
    * Unconfigured, so the resolver's `Price(market_id)` entry is read too.
    */
   async isSpecRevealed(marketId: bigint): Promise<boolean> {
-    const client = await this.client<any>("resolver", "@oracledesk/bindings-resolver");
+    const client = await this.client<TypedResolverClient>("resolver", "@oracledesk/bindings-resolver");
     const { result } = await client.state({ market_id: marketId });
     if (result?.tag && result.tag !== "Unconfigured") return true;
     const key = xdr.LedgerKey.contractData(
@@ -773,12 +839,12 @@ export class StellarAdapter {
   }): Promise<AdapterResult<bigint>> {
     const action = typeof args.action === "string" ? toTraceAction(args.action) : args.action;
     const call = { ...args, action };
-    return this.run(
+    return this.run<TypedReasoningRegistryClient, bigint>(
       "reasoning_registry",
       "@oracledesk/bindings-reasoning-registry",
       "publish_trace",
       call,
-      (client, options) => client.publish_trace(call, options),
+      (client, options) => client.publish_trace(call as Parameters<TypedReasoningRegistryClient["publish_trace"]>[0], options),
     );
   }
 
@@ -788,7 +854,7 @@ export class StellarAdapter {
     leaf_count: number;
     manifest_cid: string;
   }): Promise<AdapterResult<bigint>> {
-    return this.run(
+    return this.run<TypedReasoningRegistryClient, bigint>(
       "reasoning_registry",
       "@oracledesk/bindings-reasoning-registry",
       "publish_trace_batch",
@@ -802,7 +868,7 @@ export class StellarAdapter {
     public_key: Buffer;
     proof_sig: Buffer;
   }): Promise<AdapterResult<void>> {
-    return this.run(
+    return this.run<TypedReasoningRegistryClient, void>(
       "reasoning_registry",
       "@oracledesk/bindings-reasoning-registry",
       "add_signing_key",
@@ -815,7 +881,7 @@ export class StellarAdapter {
     agent: string;
     public_key: Buffer;
   }): Promise<AdapterResult<void>> {
-    return this.run(
+    return this.run<TypedReasoningRegistryClient, void>(
       "reasoning_registry",
       "@oracledesk/bindings-reasoning-registry",
       "retire_signing_key",
@@ -835,12 +901,12 @@ export class StellarAdapter {
   }): Promise<AdapterResult<bigint>> {
     const action = typeof args.action === "string" ? toTraceAction(args.action) : args.action;
     const call = { ...args, action };
-    return this.run(
+    return this.run<TypedReasoningRegistryClient, bigint>(
       "reasoning_registry",
       "@oracledesk/bindings-reasoning-registry",
       "publish_trace_signed",
       call,
-      (client, options) => client.publish_trace_signed(call, options),
+      (client, options) => client.publish_trace_signed(call as Parameters<TypedReasoningRegistryClient["publish_trace_signed"]>[0], options),
     );
   }
 
@@ -859,7 +925,7 @@ export class StellarAdapter {
     marketId: bigint,
     opts: { useTwapSecs?: number } = {},
   ): Promise<MarketRead> {
-    const client = await this.client<any>("market_core", "@oracledesk/bindings-market-core");
+    const client = await this.client<TypedMarketCoreClient>("market_core", "@oracledesk/bindings-market-core");
     const marketTx = await client.get_market({ market_id: marketId });
     const market = marketTx.result.unwrap() as {
       meta_uri: string;
@@ -905,7 +971,7 @@ export class StellarAdapter {
       ipfs_cid: args.ipfsCid,
       decision_hash: hexToBuffer(args.decisionHash),
     };
-    const result = await this.run(
+    const result = await this.run<TypedReasoningRegistryClient, bigint>(
       "reasoning_registry",
       "@oracledesk/bindings-reasoning-registry",
       "publish_decision_trace",
@@ -936,7 +1002,7 @@ export class StellarAdapter {
       deadline: args.deadline,
       trace_id: args.traceId,
     };
-    const result = await this.run(
+    const result = await this.run<TypedTreasuryClient, bigint>(
       "treasury",
       "@oracledesk/bindings-treasury",
       "agent_buy_traced",
@@ -967,7 +1033,7 @@ export class StellarAdapter {
       deadline: args.deadline,
       trace_id: args.traceId,
     };
-    const result = await this.run(
+    const result = await this.run<TypedTreasuryClient, bigint>(
       "treasury",
       "@oracledesk/bindings-treasury",
       "agent_sell_traced",
@@ -978,14 +1044,22 @@ export class StellarAdapter {
     return result;
   }
 
-  async tradeAndPublishTrace(args: any): Promise<any> {
+  async tradeAndPublishTrace(
+    args: Record<string, unknown> & { method?: string; deadline?: bigint | number | string },
+  ): Promise<unknown> {
     const method = typeof args?.method === "string" ? args.method : "trade_and_publish_trace";
-    const result = await this.run(
+    const result = await this.run<Record<string, DynamicContractMethod>, unknown>(
       "treasury",
       "@oracledesk/bindings-treasury",
       method,
       args,
-      (client, options) => client[method](args, options),
+      (client, options) => {
+        const fn = client[method];
+        if (typeof fn !== "function") {
+          throw new TypeError(`treasury client has no method ${method}`);
+        }
+        return fn(args, options);
+      },
       args?.deadline === undefined ? {} : { deadlineUnix: BigInt(args.deadline) },
     );
     return liveValue(result, method);

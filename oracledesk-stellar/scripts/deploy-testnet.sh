@@ -23,6 +23,15 @@ case "$NETWORK" in
   *) echo "error: NETWORK must be testnet or local (never mainnet)" >&2; exit 1 ;;
 esac
 
+# For testnet, delegate to the declarative TypeScript plan/apply deployer
+# (scripts/deployer/) unless LEGACY_BASH_DEPLOY=1 is explicitly requested.
+# Local quickstart runs (NETWORK=local) continue using the bash flow below.
+if [ "$NETWORK" = "testnet" ] && [ "${LEGACY_BASH_DEPLOY:-0}" != "1" ]; then
+  if command -v npx >/dev/null 2>&1 && [ -f "scripts/deployer/src/cli.ts" ]; then
+    exec npx tsx scripts/deployer/src/cli.ts apply --yes "$@"
+  fi
+fi
+
 IDENTITY_PREFIX=${IDENTITY_PREFIX:-oracledesk}
 DEPLOYER_KEY=${DEPLOYER_KEY:-${IDENTITY_PREFIX}-deployer}
 AGENT_KEY=${AGENT_KEY:-${IDENTITY_PREFIX}-agent}
