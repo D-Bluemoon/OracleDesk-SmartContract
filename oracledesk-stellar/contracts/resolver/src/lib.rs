@@ -72,13 +72,6 @@ pub const MAX_COMMITTEE: u32 = 32;
 /// Minimum time-lock delay for proposing and executing committee rotations (1 day).
 pub const MIN_ROTATION_DELAY: u64 = 86_400;
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OracleAsset {
-    Stellar(Address),
-    Other(Symbol),
-}
-
 /// Grace period for revealing specs before guardian void is allowed (3 days).
 pub const REVEAL_GRACE_SECS: u64 = 3 * 86_400;
 /// Grace period for oracle recovery before guardian void is allowed (1 day).
@@ -495,6 +488,80 @@ pub enum Error {
     NoPendingAdmin = 42,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 43,
+    // ---- market-core / registry call failures, mirrored by `core_call` (#60).
+    // A distinct code per market-core error keeps the cause visible to callers.
+    MarketCoreCallFailed = 1042,
+    MarketCoreMarketNotFound = 1043,
+    MarketCoreNotFinal = 1044,
+    MarketCoreMarketNotOpen = 1045,
+    MarketCoreMarketClosed = 1046,
+    MarketCoreInsufficientLiquidity = 1047,
+    MarketCoreInsufficientShares = 1048,
+    MarketCoreAlreadyClaimed = 1049,
+    MarketCoreNothingToRedeem = 1050,
+    MarketCoreInvalidAmount = 1051,
+    MarketCoreOverflow = 1052,
+    MarketCoreSlippageExceeded = 1053,
+    /// A reasoning-registry read failed.
+    RegistryCallFailed = 1054,
+}
+
+/// Maps a market-core contract error onto the resolver's own range.
+pub fn map_market_core_error(error: market_core::Error) -> Error {
+    use market_core::Error as Core;
+    match error {
+        Core::MarketNotFound => Error::MarketCoreMarketNotFound,
+        Core::NotFinal => Error::MarketCoreNotFinal,
+        Core::MarketNotOpen => Error::MarketCoreMarketNotOpen,
+        Core::MarketClosed => Error::MarketCoreMarketClosed,
+        Core::InsufficientLiquidity => Error::MarketCoreInsufficientLiquidity,
+        Core::InsufficientShares => Error::MarketCoreInsufficientShares,
+        Core::AlreadyClaimed => Error::MarketCoreAlreadyClaimed,
+        Core::NothingToRedeem => Error::MarketCoreNothingToRedeem,
+        Core::InvalidAmount => Error::MarketCoreInvalidAmount,
+        Core::Overflow => Error::MarketCoreOverflow,
+        Core::SlippageExceeded => Error::MarketCoreSlippageExceeded,
+        _ => Error::MarketCoreCallFailed,
+    }
+}
+
+/// Converts the shared `Outcome` into the `contractimport!`-generated
+/// market-core `Outcome`. They are structurally identical, but distinct Rust
+/// types.
+fn to_core_outcome(outcome: &Outcome) -> market_core::Outcome {
+    match outcome {
+        Outcome::Yes => market_core::Outcome::Yes,
+        Outcome::No => market_core::Outcome::No,
+    }
+}
+
+/// Runs a generated `try_*` market-core call, mapping both the callee error and
+/// a host/invocation failure into resolver variants. This is the only shape a
+/// cross-contract market-core call may take: the panicking generated methods
+/// would abort with market-core's own code.
+fn core_call<T, C>(
+    result: Result<Result<T, C>, Result<market_core::Error, soroban_sdk::InvokeError>>,
+) -> Result<T, Error> {
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        // The reply did not convert to the declared return type.
+        Ok(Err(_)) => Err(Error::MarketCoreCallFailed),
+        // market-core returned one of its own contract errors.
+        Err(Ok(error)) => Err(map_market_core_error(error)),
+        // The call trapped or hit a host error.
+        Err(Err(_)) => Err(Error::MarketCoreCallFailed),
+    }
+}
+
+/// Runs a generated `try_*` reasoning-registry call (only `try_get_trace` is
+/// used), mapping any failure to `RegistryCallFailed`.
+fn registry_call<T, C, E>(
+    result: Result<Result<T, C>, Result<E, soroban_sdk::InvokeError>>,
+) -> Result<T, Error> {
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        _ => Err(Error::RegistryCallFailed),
+    }
 }
 
 #[contracttype]
@@ -2955,7 +3022,7 @@ impl Resolver {
 
     fn store_rule(env: &Env, market_id: u64, rule: &ResolutionSpec) {
         let storage = env.storage().persistent();
-        let (_key, state) = match rule {
+        let (key, state) = match rule {
             ResolutionSpec::Price(cfg) => {
                 let key = DataKey::Price(market_id);
                 storage.set(&key, cfg);
@@ -3912,7 +3979,7 @@ mod test {
         assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -3941,7 +4008,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -4234,7 +4301,7 @@ mod test {
         f.resolver.expire_market(&f.market_id);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
         assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
     }
@@ -4476,7 +4543,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -4957,7 +5024,7 @@ mod test {
         open(&d);
         let treasury = d.f.market_core.get_config().treasury;
         d.f.resolver.settle_dispute(&d.f.market_id, &Verdict::No);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(status(&d), MarketStatus::Resolved(market_core::Outcome::No));
         assert_eq!(
             d.f.resolver.state(&d.f.market_id),
             ResolutionState::Finalized
@@ -4979,7 +5046,7 @@ mod test {
         let d = dispute_fixture(false);
         open(&d);
         d.f.resolver.settle_dispute(&d.f.market_id, &Verdict::Yes);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(status(&d), MarketStatus::Resolved(market_core::Outcome::Yes));
         d.f.resolver.claim_dispute_bond(&d.f.market_id);
         assert_escrow(&d, 0);
         assert_eq!(balance(&d, &d.disputer), 2 * BOND);
@@ -5039,7 +5106,7 @@ mod test {
         assert_eq!(status(&d), MarketStatus::Open);
         d.f.resolver
             .escalation_attest(&d.f.market_id, &d.members[2], &Verdict::Yes);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(status(&d), MarketStatus::Resolved(market_core::Outcome::Yes));
         d.f.resolver.claim_dispute_bond(&d.f.market_id);
         assert_eq!(balance(&d, &d.disputer), 2 * BOND);
         assert_escrow(&d, 0);
@@ -5192,7 +5259,7 @@ mod test {
                 },
             }])
             .settle_dispute(&d.f.market_id, &Verdict::No);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(status(&d), MarketStatus::Resolved(market_core::Outcome::No));
     }
 
     #[test]
@@ -5364,7 +5431,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -5547,7 +5614,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -5666,7 +5733,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -5905,7 +5972,7 @@ mod test {
         assert!(last_price_resolution(&f).from_snapshot);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -6068,7 +6135,7 @@ mod test {
         f.resolver.expire_market(&f.market_id);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -6223,7 +6290,7 @@ mod test {
             f.resolver.finalize_signers(&f.market_id),
             AttestedOutcome::Yes
         );
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(market_status(&f), MarketStatus::Resolved(market_core::Outcome::Yes));
         assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
         // FinalImpliesClosed + AtMostOnceFinal: nothing can change it again.
         assert_eq!(
@@ -6232,7 +6299,7 @@ mod test {
             Err(Ok(Error::AlreadyFinalized))
         );
         assert!(f.resolver.try_finalize_signers(&f.market_id).is_err());
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(market_status(&f), MarketStatus::Resolved(market_core::Outcome::Yes));
     }
 
     /// resolver.cfg happy path in price mode: RegisterPrice, Tick, ResolvePrice.
@@ -6252,7 +6319,7 @@ mod test {
         f.env.ledger().set_timestamp(2_000);
         assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
         assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(market_status(&f), MarketStatus::Resolved(market_core::Outcome::Yes));
         assert_eq!(
             f.resolver.try_resolve_price(&f.market_id),
             Err(Ok(Error::AlreadyFinalized))
@@ -6353,7 +6420,7 @@ mod test {
             f.resolver.finalize_signers(&f.market_id),
             AttestedOutcome::Yes
         );
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(market_status(&f), MarketStatus::Resolved(market_core::Outcome::Yes));
     }
 
     /// resolver.cfg (NoResolveBeforeClose): the guardian cannot void before
@@ -6446,9 +6513,9 @@ mod test {
         f.market_core.accept_resolver();
 
         f.env.ledger().set_timestamp(2_000);
-        f.market_core.resolve(&f.market_id, &Outcome::No);
+        f.market_core.resolve(&f.market_id, &market_core::Outcome::No);
 
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(market_status(&f), MarketStatus::Resolved(market_core::Outcome::No));
         // This resolver saw none of it: no votes, still "pending", and it
         // can no longer move the market (market-core rejects it as resolver).
         assert_eq!(
@@ -6464,7 +6531,7 @@ mod test {
         attest_both(&f, AttestedOutcome::Yes);
         f.env.ledger().set_timestamp(2_100);
         assert!(f.resolver.try_finalize_signers(&f.market_id).is_err());
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(market_status(&f), MarketStatus::Resolved(market_core::Outcome::No));
     }
 
     /// Everything observable about market-core through a resolver scenario,
@@ -6478,25 +6545,25 @@ mod test {
         let mut t = std::vec::Vec::new();
         t.push(format!(
             "price {}",
-            f.market_core.get_price(&id, &Outcome::Yes)
+            f.market_core.get_price(&id, &market_core::Outcome::Yes)
         ));
         t.push(format!(
             "quote {}",
-            f.market_core.quote_buy(&id, &Outcome::Yes, &(10 * one))
+            f.market_core.quote_buy(&id, &market_core::Outcome::Yes, &(10 * one))
         ));
         t.push(format!(
             "buy {}",
             f.market_core
-                .buy(&creator, &id, &Outcome::Yes, &(10 * one), &0)
+                .buy(&creator, &id, &market_core::Outcome::Yes, &(10 * one), &0)
         ));
         t.push(format!(
             "price {}",
-            f.market_core.get_price(&id, &Outcome::Yes)
+            f.market_core.get_price(&id, &market_core::Outcome::Yes)
         ));
         t.push(format!(
             "sell {}",
             f.market_core
-                .sell(&creator, &id, &Outcome::Yes, &(3 * one), &(100 * one))
+                .sell(&creator, &id, &market_core::Outcome::Yes, &(3 * one), &(100 * one))
         ));
         t.push(format!(
             "pos {:?}",

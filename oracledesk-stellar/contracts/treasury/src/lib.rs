@@ -116,16 +116,31 @@ fn map_market_core_code(error: soroban_sdk::Error) -> Error {
 /// market-core call must go through this (or [`Treasury::core_trade`] for the
 /// name-dispatched trade calls); the panicking generated methods are never
 /// used.
-fn core_call<T>(
+fn core_call<T, C>(
     result: Result<
-        Result<T, market_core::Error>,
-        Result<soroban_sdk::Error, soroban_sdk::InvokeError>,
+        Result<T, C>,
+        Result<market_core::Error, soroban_sdk::InvokeError>,
     >,
 ) -> Result<T, Error> {
     match result {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(map_market_core_error(error)),
-        Err(_) => Err(Error::MarketCoreCallFailed),
+        // The reply did not convert to the declared return type.
+        Ok(Err(_)) => Err(Error::MarketCoreCallFailed),
+        // market-core returned one of its own contract errors.
+        Err(Ok(error)) => Err(map_market_core_error(error)),
+        // The call trapped or hit a host error.
+        Err(Err(_)) => Err(Error::MarketCoreCallFailed),
+    }
+}
+
+/// [`core_call`] for the infallible market-core views (their `try_` form has no
+/// contract-error branch): any failure is a failed call.
+fn core_view<T, C>(
+    result: Result<Result<T, C>, Result<soroban_sdk::Error, soroban_sdk::InvokeError>>,
+) -> Result<T, Error> {
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        _ => Err(Error::MarketCoreCallFailed),
     }
 }
 
@@ -563,6 +578,21 @@ pub enum Error {
     /// `agent_create_market_and_reveal` was given a malformed resolution
     /// envelope or a rule outside the two primary modes (#64).
     InvalidResolution = 63,
+    // ---- market-core errors, mirrored by `map_core_error` (#60). A distinct
+    // code per market-core error keeps the cause visible to the caller; the
+    // 2000s are the canonical cross-contract range (ADR 0004).
+    MarketCoreCallFailed = 2031,
+    MarketCoreMarketNotFound = 2032,
+    MarketCoreNotFinal = 2033,
+    MarketCoreMarketNotOpen = 2034,
+    MarketCoreMarketClosed = 2035,
+    MarketCoreInsufficientLiquidity = 2036,
+    MarketCoreInsufficientShares = 2037,
+    MarketCoreAlreadyClaimed = 2038,
+    MarketCoreNothingToRedeem = 2039,
+    MarketCoreInvalidAmount = 2040,
+    MarketCoreOverflow = 2041,
+    MarketCoreSlippageExceeded = 2042,
 }
 
 #[contractevent]
@@ -3363,7 +3393,7 @@ impl Treasury {
         let treasury_addr = env.current_contract_address();
         let client = MarketCoreClient::new(env, core);
         let market = core_call(client.try_get_market(&market_id))?;
-        let position = core_call(client.try_get_position(&market_id, &treasury_addr))?;
+        let position = core_view(client.try_get_position(&market_id, &treasury_addr))?;
         let lp = market.creator == treasury_addr && !market.lp_claimed;
         let (lp_yes, lp_no) = if lp {
             (market.reserve_yes, market.reserve_no)
@@ -3502,7 +3532,7 @@ impl Treasury {
         }
         let treasury_addr = env.current_contract_address();
         let client = MarketCoreClient::new(env, core);
-        let position = core_call(client.try_get_position(&market_id, &treasury_addr))?;
+        let position = core_view(client.try_get_position(&market_id, &treasury_addr))?;
         let market = core_call(client.try_get_market(&market_id))?;
         let lp = market.creator == treasury_addr && !market.lp_claimed;
         if position.yes == 0 && position.no == 0 && !lp {
