@@ -1,4 +1,4 @@
-.PHONY: setup build test lint fmt deploy-testnet seed-market demo bindings clean interface-check
+.PHONY: setup build test lint fmt deploy-plan deploy-verify deploy-testnet seed-market demo bindings clean interface-check
 
 # Installs Node dependencies for the TypeScript packages. Rust toolchain,
 # the `stellar` CLI, and Python 3 are expected to already be on PATH — see
@@ -57,6 +57,7 @@ test: build
 	cd x402 && npm test
 	cd agents && npm test
 	cd scripts/governance && npm test
+	cd scripts/deployer && npm test
 
 lint:
 	./scripts/check-no-mock-all-auths.sh
@@ -97,8 +98,14 @@ coverage-gate:
 formal:
 	./scripts/formal.sh
 
+deploy-plan: build
+	npx tsx scripts/deployer/src/cli.ts plan
+
+deploy-verify:
+	npx tsx scripts/deployer/src/cli.ts verify
+
 deploy-testnet: build
-	./scripts/deploy-testnet.sh
+	npx tsx scripts/deployer/src/cli.ts apply --yes
 
 seed-market:
 	./scripts/seed-market.sh

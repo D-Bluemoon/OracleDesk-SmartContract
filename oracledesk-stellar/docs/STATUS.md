@@ -506,3 +506,15 @@ The pinned x402 Stellar package declares Node >=22, so CI and the documented
 minimum now use Node 22. An additional isolated Node 20 smoke run passed the
 HTTP/SQLite tests but emitted dependency engine warnings and is not a supported
 runtime target.
+
+## Contributor addendum: declarative testnet deployer (#128)
+
+Added `scripts/deployer/` and `deployments/testnet.manifest.json` providing
+declarative `plan`, `apply`, `verify`, and `migrate-record` workflows against
+live Stellar testnet state, with atomic v2 record checkpointing (preserving all
+v1 top-level keys for `loadDeployments()`, `seed-market.sh`, and `demo.sh`),
+drift and testnet-reset detection, archived-instance restoration, and a hard
+testnet passphrase interlock. `scripts/deploy-testnet.sh` delegates testnet
+runs to the deployer while keeping `NETWORK=local` intact for local E2E runs.
+Verified locally via `scripts/deployer` unit tests (`plan.test.ts` and
+`record.test.ts`). Live testnet apply was not re-run in this session.

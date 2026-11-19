@@ -210,17 +210,19 @@ make test    # cargo test (40 tests), model/fpmm_model.py, x402 + agents test su
 
 ```bash
 cd oracledesk-stellar
-make deploy-testnet   # idempotent: generates/funds two throwaway testnet
-                       # identities, deploys all 4 contracts + a self-issued
-                       # test USDC, wires them together, writes
-                       # deployments/testnet.json
+make deploy-plan      # read live testnet state vs deployments/testnet.manifest.json
+                      # exits 0 if up to date, 2 if changes are planned, 1 if blocked
+make deploy-testnet   # apply planned changes via scripts/deployer/ with atomic
+                      # checkpointing to deployments/testnet.json (schema v2)
+make deploy-verify    # verify live contract wiring, agent registration, and funding
 make demo             # create -> trade -> resolve -> record trace -> verify
-                       # hash, entirely on testnet, with real transaction output
+                      # hash, entirely on testnet, with real transaction output
 ```
 
-Both scripts submit real Stellar testnet transactions using throwaway
-identities generated via `stellar keys generate --fund`. Nothing here ever
-touches mainnet.
+The declarative deployer (`scripts/deployer/`) enforces a hard Stellar testnet
+passphrase interlock and refuses non-testnet networks. `scripts/deploy-testnet.sh`
+delegates testnet runs to the declarative deployer for backward compatibility.
+Nothing here ever touches mainnet.
 
 ---
 
