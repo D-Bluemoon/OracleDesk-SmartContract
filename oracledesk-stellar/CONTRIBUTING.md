@@ -161,3 +161,7 @@ an initial changelog, not an artificial breaking-change report. CI compares
 against the PR base branch and also rejects stale generated manifests. GitHub
 runs the workflow at the repository root; the nested workflow is retained for
 standalone use of `oracledesk-stellar/`.
+
+## Supply-chain security
+
+All PRs run automated supply-chain checks (`cargo-deny`, production `npm audit` gate, `gitleaks`, and CycloneDX SBOM generation). See [`docs/security-ci.md`](docs/security-ci.md) for policy details and exception rules.
