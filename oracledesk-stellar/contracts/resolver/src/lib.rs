@@ -665,6 +665,26 @@ pub enum DataKey {
     /// discipline, issue #27): a revealed TWAP rule's `TwapConfig` lives
     /// under its own key so no stored payload is ever reinterpreted.
     PriceTwap(u64),
+    /// #297: timestamp at which an epoch of a committee started. Written in
+    /// `create_committee` (epoch 1) and `execute_rotation` (new epoch). Used
+    /// by `epoch_at` to walk back from the current epoch to the one in force
+    /// at a market's close_time.
+    EpochStart(u64, u32),
+    /// #297: the pinned (committee_id, epoch) for a committee market, set on
+    /// the first attestation after close or through `pin_committee_epoch`.
+    /// Absent until pinned, so pre-attestation views compute the would-be pin
+    /// without writing.
+    MarketEpoch(u64),
+}
+
+/// #297: A committee member set snapshotted at a specific epoch. Loaded from
+/// `MemberAt(committee_id, epoch)` so attestations and quorum always use the
+/// epoch that was in force at the market's close_time, not the live committee.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitteeSnapshot {
+    pub epoch: u32,
+    pub members: Vec<Address>,
+    pub threshold: u32,
 }
 
 /// The registered signer group/authority, whichever kind the market committed to.
@@ -674,7 +694,11 @@ enum SignerAuthority {
     Signers(SignerConfig),
     Weighted(WeightedKeyConfig),
     Disputable(DisputableSignerConfig),
-    Committee(CommitteeRef, Committee),
+    /// #297: the second field is the pinned epoch snapshot, loaded from
+    /// `MemberAt(committee_id, pinned_epoch)`. If the market is not yet pinned
+    /// (no attestation has happened and `pin_committee_epoch` has not run),
+    /// the snapshot is computed from the would-be pin without writing.
+    Committee(CommitteeRef, CommitteeSnapshot),
     Hybrid(HybridConfig),
 }
 
@@ -878,6 +902,18 @@ pub struct RotationExecuted {
 pub struct RotationCancelled {
     #[topic]
     pub committee_id: u64,
+}
+
+/// #297: Emitted when a committee market's epoch is pinned to the epoch in
+/// force at close_time, either through the first attestation or through
+/// `pin_committee_epoch`.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitteeEpochPinned {
+    #[topic]
+    pub market_id: u64,
+    pub committee_id: u64,
+    pub epoch: u32,
 }
 
 #[contractevent]
@@ -1165,13 +1201,7 @@ impl Resolver {
         spec: CommitteeRef,
     ) -> Result<(), Error> {
         Self::assert_unconfigured(&env, market_id)?;
-        let committee = Self::load_committee(&env, spec.committee_id)?;
-        if committee.epoch < spec.min_epoch {
-            return Err(Error::RotationBoundExceeded);
-        }
-        if spec.dispute_window == 0 {
-            return Err(Error::InvalidConfig);
-        }
+        Self::validate_committee_ref(&env, &spec)?;
         let rule = ResolutionSpec::Committee(spec);
         Self::assert_matches_commitment(&env, market_id, &legacy_spec_hash(&env, &rule))?;
         Self::store_rule(&env, market_id, &rule);
@@ -1220,6 +1250,10 @@ impl Resolver {
 
         let snap_key = DataKey::MemberAt(id, 1);
         Self::persist(&env, &snap_key, &(members.clone(), threshold));
+
+        // #297: record the timestamp at which epoch 1 started.
+        let epoch_start_key = DataKey::EpochStart(id, 1);
+        Self::persist(&env, &epoch_start_key, &env.ledger().timestamp());
 
         CommitteeCreated {
             committee_id: id,
@@ -1289,6 +1323,9 @@ impl Resolver {
             &DataKey::MemberAt(committee_id, new_epoch),
             &(pending.members, pending.threshold),
         );
+        // #297: record the timestamp at which the new epoch started.
+        let epoch_start_key = DataKey::EpochStart(committee_id, new_epoch);
+        Self::persist(&env, &epoch_start_key, &env.ledger().timestamp());
         RotationExecuted {
             committee_id,
             epoch: new_epoch,
@@ -1313,6 +1350,50 @@ impl Resolver {
     /// Reads committee state and extends its storage TTL.
     pub fn get_committee(env: Env, committee_id: u64) -> Result<Committee, Error> {
         Self::load_committee(&env, committee_id)
+    }
+
+    /// #297: Permissionlessly pins the committee epoch for a market to the
+    /// epoch in force at `close_time`. Can be called by keepers right after
+    /// close, before any rotation lands. Idempotent: if already pinned, the
+    /// existing pin is kept. Must not run before close_time.
+    pub fn pin_committee_epoch(env: Env, market_id: u64) -> Result<(u64, u32), Error> {
+        let ref_spec: CommitteeRef = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommitteeSpec(market_id))
+            .ok_or(Error::MarketNotConfigured)?;
+        let market_core: Address = Self::instance_get(&env, DataKey::MarketCore)?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
+        if env.ledger().timestamp() < market.close_time {
+            return Err(Error::MarketNotClosed);
+        }
+        let snapshot = Self::pin_epoch_for_market(&env, market_id, &ref_spec, market.close_time)?;
+        Ok((ref_spec.committee_id, snapshot.epoch))
+    }
+
+    /// #297: View returning the pinned (committee_id, epoch) for a market, or
+    /// `None` if not yet pinned.
+    pub fn market_committee_epoch(env: Env, market_id: u64) -> Option<(u64, u32)> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MarketEpoch(market_id))
+    }
+
+    /// #297: View returning the members and threshold for a committee at a
+    /// specific epoch, from the `MemberAt` snapshot.
+    pub fn committee_members_at(
+        env: Env,
+        committee_id: u64,
+        epoch: u32,
+    ) -> Result<(Vec<Address>, u32), Error> {
+        let key = DataKey::MemberAt(committee_id, epoch);
+        let (members, threshold) = env
+            .storage()
+            .persistent()
+            .get::<_, (Vec<Address>, u32)>(&key)
+            .ok_or(Error::CommitteeNotFound)?;
+        Ok((members, threshold))
     }
 
     /// Opens fallback signer attestation in a hybrid market if the feed failed past the deadline.
@@ -2705,8 +2786,11 @@ impl Resolver {
             return Ok(SignerAuthority::Weighted(cfg));
         }
         if let Some(ref_spec) = storage.get::<_, CommitteeRef>(&DataKey::CommitteeSpec(market_id)) {
-            let comm = Self::load_committee(env, ref_spec.committee_id)?;
-            return Ok(SignerAuthority::Committee(ref_spec, comm));
+            // #297: use the pinned epoch snapshot, or compute the would-be pin
+            // without writing, so views stay read-only before the first attestation.
+            let close_time = Self::market_close_time(env, market_id)?;
+            let snapshot = Self::committee_snapshot(env, market_id, &ref_spec, close_time)?;
+            return Ok(SignerAuthority::Committee(ref_spec, snapshot));
         }
         if let Some(cfg) = storage.get::<_, HybridConfig>(&DataKey::Hybrid(market_id)) {
             return Ok(SignerAuthority::Hybrid(cfg));
@@ -2733,20 +2817,17 @@ impl Resolver {
                 let round = Self::round(env, market_id);
                 Self::round_weight(env, market_id, round, &o) >= cfg.weight_threshold
             }),
-            SignerAuthority::Committee(ref_spec, comm) => {
-                let current = comm.epoch;
-                if current < ref_spec.min_epoch
-                    || current.saturating_sub(ref_spec.min_epoch) > ref_spec.max_rotation_delta
-                {
-                    return false;
-                }
+            SignerAuthority::Committee(ref_spec, snapshot) => {
+                // #297: quorum is counted against the pinned epoch's snapshot
+                // only. Rotations after close have no effect.
+                let _ = ref_spec;
                 let mut votes: u32 = 0;
-                for member in comm.members.iter() {
+                for member in snapshot.members.iter() {
                     if Self::has_attested(env, market_id, outcome, &member) {
                         votes += 1;
                     }
                 }
-                votes >= comm.threshold
+                votes >= snapshot.threshold
             }
             SignerAuthority::Hybrid(cfg) => {
                 Self::attestation_count(env, market_id, outcome) >= cfg.fallback.threshold
@@ -3122,13 +3203,10 @@ impl Resolver {
             ResolutionSpec::WeightedKeys(cfg) => Self::weighted_config_is_valid(cfg),
             ResolutionSpec::SignersDisputable(cfg) => Self::disputable_config_is_valid(cfg),
             ResolutionSpec::Committee(cfg) => {
-                if cfg.dispute_window == 0 {
-                    return Err(Error::InvalidConfig);
-                }
-                let committee = Self::load_committee(env, cfg.committee_id)?;
-                if committee.epoch < cfg.min_epoch {
-                    return Err(Error::RotationBoundExceeded);
-                }
+                // #297: the V2/V3 reveal path now validates the committee ref
+                // through validate_committee_ref, shared with
+                // register_committee_spec.
+                Self::validate_committee_ref(env, cfg)?;
                 true
             }
             ResolutionSpec::Hybrid(cfg) => {
@@ -3300,6 +3378,174 @@ impl Resolver {
         Ok(comm)
     }
 
+    // ── #297: epoch binding helpers ───────────────────────────────────────
+
+    /// Maximum `max_rotation_delta` a committee market may declare. Bounds the
+    /// `epoch_at` walk-back footprint so a single attestation never reads more
+    /// than `MAX_ROTATION_DELTA + 1` `EpochStart` entries.
+    pub const MAX_ROTATION_DELTA: u32 = 16;
+
+    /// Walk back from `current` epoch to the epoch whose `EpochStart` is <=
+    /// `ts`, at most `max_steps + 1` reads. Returns the epoch in force at `ts`.
+    /// For committees created before this change (no `EpochStart` for epoch 1),
+    /// a missing entry at epoch 1 is treated as "started at creation" (0).
+    fn epoch_at(
+        env: &Env,
+        committee_id: u64,
+        current: u32,
+        ts: u64,
+        max_steps: u32,
+    ) -> Result<u32, Error> {
+        let mut epoch = current;
+        let mut steps = 0u32;
+        loop {
+            let key = DataKey::EpochStart(committee_id, epoch);
+            let started_at = env.storage().persistent().get::<_, u64>(&key);
+            match started_at {
+                Some(t) if t <= ts => return Ok(epoch),
+                Some(_) => {}
+                None => {
+                    // Legacy committee without EpochStart: epoch 1 started at
+                    // creation (treated as 0, which is <= any ts). Other epochs
+                    // without EpochStart are unknown → fall back to current.
+                    if epoch == 1 {
+                        return Ok(1);
+                    }
+                }
+            }
+            if steps >= max_steps || epoch == 0 {
+                return Err(Error::RotationBoundExceeded);
+            }
+            epoch = epoch.saturating_sub(1);
+            steps += 1;
+        }
+    }
+
+    /// Load the member set and threshold for a committee at a specific epoch.
+    fn load_snapshot(env: &Env, committee_id: u64, epoch: u32) -> Result<CommitteeSnapshot, Error> {
+        let key = DataKey::MemberAt(committee_id, epoch);
+        let (members, threshold) = env
+            .storage()
+            .persistent()
+            .get::<_, (Vec<Address>, u32)>(&key)
+            .ok_or(Error::CommitteeNotFound)?;
+        Ok(CommitteeSnapshot {
+            epoch,
+            members,
+            threshold,
+        })
+    }
+
+    /// Compute the epoch that was in force at `close_time` for a committee
+    /// market, without writing. Used by views before pinning.
+    fn compute_pinned_epoch(
+        env: &Env,
+        ref_spec: &CommitteeRef,
+        close_time: u64,
+    ) -> Result<u32, Error> {
+        let comm = Self::load_committee(env, ref_spec.committee_id)?;
+        if ref_spec.max_rotation_delta > Self::MAX_ROTATION_DELTA {
+            return Err(Error::InvalidConfig);
+        }
+        let epoch = Self::epoch_at(
+            env,
+            ref_spec.committee_id,
+            comm.epoch,
+            close_time,
+            ref_spec.max_rotation_delta,
+        )?;
+        if epoch < ref_spec.min_epoch
+            || epoch.saturating_sub(ref_spec.min_epoch) > ref_spec.max_rotation_delta
+        {
+            return Err(Error::RotationBoundExceeded);
+        }
+        Ok(epoch)
+    }
+
+    /// Load or compute the pinned snapshot for a committee market. If the
+    /// market is already pinned, use the stored epoch. If not, compute the
+    /// would-be pin without writing (for views like `has_valid_proposal`).
+    fn committee_snapshot(
+        env: &Env,
+        market_id: u64,
+        ref_spec: &CommitteeRef,
+        close_time: u64,
+    ) -> Result<CommitteeSnapshot, Error> {
+        if let Some((committee_id, epoch)) =
+            env.storage().persistent().get::<_, (u64, u32)>(&DataKey::MarketEpoch(market_id))
+        {
+            return Self::load_snapshot(env, committee_id, epoch);
+        }
+        // Not yet pinned: compute the would-be pin.
+        let epoch = Self::compute_pinned_epoch(env, ref_spec, close_time)?;
+        Self::load_snapshot(env, ref_spec.committee_id, epoch)
+    }
+
+    /// Pin the epoch for a committee market: write `MarketEpoch` and bump
+    /// `MemberAt`, `EpochStart`, and `CommitteeSpec` to the market target.
+    fn pin_epoch_for_market(
+        env: &Env,
+        market_id: u64,
+        ref_spec: &CommitteeRef,
+        close_time: u64,
+    ) -> Result<CommitteeSnapshot, Error> {
+        let storage = env.storage().persistent();
+        let pin_key = DataKey::MarketEpoch(market_id);
+        if let Some((committee_id, epoch)) = storage.get::<_, (u64, u32)>(&pin_key) {
+            // Already pinned: return the existing snapshot.
+            return Self::load_snapshot(env, committee_id, epoch);
+        }
+        let epoch = Self::compute_pinned_epoch(env, ref_spec, close_time)?;
+        let snapshot = Self::load_snapshot(env, ref_spec.committee_id, epoch)?;
+
+        // Write the pin.
+        let pin_value = (ref_spec.committee_id, epoch);
+        Self::persist(env, &pin_key, &pin_value);
+
+        // Bump the snapshot and epoch-start entries to the market target so
+        // they survive until the market finalizes.
+        let target = ttl::market_target(env, close_time);
+        let member_key = DataKey::MemberAt(ref_spec.committee_id, epoch);
+        if env.storage().persistent().has(&member_key) {
+            ttl::bump_persistent(env, &member_key, target);
+        }
+        let epoch_start_key = DataKey::EpochStart(ref_spec.committee_id, epoch);
+        if env.storage().persistent().has(&epoch_start_key) {
+            ttl::bump_persistent(env, &epoch_start_key, target);
+        }
+        // Bump the CommitteeSpec entry too.
+        let spec_key = DataKey::CommitteeSpec(market_id);
+        if env.storage().persistent().has(&spec_key) {
+            ttl::bump_persistent(env, &spec_key, target);
+        }
+
+        CommitteeEpochPinned {
+            market_id,
+            committee_id: ref_spec.committee_id,
+            epoch,
+        }
+        .publish(env);
+
+        Ok(snapshot)
+    }
+
+    /// #297: Validate a CommitteeRef against the live committee registry.
+    /// Shared between `register_committee_spec` and the V2/V3 reveal path so
+    /// both check existence, min_epoch, and dispute_window consistently.
+    fn validate_committee_ref(env: &Env, cfg: &CommitteeRef) -> Result<(), Error> {
+        if cfg.dispute_window == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if cfg.max_rotation_delta > Self::MAX_ROTATION_DELTA {
+            return Err(Error::InvalidConfig);
+        }
+        let committee = Self::load_committee(env, cfg.committee_id)?;
+        if committee.epoch < cfg.min_epoch {
+            return Err(Error::RotationBoundExceeded);
+        }
+        Ok(())
+    }
+
     fn record_attestation(
         env: &Env,
         market_id: u64,
@@ -3322,17 +3568,26 @@ impl Resolver {
                 (cfg.threshold, None)
             }
             SignerAuthority::Weighted(_) => return Err(Error::WrongMode),
-            SignerAuthority::Committee(ref_spec, comm) => {
-                let current = comm.epoch;
-                if current < ref_spec.min_epoch
-                    || current.saturating_sub(ref_spec.min_epoch) > ref_spec.max_rotation_delta
-                {
-                    return Err(Error::RotationBoundExceeded);
+            SignerAuthority::Committee(ref_spec, snapshot) => {
+                // #297: pin the epoch on the first attestation after close.
+                // The snapshot is already loaded; pin it to storage so future
+                // reads use the pinned epoch. The epoch bound check is already
+                // enforced by compute_pinned_epoch inside committee_snapshot.
+                if !env.storage().persistent().has(&DataKey::MarketEpoch(market_id)) {
+                    Self::pin_epoch_for_market(env, market_id, ref_spec, market.close_time)?;
                 }
-                if !Self::contains(&comm.members, &signer) {
+                // Re-read the pinned snapshot to be sure we use the stored pin.
+                let pinned = if let Some((cid, ep)) =
+                    env.storage().persistent().get::<_, (u64, u32)>(&DataKey::MarketEpoch(market_id))
+                {
+                    Self::load_snapshot(env, cid, ep)?
+                } else {
+                    snapshot.clone()
+                };
+                if !Self::contains(&pinned.members, &signer) {
                     return Err(Error::NotSigner);
                 }
-                (comm.threshold, Some(current))
+                (pinned.threshold, Some(pinned.epoch))
             }
             SignerAuthority::Hybrid(cfg) => {
                 if Self::resolution_state(env, market_id) != ResolutionState::HybridFallbackOpen {
@@ -3515,10 +3770,30 @@ impl Resolver {
             DataKey::CountV2(market_id, AttestedOutcome::Yes),
             DataKey::CountV2(market_id, AttestedOutcome::No),
             DataKey::CountV2(market_id, AttestedOutcome::Invalid),
+            // #297: committee epoch-binding entries are bumped alongside the
+            // market's other entries so they survive until finalization.
+            DataKey::CommitteeSpec(market_id),
+            DataKey::MarketEpoch(market_id),
         ];
         for key in keys {
             if env.storage().persistent().has(&key) {
                 ttl::bump_persistent(env, &key, target);
+            }
+        }
+        // #297: also bump the pinned snapshot's MemberAt and EpochStart entries.
+        // These are shared across markets; each market bumping them is idempotent.
+        if let Some((committee_id, epoch)) = env
+            .storage()
+            .persistent()
+            .get::<_, (u64, u32)>(&DataKey::MarketEpoch(market_id))
+        {
+            let member_key = DataKey::MemberAt(committee_id, epoch);
+            if env.storage().persistent().has(&member_key) {
+                ttl::bump_persistent(env, &member_key, target);
+            }
+            let epoch_start_key = DataKey::EpochStart(committee_id, epoch);
+            if env.storage().persistent().has(&epoch_start_key) {
+                ttl::bump_persistent(env, &epoch_start_key, target);
             }
         }
     }
@@ -6927,10 +7202,171 @@ mod test {
         let t = d.f.resolver.trade_status(&d.f.market_id);
         assert_eq!(t.state, ResolutionState::Finalized);
     }
-}
 
-#[cfg(test)]
-fn bytes_to_vec(bytes: &Bytes) -> std::vec::Vec<u8> {
+    // ── #297: committee epoch binding tests ──────────────────────────────────
+
+    /// Helper: builds a committee market fixture with given members and
+    /// threshold, advances time to close, and returns the fixture plus members.
+    fn committee_market(
+        member_count: u32,
+        threshold: u32,
+        max_rotation_delta: u32,
+    ) -> (Fixture, std::vec::Vec<Address>) {
+        let members_cell = std::cell::RefCell::new(std::vec::Vec::new());
+        let f = fixture(|env, _r, _a, _b| {
+            let list: std::vec::Vec<Address> =
+                (0..member_count).map(|_| Address::generate(env)).collect();
+            members_cell.borrow_mut().extend(list.iter().cloned());
+            ResolutionSpec::Committee(CommitteeRef {
+                committee_id: 0,
+                min_epoch: 1,
+                max_rotation_delta,
+                dispute_window: 100,
+            })
+        });
+        let members: std::vec::Vec<Address> = members_cell.into_inner();
+        let member_vec = Vec::from_slice(&f.env, &members);
+        f.resolver
+            .create_committee(&f.admin, &member_vec, &threshold, &MIN_ROTATION_DELAY);
+        f.resolver
+            .register_committee_spec(&f.market_id, &CommitteeRef {
+                committee_id: 0,
+                min_epoch: 1,
+                max_rotation_delta,
+                dispute_window: 100,
+            });
+        (f, members)
+    }
+
+    #[test]
+    fn rotation_after_attestations_does_not_drop_quorum() {
+        let (f, members) = committee_market(3, 2, 1);
+        f.env.ledger().set_timestamp(2_000);
+        f.resolver
+            .attest(&f.market_id, &members[0].clone(), &AttestedOutcome::Yes);
+        f.resolver
+            .attest(&f.market_id, &members[1].clone(), &AttestedOutcome::Yes);
+
+        let pin = f.resolver.market_committee_epoch(&f.market_id);
+        assert!(pin.is_some());
+        assert_eq!(pin.unwrap().1, 1u32);
+
+        let new_members = Vec::from_array(&f.env, [members[1].clone(), members[2].clone()]);
+        f.resolver
+            .propose_rotation(&0, &new_members, &2, &MIN_ROTATION_DELAY);
+        f.env.ledger().set_timestamp(2_000 + MIN_ROTATION_DELAY + 1);
+        f.resolver.execute_rotation(&0);
+
+        // finalize_signers should still succeed — old members' votes count.
+        f.env.ledger().set_timestamp(2_000 + 200);
+        f.resolver.finalize_signers(&f.market_id);
+    }
+
+    #[test]
+    fn rotation_after_close_new_members_cannot_attest() {
+        let (f, members) = committee_market(3, 2, 1);
+        f.env.ledger().set_timestamp(2_000);
+
+        let new_member = Address::generate(&f.env);
+        let new_members = Vec::from_array(&f.env, [new_member.clone(), members[2].clone()]);
+        f.resolver
+            .propose_rotation(&0, &new_members, &2, &MIN_ROTATION_DELAY);
+        f.env.ledger().set_timestamp(2_000 + MIN_ROTATION_DELAY + 1);
+        f.resolver.execute_rotation(&0);
+
+        f.env.ledger().set_timestamp(2_000);
+        f.resolver.pin_committee_epoch(&f.market_id).unwrap();
+        let pin = f.resolver.market_committee_epoch(&f.market_id).unwrap();
+        assert_eq!(pin.1, 1u32, "should pin to epoch 1 (in force at close)");
+
+        f.env.ledger().set_timestamp(2_000 + 10);
+        let result = f
+            .resolver
+            .try_attest(&f.market_id, &new_member, &AttestedOutcome::Yes);
+        assert_eq!(result, Err(Ok(Error::NotSigner)));
+    }
+
+    #[test]
+    fn pin_committee_epoch_is_idempotent() {
+        let (f, _members) = committee_market(3, 2, 1);
+        f.env.ledger().set_timestamp(2_000);
+        let first = f.resolver.pin_committee_epoch(&f.market_id).unwrap();
+        let second = f.resolver.pin_committee_epoch(&f.market_id).unwrap();
+        assert_eq!(first.1, second.1);
+    }
+
+    #[test]
+    fn pin_committee_epoch_rejects_before_close() {
+        let (f, _members) = committee_market(3, 2, 1);
+        f.env.ledger().set_timestamp(1_000);
+        let result = f.resolver.try_pin_committee_epoch(&f.market_id);
+        assert_eq!(result, Err(Ok(Error::MarketNotClosed)));
+    }
+
+    #[test]
+    fn committee_members_at_returns_snapshot() {
+        let (f, _members) = committee_market(3, 2, 1);
+        let (returned_members, threshold) = f.resolver.committee_members_at(&0, &1).unwrap();
+        assert_eq!(threshold, 2);
+        assert_eq!(returned_members.len(), 3);
+    }
+
+    #[test]
+    fn v2_committee_reveal_validates_committee_exists() {
+        let salt = [9u8; 32];
+        let f = v2_fixture(salt, |_env, _r, _a, _b| {
+            ResolutionSpec::Committee(CommitteeRef {
+                committee_id: 99,
+                min_epoch: 1,
+                max_rotation_delta: 1,
+                dispute_window: 100,
+            })
+        });
+        let result = f
+            .resolver
+            .try_register_spec_v2(&f.market_id, &envelope(&f, salt));
+        assert_eq!(result, Err(Ok(Error::CommitteeNotFound)));
+    }
+
+    #[test]
+    fn v2_committee_reveal_validates_max_rotation_delta_bound() {
+        let salt = [10u8; 32];
+        let f = v2_fixture(salt, |_env, _r, _a, _b| {
+            ResolutionSpec::Committee(CommitteeRef {
+                committee_id: 0,
+                min_epoch: 1,
+                max_rotation_delta: 99,
+                dispute_window: 100,
+            })
+        });
+        let members: Vec<Address> = Vec::from_array(
+            &f.env,
+            [
+                Address::generate(&f.env),
+                Address::generate(&f.env),
+                Address::generate(&f.env),
+            ],
+        );
+        f.resolver
+            .create_committee(&f.admin, &members, &2, &MIN_ROTATION_DELAY);
+        let result = f
+            .resolver
+            .try_register_spec_v2(&f.market_id, &envelope(&f, salt));
+        assert_eq!(result, Err(Ok(Error::InvalidConfig)));
+    }
+
+    #[test]
+    fn legacy_committee_without_epoch_start_pins_epoch_1() {
+        let (f, _members) = committee_market(3, 2, 1);
+        f.env.storage()
+            .persistent()
+            .remove(&DataKey::EpochStart(0, 1));
+        f.env.ledger().set_timestamp(2_000);
+        let result = f.resolver.pin_committee_epoch(&f.market_id);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().1, 1u32);
+    }
+}
     let mut out = std::vec![0u8; bytes.len() as usize];
     bytes.copy_into_slice(&mut out);
     out

@@ -68,6 +68,13 @@ export interface RegistryTraceReader {
     start: bigint;
     limit: number;
   }): Promise<{ result: RegistryTracePage }>;
+  /** #299: optional trace_verdict from the registry. */
+  trace_verdict?(args: {
+    trace_id: bigint;
+    received_hash: Buffer;
+  }): Promise<{ result: TraceVerdict }>;
+  /** #299: optional signature_verdict from the registry. */
+  signature_verdict?(args: { trace_id: bigint }): Promise<{ result: unknown }>;
 }
 
 /** Extended TraceRecord that carries registry metadata and the sale-time verdict. */
@@ -165,6 +172,26 @@ export class RegistryTraceRepository implements TraceRepository, TraceListReposi
     }
     try {
       const { result } = await this.reader.get_trace({ trace_id: id });
+      let verdict: TraceVerdict | undefined = undefined;
+      if (typeof this.reader.trace_verdict === "function") {
+        try {
+          const verdictRes = await this.reader.trace_verdict({
+            trace_id: id,
+            received_hash: result.trace_hash,
+          });
+          verdict = verdictRes.result;
+        } catch {
+          // Contract-level error or method unavailable
+        }
+      }
+      // #299: also read signature_verdict if available, to detect key compromise.
+      if (typeof this.reader.signature_verdict === "function" && !verdict) {
+        try {
+          await this.reader.signature_verdict({ trace_id: id });
+        } catch {
+          // Signature verdict unavailable; verdict stays undefined
+        }
+      }
       return {
         traceId,
         ipfsCid: result.ipfs_cid,

@@ -305,14 +305,22 @@ export function createTraceApi(options: TraceApiOptions): Express {
         accepted: paymentPayload.accepted,
         payload: paymentPayload.payload,
       }).paymentId;
-      const state = (await ledger.get(id))?.state;
-      if (state === "settling")
-        await ledger.transition(
-          id,
-          ["settling"],
-          error instanceof FacilitatorTimeoutError ? "indeterminate" : "failed",
-          { error: String(error) },
-        );
+      const entry = await ledger.get(id);
+      const state = entry?.state;
+      if (state === "settling") {
+        if (error instanceof FacilitatorTimeoutError) {
+          await ledger.transition(id, ["settling"], "indeterminate", {
+            error: String(error),
+          });
+        } else {
+          // #300: persist facilitator tx hash on failure, use failed_unconfirmed
+          // so the reconciler can check on-chain whether it actually settled.
+          await ledger.transition(id, ["settling"], "failed_unconfirmed", {
+            error: String(error),
+            facilitatorTx: (paymentPayload as { transaction?: string }).transaction,
+          });
+        }
+      }
       if (error instanceof FacilitatorTimeoutError)
         console.error(
           JSON.stringify({
@@ -485,6 +493,14 @@ export function createTraceApi(options: TraceApiOptions): Express {
       }
       // ── End verdict enforcement ─────────────────────────────────────────
 
+      // #299: refuse to serve traces whose verdict is anything other than Valid,
+      // before any payment is verified or settled.
+      if (prepared.record.verdict && prepared.record.verdict.tag !== "Valid") {
+        res
+          .status(410)
+          .json({ error: "trace_not_valid", verdict: prepared.record.verdict });
+        return;
+      }
       const body = JSON.stringify({
         traceId: prepared.record.traceId,
         traceHash: prepared.record.traceHash,
@@ -502,6 +518,7 @@ export function createTraceApi(options: TraceApiOptions): Express {
           res.status(402).json({ error: "Unsupported payment requirements" });
           return;
         }
+        const identity = paymentIdentity(payload);
         const claim = await ledger.claim({
           paymentId,
           traceId,
@@ -510,7 +527,10 @@ export function createTraceApi(options: TraceApiOptions): Express {
           payTo: r.payTo,
           amount: r.amount,
           asset: r.asset,
-          expiresAt: paymentIdentity(payload).expiresAt,
+          expiresAt: identity.expiresAt,
+          maxLedger: identity.maxLedger,
+          innerTxHash: identity.innerTxHash,
+          auths: identity.auths,
           responseBody: body,
           traceBytes: Buffer.from(prepared.bytes).toString("base64"),
           requirementsKey: requirementsKey(payload),
@@ -589,14 +609,23 @@ export function createTraceApi(options: TraceApiOptions): Express {
       if (!s.success) {
         const e = await ledger.get(paymentId);
         if (e?.state === "settling")
-          await ledger.transition(paymentId, ["settling"], "failed", {
+          await ledger.transition(paymentId, ["settling"], "failed_unconfirmed", {
             error: s.errorReason,
+            facilitatorTx: s.transaction,
           });
         if ((await ledger.get(paymentId))?.state === "indeterminate") {
           res.status(502).json({
             error: "Settlement outcome indeterminate",
             paymentId,
             transaction: s.transaction,
+          });
+          return;
+        }
+        // #300: if failed_unconfirmed, tell the buyer to wait for reconciliation
+        if ((await ledger.get(paymentId))?.state === "failed_unconfirmed") {
+          res.status(409).json({
+            error: "Settlement being reconciled",
+            retryAfter: 30,
           });
           return;
         }
@@ -698,7 +727,12 @@ export function createTraceApi(options: TraceApiOptions): Express {
         requirementsKey: _requirements,
         ...redacted
       } = e;
-      res.set("Cache-Control", "no-store").json(redacted);
+      // #300: surface reconciliation state in admin API
+      const adminEntry = {
+        ...redacted,
+        needsOperator: e.state === "needs_operator",
+      };
+      res.set("Cache-Control", "no-store").json(adminEntry);
     } catch {
       res.status(503).json({ error: "Ledger unavailable" });
     }
