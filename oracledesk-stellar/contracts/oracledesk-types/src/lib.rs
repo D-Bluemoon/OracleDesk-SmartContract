@@ -198,6 +198,110 @@ pub struct ResolutionSpecV2 {
     pub rule: ResolutionSpec,
 }
 
+// ---------------------------------------------------------------------------
+// Issue #292 — ResolutionSpecV3 / InvalidPolicy
+//
+// V1/V2 structs are frozen. The new envelope is strictly additive: it appends
+// an `Option<InvalidPolicy>` field and uses a different hash domain prefix
+// ("oracledesk:resolution-spec-v3") so V3 preimages can never collide with V2.
+// ---------------------------------------------------------------------------
+
+/// Per-market Invalid-attestation policy committed in a V3 spec envelope.
+///
+/// When present, `threshold` is the minimum Invalid attestation count required
+/// to reach quorum — it **must** be strictly greater than the Yes/No threshold
+/// of the underlying rule (validated in `register_spec_v3`).
+///
+/// `allow_displacement`: when `false`, an Invalid quorum can never displace a
+/// pending Yes/No proposal (NoInvalidDisplacement holds).  When `true`, at most
+/// one displacement is permitted per market (tracked by `DataKey::InvalidDisplaced`).
+///
+/// **Preconditions** (enforced by `validate_invalid_policy`):
+/// - `threshold > base_threshold` and `threshold <= member_count`; if
+///   `threshold > member_count` the market can never void via signers.
+/// - For Committee resolution the threshold is re-checked at attest time
+///   against the membership epoch in force for the current quorum.
+/// - Price / WeightedKeys rules: policy is `InvalidConfig` (not yet supported
+///   here; a follow-up item adds weighted-key Invalid support).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvalidPolicy {
+    /// Address count, committee members, or weight threshold for Invalid quorum.
+    pub threshold: u32,
+    /// Whether a quorum of Invalid attestations may displace a pending Yes/No
+    /// proposal.  At most one displacement is ever allowed per market.
+    pub allow_displacement: bool,
+}
+
+/// V3 commitment envelope.
+///
+/// Commitment domain: `sha256("oracledesk:resolution-spec-v3" || XDR(ResolutionSpecV3))`.
+/// The domain prefix differs from V2 (`"oracledesk:resolution-spec"`) so a V3
+/// preimage with `invalid = None` cannot collide with the corresponding V2 hash.
+///
+/// Fields `version`, `network_id`, `market_core`, `salt` and `rule` carry
+/// identical semantics to [`ResolutionSpecV2`].  The only addition is `invalid`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionSpecV3 {
+    /// Must be 3; `register_spec_v3` rejects any other value.
+    pub version: u32,
+    /// `sha256(network passphrase)`, i.e. `env.ledger().network_id()`.
+    pub network_id: BytesN<32>,
+    pub market_core: Address,
+    pub salt: BytesN<32>,
+    pub rule: ResolutionSpec,
+    /// Optional Invalid-attestation policy.  `None` gives legacy V2 semantics:
+    /// Invalid uses the same threshold as Yes/No and displacement is unrestricted.
+    pub invalid: Option<InvalidPolicy>,
+}
+
+// ---------------------------------------------------------------------------
+// Issue #291 — Multi-leg trade types (Leg / LegResult / LegKind)
+//
+// Shared by Router::execute_legs and Treasury::agent_execute_legs.
+// Existing commitment XDR is unaffected — these are new, non-commitment types.
+// ---------------------------------------------------------------------------
+
+/// Direction of a single leg in an atomic multi-leg trade bundle.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegKind {
+    /// Spend exactly `amount` collateral, receive at least `bound` shares.
+    BuyExactIn,
+    /// Receive exactly `amount` collateral, spend at most `bound` shares.
+    SellExactOut,
+}
+
+/// One leg of an atomic multi-leg trade bundle.
+///
+/// Duplicate `(market_id, outcome, kind)` triples are rejected with
+/// `Error::DuplicateLeg` to prevent circumventing `max_market` caps and
+/// to keep the auth tree unambiguous.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Leg {
+    pub market_id: u64,
+    pub outcome: Outcome,
+    pub kind: LegKind,
+    /// Collateral in (BuyExactIn) or collateral out (SellExactOut).
+    pub amount: i128,
+    /// Min shares out (BuyExactIn) or max shares in (SellExactOut).
+    pub bound: i128,
+    /// Slippage ceiling; 0 means no limit.
+    pub limit_price_bps: u32,
+}
+
+/// Per-leg result returned by `execute_legs` / `agent_execute_legs`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LegResult {
+    pub market_id: u64,
+    /// Net collateral flow for this leg (positive = received, negative = spent).
+    pub collateral: i128,
+    pub shares: i128,
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
