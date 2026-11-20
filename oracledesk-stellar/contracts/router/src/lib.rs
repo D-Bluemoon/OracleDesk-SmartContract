@@ -173,26 +173,20 @@ pub struct TradeBounds {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ChainArgs {
-    pub expected_seq: u64,
-    pub prev_trace_hash: BytesN<32>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SigArgs {
-    pub signing_key: BytesN<32>,
-    pub signature: BytesN<64>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TraceArgs {
     pub action: TraceAction,
     pub trace_hash: BytesN<32>,
     pub ipfs_cid: String,
-    pub chain: Option<ChainArgs>,
-    pub sig: Option<SigArgs>,
+    /// Chained publish requested. When `false`, `chain_expected_seq` and
+    /// `chain_prev_trace_hash` are ignored.
+    pub chained: bool,
+    pub chain_expected_seq: u64,
+    pub chain_prev_trace_hash: BytesN<32>,
+    /// Signed publish requested. When `false`, `signing_key` and `signature`
+    /// are ignored.
+    pub signed: bool,
+    pub signing_key: BytesN<32>,
+    pub signature: BytesN<64>,
 }
 
 #[contracttype]
@@ -472,7 +466,7 @@ impl Router {
         }
 
         let trace_id = Self::publish(&env, &registry, &trader, market_id, &trace);
-        let chain_seq = Self::chain_seq(&env, &registry, &trader, &trace.chain);
+        let chain_seq = Self::chain_seq(&env, &registry, &trader, trace.chained);
         TradeTraced {
             market_id,
             trader,
@@ -541,7 +535,7 @@ impl Router {
         }
 
         let trace_id = Self::publish(&env, &registry, &agent, market_id, &trace);
-        let chain_seq = Self::chain_seq(&env, &registry, &agent, &trace.chain);
+        let chain_seq = Self::chain_seq(&env, &registry, &agent, trace.chained);
         TradeTraced {
             market_id,
             trader: agent,
@@ -573,6 +567,9 @@ impl Router {
         ipfs_cid: String,
     ) -> Result<TradeTraceResult, Error> {
         let deadline = env.ledger().timestamp();
+        // Built before `env` is moved into the call below.
+        let zero32 = BytesN::from_array(&env, &[0u8; 32]);
+        let zero64 = BytesN::from_array(&env, &[0u8; 64]);
         Self::trade_and_publish_trace(
             env,
             trader,
@@ -589,8 +586,12 @@ impl Router {
                 action: TraceAction::Buy,
                 trace_hash,
                 ipfs_cid,
-                chain: None,
-                sig: None,
+                chained: false,
+                chain_expected_seq: 0,
+                chain_prev_trace_hash: zero32.clone(),
+                signed: false,
+                signing_key: zero32,
+                signature: zero64,
             },
         )
     }
@@ -700,23 +701,23 @@ impl Router {
             trace.trace_hash.clone().into_val(env),
             trace.ipfs_cid.clone().into_val(env),
         ];
-        match (&trace.chain, &trace.sig) {
-            (None, None) => Self::invoke_publish(env, registry, "publish_trace", args),
-            (Some(chain), None) => {
-                args.push_back(chain.expected_seq.into_val(env));
-                args.push_back(chain.prev_trace_hash.clone().into_val(env));
+        match (trace.chained, trace.signed) {
+            (false, false) => Self::invoke_publish(env, registry, "publish_trace", args),
+            (true, false) => {
+                args.push_back(trace.chain_expected_seq.into_val(env));
+                args.push_back(trace.chain_prev_trace_hash.clone().into_val(env));
                 Self::invoke_publish(env, registry, "publish_chained_trace", args)
             }
-            (None, Some(sig)) => {
-                args.push_back(sig.signing_key.clone().into_val(env));
-                args.push_back(sig.signature.clone().into_val(env));
+            (false, true) => {
+                args.push_back(trace.signing_key.clone().into_val(env));
+                args.push_back(trace.signature.clone().into_val(env));
                 Self::invoke_publish(env, registry, "publish_trace_signed", args)
             }
-            (Some(chain), Some(sig)) => {
-                args.push_back(chain.expected_seq.into_val(env));
-                args.push_back(chain.prev_trace_hash.clone().into_val(env));
-                args.push_back(sig.signing_key.clone().into_val(env));
-                args.push_back(sig.signature.clone().into_val(env));
+            (true, true) => {
+                args.push_back(trace.chain_expected_seq.into_val(env));
+                args.push_back(trace.chain_prev_trace_hash.clone().into_val(env));
+                args.push_back(trace.signing_key.clone().into_val(env));
+                args.push_back(trace.signature.clone().into_val(env));
                 Self::invoke_publish(env, registry, "publish_chained_trace_signed", args)
             }
         }
@@ -730,9 +731,9 @@ impl Router {
         env: &Env,
         registry: &Address,
         author: &Address,
-        chain: &Option<ChainArgs>,
+        chained: bool,
     ) -> Option<u64> {
-        if chain.is_none() {
+        if !chained {
             return None;
         }
         let head: ChainHead = env.invoke_contract(

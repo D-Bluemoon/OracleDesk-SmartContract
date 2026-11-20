@@ -322,8 +322,12 @@ fn action_mismatch_rejected_before_any_call() {
             action: TraceAction::Sell,
             trace_hash: BytesN::from_array(&f.env, &[1u8; 32]),
             ipfs_cid: String::from_str(&f.env, "ipfs://trace"),
-            chain: None,
-            sig: None,
+            chained: false,
+            chain_expected_seq: 0,
+            chain_prev_trace_hash: BytesN::from_array(&f.env, &[0u8; 32]),
+            signed: false,
+            signing_key: BytesN::from_array(&f.env, &[0u8; 32]),
+            signature: BytesN::from_array(&f.env, &[0u8; 64]),
         },
     );
     assert_eq!(err, Err(Ok(Error::ActionMismatch)));
