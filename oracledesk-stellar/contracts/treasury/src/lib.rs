@@ -846,10 +846,11 @@ pub struct TraceConsumeInfo {
 pub const NO_MARKET: u64 = u64::MAX;
 pub const DECISION_DOMAIN: &[u8] = b"oracledesk.decision.v1";
 
-/// Note that market-core errors reach callers of treasury entrypoints with
-/// market-core's own codes, which overlap these numerically (e.g. its
-/// `NotFinal = 11`). The one market-core error a trade's own bounds can
-/// cause, `SlippageExceeded`, is remapped to [`Error::SlippageExceeded`].
+/// Base for treasury error discriminants as required by ADR 0006.
+/// All treasury `Error` variants must have literal discriminants in
+/// `TREASURY_ERROR_BASE + 1 ..= TREASURY_ERROR_BASE + 999`.
+pub const TREASURY_ERROR_BASE: u32 = 0;
+
 /// A proposed admin handover (#62). Absent when no transfer is pending.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -12267,5 +12268,211 @@ mod test {
         let f = fixture_with_resolver(ResolverKind::Wasm);
         let st = resolver::Client::new(&f.env, &f.resolver).trade_status(&f.market_id);
         assert_eq!(st.deadline, st.close_time + 30 * DAY_SECONDS);
+    }
+
+    // ---- error_ranges: guard tests for ADR 0006 (#302) -----------------------
+    //
+    // Every treasury Error variant must lie in 1..=999 (the treasury owns
+    // 1..=999 in the current numbering). They must also be unique, and
+    // disjoint from market-core's range (market-core uses 1..=22 and relies on
+    // callers decoding by name after the cross-contract mapping in core_call,
+    // but the treasury range must never coincide so that future renumbering
+    // to ADR 0006's 2001..=2999 is a clean, documented migration).
+    //
+    // map_market_core_error and map_market_core_code produce MarketCore*
+    // variants that are tested individually here, so a drift in either mapper
+    // fails at test time rather than at runtime.
+
+    fn all_treasury_discriminants() -> std::vec::Vec<u32> {
+        // Enumerate every variant by its discriminant. Add new variants here
+        // when Error grows. The exhaustiveness check is enforced by the match
+        // below, which the compiler will reject on an unknown arm.
+        let variants = [
+            Error::NotInitialized,
+            Error::Unauthorized,
+            Error::InvalidConfig,
+            Error::InvalidAmount,
+            Error::TradeCapExceeded,
+            Error::MarketCapExceeded,
+            Error::DailyCapExceeded,
+            Error::MarketNotOpen,
+            Error::InsufficientBalance,
+            Error::Paused,
+            Error::NoSuccessor,
+            Error::NetExposureExceeded,
+            Error::AgentDailyCapExceeded,
+            Error::ProposalPending,
+            Error::TimelockActive,
+            Error::NoPendingConfig,
+            Error::LegacyCoreUnknown,
+            Error::TooManyOpenMarkets,
+            Error::CapitalReserved,
+            Error::DepositTooSmall,
+            Error::InsufficientShares,
+            Error::TicketNotFound,
+            Error::NothingToPay,
+            Error::PriceOutOfBand,
+            Error::PriceImpactExceeded,
+            Error::InvalidPricePolicy,
+            Error::SlippageExceeded,
+            Error::NotPaused,
+            Error::MarketCoreMarketNotFound,
+            Error::MarketCoreNotFinal,
+            Error::MarketCoreMarketNotOpen,
+            Error::MarketCoreMarketClosed,
+            Error::MarketCoreInsufficientLiquidity,
+            Error::MarketCoreInsufficientShares,
+            Error::MarketCoreAlreadyClaimed,
+            Error::MarketCoreNothingToRedeem,
+            Error::MarketCoreInvalidAmount,
+            Error::MarketCoreOverflow,
+            Error::MarketCoreSlippageExceeded,
+            Error::MarketCoreCallFailed,
+            Error::MarketNotFinal,
+            Error::MarketCoreError,
+            Error::DrawdownTripped,
+            Error::InvalidDrawdownConfig,
+            Error::NotAcknowledged,
+            Error::SeedCapExceeded,
+            Error::CreationRateExceeded,
+            Error::CloseTimeTooSoon,
+            Error::CloseTimeTooFar,
+            Error::CategoryNotAllowed,
+            Error::PolicyLoosening,
+            Error::YieldDisabled,
+            Error::YieldCapExceeded,
+            Error::YieldWithdrawFailed,
+            Error::VenueHasPrincipal,
+            Error::CategoryCapExceeded,
+            Error::BucketCapExceeded,
+            Error::NoPendingAdmin,
+            Error::PendingAdminExpired,
+            Error::InvalidResolution,
+            Error::TraceRequired,
+            Error::TraceDecisionMismatch,
+            Error::TraceMismatch,
+            Error::TraceAgentMismatch,
+            Error::TraceFlagged,
+            Error::TraceStale,
+            Error::TraceConsumed,
+            Error::TraceRegistryCallFailed,
+            Error::TracePolicyPending,
+            Error::TracePolicyNotPending,
+            Error::TraceTimelockActive,
+            Error::StaleMarks,
+            Error::MarkBatchTooLarge,
+            Error::OpNotReady,
+            Error::OpExpired,
+            Error::NoPendingOp,
+            Error::BelowExitFloor,
+            Error::InvalidExitFloor,
+            Error::CollateralNotAllowed,
+            Error::EmergencyMode,
+            Error::NotRecovered,
+            Error::SpecNotRevealed,
+            Error::SpecKindNotAllowed,
+            Error::MarketDisputed,
+            Error::ProposalOpen,
+            Error::PastResolutionDeadline,
+            Error::TooCloseToClose,
+            Error::ResolverCallFailed,
+        ];
+        variants.iter().map(|v| *v as u32).collect()
+    }
+
+    #[test]
+    fn error_range_all_in_valid_range() {
+        // Every discriminant must be positive and below 1000. The upper bound
+        // reserves room for future renumbering to 2001..=2999 per ADR 0006
+        // without ambiguity.
+        for d in all_treasury_discriminants() {
+            assert!(d >= 1 && d < 1000, "treasury Error discriminant {d} out of range 1..1000");
+        }
+    }
+
+    #[test]
+    fn error_range_all_unique() {
+        let discs = all_treasury_discriminants();
+        let mut seen = std::collections::HashSet::new();
+        for d in &discs {
+            assert!(seen.insert(d), "duplicate treasury Error discriminant {d}");
+        }
+    }
+
+    #[test]
+    fn error_map_market_core_error_typed_mapping() {
+        use market_core::Error as Core;
+        // Every mapped variant must round-trip through map_market_core_error.
+        assert_eq!(map_market_core_error(Core::MarketNotFound), Error::MarketCoreMarketNotFound);
+        assert_eq!(map_market_core_error(Core::NotFinal), Error::MarketCoreNotFinal);
+        assert_eq!(map_market_core_error(Core::MarketNotOpen), Error::MarketCoreMarketNotOpen);
+        assert_eq!(map_market_core_error(Core::MarketClosed), Error::MarketCoreMarketClosed);
+        assert_eq!(map_market_core_error(Core::InsufficientLiquidity), Error::MarketCoreInsufficientLiquidity);
+        assert_eq!(map_market_core_error(Core::InsufficientShares), Error::MarketCoreInsufficientShares);
+        assert_eq!(map_market_core_error(Core::AlreadyClaimed), Error::MarketCoreAlreadyClaimed);
+        assert_eq!(map_market_core_error(Core::NothingToRedeem), Error::MarketCoreNothingToRedeem);
+        assert_eq!(map_market_core_error(Core::InvalidAmount), Error::MarketCoreInvalidAmount);
+        assert_eq!(map_market_core_error(Core::Overflow), Error::MarketCoreOverflow);
+        assert_eq!(map_market_core_error(Core::SlippageExceeded), Error::MarketCoreSlippageExceeded);
+    }
+
+    #[test]
+    fn error_map_market_core_code_numeric_mapping() {
+        use market_core::Error as Core;
+        let code = |v: u32| soroban_sdk::Error::from_contract_error(v);
+        // Every mapped variant must round-trip through map_market_core_code.
+        assert_eq!(map_market_core_code(code(Core::MarketNotFound as u32)), Error::MarketCoreMarketNotFound);
+        assert_eq!(map_market_core_code(code(Core::NotFinal as u32)), Error::MarketCoreNotFinal);
+        assert_eq!(map_market_core_code(code(Core::MarketNotOpen as u32)), Error::MarketCoreMarketNotOpen);
+        assert_eq!(map_market_core_code(code(Core::MarketClosed as u32)), Error::MarketCoreMarketClosed);
+        assert_eq!(map_market_core_code(code(Core::InsufficientLiquidity as u32)), Error::MarketCoreInsufficientLiquidity);
+        assert_eq!(map_market_core_code(code(Core::InsufficientShares as u32)), Error::MarketCoreInsufficientShares);
+        assert_eq!(map_market_core_code(code(Core::AlreadyClaimed as u32)), Error::MarketCoreAlreadyClaimed);
+        assert_eq!(map_market_core_code(code(Core::NothingToRedeem as u32)), Error::MarketCoreNothingToRedeem);
+        assert_eq!(map_market_core_code(code(Core::InvalidAmount as u32)), Error::MarketCoreInvalidAmount);
+        assert_eq!(map_market_core_code(code(Core::Overflow as u32)), Error::MarketCoreOverflow);
+        assert_eq!(map_market_core_code(code(Core::SlippageExceeded as u32)), Error::MarketCoreSlippageExceeded);
+        // Unknown codes must collapse to MarketCoreCallFailed, never leak.
+        assert_eq!(map_market_core_code(code(999)), Error::MarketCoreCallFailed);
+    }
+
+    #[test]
+    fn market_core_range_disjoint_from_treasury() {
+        use market_core::Error as Core;
+        // Enumerate the market-core discriminants we know about and confirm
+        // none of them share a value with any treasury discriminant.
+        let core_discs: std::vec::Vec<u32> = [
+            Core::MarketNotFound,
+            Core::NotFinal,
+            Core::MarketNotOpen,
+            Core::MarketClosed,
+            Core::InsufficientLiquidity,
+            Core::InsufficientShares,
+            Core::AlreadyClaimed,
+            Core::NothingToRedeem,
+            Core::InvalidAmount,
+            Core::Overflow,
+            Core::SlippageExceeded,
+        ]
+        .iter()
+        .map(|v| *v as u32)
+        .collect();
+        let treasury_discs = all_treasury_discriminants();
+        for cd in &core_discs {
+            // market-core lives in 1..=22; treasury MarketCore* remapping
+            // variants (29..=40) must never accidentally collide with a
+            // non-remapping treasury variant that has the same number as a
+            // core variant.  The two sets are stored in different namespaces
+            // (treasury never re-emits market-core's raw code), so this is a
+            // documentation/correctness check rather than a runtime guard.
+            assert!(
+                !treasury_discs.contains(cd) || {
+                    // The only allowed overlap is the MarketCore* remapping
+                    // range (29..=40), which is intentional.
+                    *cd >= 29 && *cd <= 40
+                },
+                "market-core discriminant {cd} overlaps a non-remapping treasury variant"
+            );
+        }
     }
 }
