@@ -440,6 +440,14 @@ export function createTraceApi(options: TraceApiOptions): Express {
         res.status(404).json({ error: "Trace not found" });
         return;
       }
+      // #299: refuse to serve traces whose verdict is anything other than Valid,
+      // before any payment is verified or settled.
+      if (prepared.record.verdict && prepared.record.verdict.tag !== "Valid") {
+        res
+          .status(410)
+          .json({ error: "trace_not_valid", verdict: prepared.record.verdict });
+        return;
+      }
       const body = JSON.stringify({
         traceId: prepared.record.traceId,
         traceHash: prepared.record.traceHash,

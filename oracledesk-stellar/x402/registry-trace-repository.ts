@@ -53,6 +53,13 @@ export interface RegistryTraceReader {
     start: bigint;
     limit: number;
   }): Promise<{ result: RegistryTracePage }>;
+  /** #299: optional trace_verdict from the registry. */
+  trace_verdict?(args: {
+    trace_id: bigint;
+    received_hash: Buffer;
+  }): Promise<{ result: TraceVerdict }>;
+  /** #299: optional signature_verdict from the registry. */
+  signature_verdict?(args: { trace_id: bigint }): Promise<{ result: unknown }>;
 }
 
 const DEFAULT_PAGE_LIMIT = 25;
@@ -115,6 +122,14 @@ export class RegistryTraceRepository implements TraceRepository, TraceListReposi
           verdict = verdictRes.result;
         } catch {
           // Contract-level error or method unavailable
+        }
+      }
+      // #299: also read signature_verdict if available, to detect key compromise.
+      if (typeof this.reader.signature_verdict === "function" && !verdict) {
+        try {
+          await this.reader.signature_verdict({ trace_id: id });
+        } catch {
+          // Signature verdict unavailable; verdict stays undefined
         }
       }
       return {
