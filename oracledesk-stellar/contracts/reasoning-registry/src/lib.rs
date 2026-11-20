@@ -307,6 +307,23 @@ pub enum DataKey {
     SigningKeyHistory(Address, u32),
     KeyToAgent(BytesN<32>),
     TraceSignature(u64),
+    // ── #307 Per-agent consumer scoping ─────────────────────────────────────
+    /// `AgentConsumer(agent, consumer)` → `ConsumerGrant { granted_at: u64 }`
+    AgentConsumer(Address, Address),
+    /// Count of consumers authorised by an agent (for the dense array).
+    AgentConsumerCount(Address),
+    /// Dense index: `AgentConsumerAt(agent, index)` → `Address` (consumer).
+    AgentConsumerAt(Address, u32),
+    /// Reverse slot: `AgentConsumerSlot(agent, consumer)` → `u32`.
+    AgentConsumerSlot(Address, Address),
+    /// Per-agent default consumer applied at publish time.
+    AgentDefaultConsumer(Address),
+    /// Per-trace consumer binding (write-once at publish or via bind_trace_consumer).
+    TraceConsumer(u64),
+    /// Batch-level consumer binding written from the agent's default at batch publish.
+    BatchConsumer(u64),
+    /// Instance flag: `true` once enable_consumer_scoping() has been called.
+    ConsumerScoping,
     /// #299: per-key retroactive revocation record.
     KeyRevocation(BytesN<32>),
     /// #299: number of traces a key has signed (per-key index length).
@@ -390,6 +407,20 @@ pub enum Error {
     SigningKeyNotFound = 126,
     TooManySigningKeys = 127,
     SigningKeyAlreadyBound = 128,
+    // ── #307 Per-agent consumer scoping ──────────────────────────────────
+    /// `authorize_consumer` called after agent has reached MAX_AGENT_CONSUMERS.
+    TooManyConsumers = 129,
+    /// `consume_trace` called by a consumer the publishing agent never granted.
+    ConsumerNotAuthorized = 130,
+    /// `consume_trace` called by a consumer other than the one the trace is bound to.
+    TraceBoundElsewhere = 131,
+    /// `set_default_consumer` or `bind_trace_consumer` called with a consumer the
+    /// agent has not yet authorised.
+    ConsumerGrantRequired = 132,
+    /// `bind_trace_consumer` called on a trace that already has a binding.
+    TraceAlreadyBound = 133,
+    /// `grant_consumer_legacy` called after scoping has been enabled.
+    ScopingAlreadyEnabled = 134,
     /// #299: Key already revoked and `compromised_since` cannot move later.
     AlreadyRevoked = 129,
 }
