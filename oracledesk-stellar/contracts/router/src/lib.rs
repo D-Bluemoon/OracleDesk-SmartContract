@@ -63,10 +63,15 @@ use treasury::Client as TreasuryClient;
 // Only its `WASM` constant (used by the tests) is taken from the import: every
 // publish call is made dynamically below so this crate does not encode the
 // stale `String`-action interface at compile time.
-#[allow(dead_code)]
-#[allow(clippy::too_many_arguments)]
-mod reasoning_registry {
-    soroban_sdk::contractimport!(file = "reasoning_registry.wasm");
+
+/// `market_core` and `treasury` each generate their own `Outcome` type from
+/// their wasm import, so the router maps between them explicitly. The variants
+/// have identical XDR encodings.
+fn to_treasury_outcome(outcome: &market_core::Outcome) -> treasury::Outcome {
+    match outcome {
+        market_core::Outcome::Yes => treasury::Outcome::Yes,
+        market_core::Outcome::No => treasury::Outcome::No,
+    }
 }
 
 /// Domain tag prepended to a V2 spec before hashing. Must match the resolver's
@@ -127,7 +132,7 @@ pub struct MarketCreatedAndRevealed {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AgentMarketCreatedAndRevealed {
+pub struct AgentMarketRevealed {
     #[topic]
     pub market_id: u64,
     #[topic]
@@ -338,7 +343,7 @@ impl Router {
         };
         let (resolver, _) = Self::live_wiring(&env, &cfg)?;
         Self::assert_rule_kind(&env, &resolver, market_id, &spec_v2)?;
-        AgentMarketCreatedAndRevealed {
+        AgentMarketRevealed {
             market_id,
             agent,
             creator: treasury,
@@ -515,7 +520,7 @@ impl Router {
             Side::Buy => treasury_client.agent_buy_v2(
                 &agent,
                 &market_id,
-                &outcome,
+                &to_treasury_outcome(&outcome),
                 &bounds.amount,
                 &bounds.limit_shares,
                 &bounds.limit_price_bps,
@@ -524,7 +529,7 @@ impl Router {
             Side::Sell => treasury_client.agent_sell_v2(
                 &agent,
                 &market_id,
-                &outcome,
+                &to_treasury_outcome(&outcome),
                 &bounds.amount,
                 &bounds.limit_shares,
                 &bounds.limit_price_bps,

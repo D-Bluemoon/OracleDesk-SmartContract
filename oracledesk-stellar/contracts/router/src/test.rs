@@ -1,5 +1,10 @@
 use super::*;
 use market_core::MarketStatus;
+// Test-only import of the vendored registry. Kept out of the crate root: the
+// contract import's spec types would collide with the router's own event types.
+mod reasoning_registry {
+    soroban_sdk::contractimport!(file = "reasoning_registry.wasm");
+}
 use reasoning_registry::Client as RegistryClient;
 use resolver::{PriceConfig, SignerConfig};
 use soroban_sdk::{
