@@ -26,6 +26,60 @@ mod market_core {
 }
 use market_core::Client as MarketCoreClient;
 
+// ─── Cross-contract call helpers (#293 / ADR 0006) ───────────────────────────
+
+/// Base discriminant for resolver error codes (ADR 0006: 1001..=1999).
+pub const RESOLVER_ERROR_BASE: u32 = 1000;
+
+/// Map a market-core error to the resolver's cross-contract error range.
+fn map_market_core_error(e: market_core::Error) -> Error {
+    use market_core::Error as M;
+    match e {
+        M::MarketNotFound => Error::MarketCoreMarketNotFound,
+        M::NotFinal => Error::MarketCoreNotFinal,
+        M::MarketNotOpen => Error::MarketCoreMarketNotOpen,
+        M::MarketClosed => Error::MarketCoreMarketClosed,
+        M::InsufficientLiquidity => Error::MarketCoreInsufficientLiquidity,
+        M::InsufficientShares => Error::MarketCoreInsufficientShares,
+        M::AlreadyClaimed => Error::MarketCoreAlreadyClaimed,
+        M::NothingToRedeem => Error::MarketCoreNothingToRedeem,
+        M::InvalidAmount => Error::MarketCoreInvalidAmount,
+        M::Overflow => Error::MarketCoreOverflow,
+        M::SlippageExceeded => Error::MarketCoreSlippageExceeded,
+        _ => Error::MarketCoreCallFailed,
+    }
+}
+
+/// Unwrap a cross-contract call result into the resolver's error type.
+fn core_call<T>(
+    r: Result<Result<T, market_core::Error>, Result<soroban_sdk::Error, soroban_sdk::InvokeError>>,
+) -> Result<T, Error> {
+    match r {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(map_market_core_error(e)),
+        Err(_) => Err(Error::MarketCoreCallFailed),
+    }
+}
+
+/// Unwrap a reasoning-registry cross-contract call.
+fn registry_call<T, E>(
+    r: Result<Result<T, E>, Result<soroban_sdk::Error, soroban_sdk::InvokeError>>,
+) -> Result<T, Error> {
+    match r {
+        Ok(Ok(v)) => Ok(v),
+        _ => Err(Error::RegistryCallFailed),
+    }
+}
+
+/// Convert the shared `Outcome` to the market-core imported `Outcome`.
+fn to_core_outcome(o: &Outcome) -> market_core::Outcome {
+    match o {
+        Outcome::Yes => market_core::Outcome::Yes,
+        Outcome::No => market_core::Outcome::No,
+        Outcome::Invalid => market_core::Outcome::Invalid,
+    }
+}
+
 // The resolution-spec surface is XDR-consensus-critical (`resolution_hash =
 // sha256(spec.to_xdr())`), so its definitions now live in the shared
 // `oracledesk-types` crate rather than being duplicated per contract. Re-export
@@ -71,6 +125,9 @@ pub const RESOLUTION_GRACE_SECS: u64 = 30 * 86_400;
 pub const MAX_COMMITTEE: u32 = 32;
 /// Minimum time-lock delay for proposing and executing committee rotations (1 day).
 pub const MIN_ROTATION_DELAY: u64 = 86_400;
+
+// #293: removed duplicate local OracleAsset — the shared type from oracledesk_types is re-exported
+// above (line 35). Keeping it here caused E0255 / orphan-impl errors.
 
 /// Grace period for revealing specs before guardian void is allowed (3 days).
 pub const REVEAL_GRACE_SECS: u64 = 3 * 86_400;
@@ -537,80 +594,20 @@ pub enum Error {
     NoPendingAdmin = 42,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 43,
-    // ---- market-core / registry call failures, mirrored by `core_call` (#60).
-    // A distinct code per market-core error keeps the cause visible to callers.
-    MarketCoreCallFailed = 1042,
-    MarketCoreMarketNotFound = 1043,
-    MarketCoreNotFinal = 1044,
-    MarketCoreMarketNotOpen = 1045,
-    MarketCoreMarketClosed = 1046,
-    MarketCoreInsufficientLiquidity = 1047,
-    MarketCoreInsufficientShares = 1048,
-    MarketCoreAlreadyClaimed = 1049,
-    MarketCoreNothingToRedeem = 1050,
-    MarketCoreInvalidAmount = 1051,
-    MarketCoreOverflow = 1052,
-    MarketCoreSlippageExceeded = 1053,
-    /// A reasoning-registry read failed.
-    RegistryCallFailed = 1054,
-}
-
-/// Maps a market-core contract error onto the resolver's own range.
-pub fn map_market_core_error(error: market_core::Error) -> Error {
-    use market_core::Error as Core;
-    match error {
-        Core::MarketNotFound => Error::MarketCoreMarketNotFound,
-        Core::NotFinal => Error::MarketCoreNotFinal,
-        Core::MarketNotOpen => Error::MarketCoreMarketNotOpen,
-        Core::MarketClosed => Error::MarketCoreMarketClosed,
-        Core::InsufficientLiquidity => Error::MarketCoreInsufficientLiquidity,
-        Core::InsufficientShares => Error::MarketCoreInsufficientShares,
-        Core::AlreadyClaimed => Error::MarketCoreAlreadyClaimed,
-        Core::NothingToRedeem => Error::MarketCoreNothingToRedeem,
-        Core::InvalidAmount => Error::MarketCoreInvalidAmount,
-        Core::Overflow => Error::MarketCoreOverflow,
-        Core::SlippageExceeded => Error::MarketCoreSlippageExceeded,
-        _ => Error::MarketCoreCallFailed,
-    }
-}
-
-/// Converts the shared `Outcome` into the `contractimport!`-generated
-/// market-core `Outcome`. They are structurally identical, but distinct Rust
-/// types.
-fn to_core_outcome(outcome: &Outcome) -> market_core::Outcome {
-    match outcome {
-        Outcome::Yes => market_core::Outcome::Yes,
-        Outcome::No => market_core::Outcome::No,
-    }
-}
-
-/// Runs a generated `try_*` market-core call, mapping both the callee error and
-/// a host/invocation failure into resolver variants. This is the only shape a
-/// cross-contract market-core call may take: the panicking generated methods
-/// would abort with market-core's own code.
-fn core_call<T, C>(
-    result: Result<Result<T, C>, Result<market_core::Error, soroban_sdk::InvokeError>>,
-) -> Result<T, Error> {
-    match result {
-        Ok(Ok(value)) => Ok(value),
-        // The reply did not convert to the declared return type.
-        Ok(Err(_)) => Err(Error::MarketCoreCallFailed),
-        // market-core returned one of its own contract errors.
-        Err(Ok(error)) => Err(map_market_core_error(error)),
-        // The call trapped or hit a host error.
-        Err(Err(_)) => Err(Error::MarketCoreCallFailed),
-    }
-}
-
-/// Runs a generated `try_*` reasoning-registry call (only `try_get_trace` is
-/// used), mapping any failure to `RegistryCallFailed`.
-fn registry_call<T, C, E>(
-    result: Result<Result<T, C>, Result<E, soroban_sdk::InvokeError>>,
-) -> Result<T, Error> {
-    match result {
-        Ok(Ok(value)) => Ok(value),
-        _ => Err(Error::RegistryCallFailed),
-    }
+    // ── Cross-contract error range (ADR 0006, 1001..=1999) ──────────────────
+    MarketCoreMarketNotFound      = 1044,
+    MarketCoreNotFinal            = 1045,
+    MarketCoreMarketNotOpen       = 1046,
+    MarketCoreMarketClosed        = 1047,
+    MarketCoreInsufficientLiquidity = 1048,
+    MarketCoreInsufficientShares  = 1049,
+    MarketCoreAlreadyClaimed      = 1050,
+    MarketCoreNothingToRedeem     = 1051,
+    MarketCoreInvalidAmount       = 1052,
+    MarketCoreOverflow            = 1053,
+    MarketCoreSlippageExceeded    = 1054,
+    MarketCoreCallFailed          = 1055,
+    RegistryCallFailed            = 1056,
 }
 
 #[contracttype]
@@ -1496,13 +1493,10 @@ impl Resolver {
         }
         Self::persist(&env, &cancel_key, &(cancels + 1));
         Self::remove_proposal(&env, market_id);
-        if storage.has(&DataKey::WeightedKeys(market_id)) {
-            Self::persist(
-                &env,
-                &DataKey::Round(market_id),
-                &(Self::round(&env, market_id) + 1),
-            );
-        }
+        // #286: bump round for every signer mode, not just weighted-key markets.
+        // This allows signers to re-attest after a cancel, fixing the stranded-quorum bug.
+        let next_round = Self::round(&env, market_id) + 1;
+        Self::persist(&env, &DataKey::Round(market_id), &next_round);
         Self::bump_market_entries(&env, market_id, close_time);
         GuardianAction {
             market_id,
