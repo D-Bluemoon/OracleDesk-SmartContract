@@ -7362,6 +7362,9 @@ mod test {
         assert_eq!(result.unwrap().1, 1u32);
     }
 }
+
+#[cfg(test)]
+fn bytes_to_vec(bytes: &Bytes) -> std::vec::Vec<u8> {
     let mut out = std::vec![0u8; bytes.len() as usize];
     bytes.copy_into_slice(&mut out);
     out
