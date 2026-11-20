@@ -1393,13 +1393,10 @@ impl Resolver {
         }
         Self::persist(&env, &cancel_key, &(cancels + 1));
         Self::remove_proposal(&env, market_id);
-        if storage.has(&DataKey::WeightedKeys(market_id)) {
-            Self::persist(
-                &env,
-                &DataKey::Round(market_id),
-                &(Self::round(&env, market_id) + 1),
-            );
-        }
+        // #286: bump round for every signer mode, not just weighted-key markets.
+        // This allows signers to re-attest after a cancel, fixing the stranded-quorum bug.
+        let next_round = Self::round(&env, market_id) + 1;
+        Self::persist(&env, &DataKey::Round(market_id), &next_round);
         Self::bump_market_entries(&env, market_id, close_time);
         GuardianAction {
             market_id,
