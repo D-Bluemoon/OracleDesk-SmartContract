@@ -1185,6 +1185,9 @@ impl Resolver {
     }
 
     /// Creates a reusable committee with an admin, member set, threshold, and time-lock delay.
+    /// The named `admin` must authorise creation (#304): without this gate anyone could
+    /// create a committee claiming any address as its admin, consuming sequential ids and
+    /// filling instance storage at zero cost beyond fees.
     pub fn create_committee(
         env: Env,
         admin: Address,
@@ -1192,6 +1195,8 @@ impl Resolver {
         threshold: u32,
         rotation_delay: u64,
     ) -> Result<u64, Error> {
+        // #304: require the named admin's auth before allocating a committee id.
+        admin.require_auth();
         Self::validate_committee_members(&members)?;
         if threshold == 0 || threshold > members.len() {
             return Err(Error::InvalidConfig);

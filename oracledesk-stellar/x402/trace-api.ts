@@ -1,6 +1,7 @@
 import express, { type Express, type Response } from "express";
 import { isDeepStrictEqual } from "node:util";
 import { timingSafeEqual } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
   HTTPFacilitatorClient,
   x402HTTPResourceServer,
@@ -19,6 +20,7 @@ import {
   ipfsUrl,
   verifyTraceHash,
   type TraceRecord,
+  type TraceVerdict,
 } from "./trace-verification.js";
 import {
   MemoryPaymentLedger,
@@ -26,6 +28,12 @@ import {
   type PaymentLedger,
   type PaymentEntry,
 } from "./payment-ledger.js";
+import {
+  loadVerdictPolicy,
+  decide,
+  type VerdictPolicy,
+} from "./verdict-policy.js";
+import type { RegistryTraceRepository } from "./registry-trace-repository.js";
 export type { TraceRecord };
 export interface TraceRepository {
   get(traceId: string): Promise<TraceRecord | undefined>;
@@ -83,6 +91,14 @@ export interface TraceApiOptions {
   repository: TraceRepository;
   /** Present only when the deployment has a reasoning-registry configured. */
   listRepository?: TraceListRepository;
+  /**
+   * When set, verdict enforcement is applied before every sale and
+   * re-checked before settlement (#306). Requires the repository to
+   * implement `verdict(traceId, receivedHashHex)`.
+   */
+  registryRepository?: RegistryTraceRepository;
+  /** Verdict policy loaded from X402_VERDICT_POLICY (#306). */
+  verdictPolicy?: VerdictPolicy;
   ipfsGateway: string;
   price: string;
   networks: TracePaymentNetwork[];
@@ -440,9 +456,39 @@ export function createTraceApi(options: TraceApiOptions): Express {
         res.status(404).json({ error: "Trace not found" });
         return;
       }
+
+      // ── #306 Verdict enforcement ────────────────────────────────────────
+      // Call trace_verdict with the SHA-256 of the *fetched* bytes so
+      // HashMismatch is reachable. Must happen before any ledger claim.
+      let verdictAtSale: TraceVerdict | undefined;
+      if (options.registryRepository) {
+        const policy = options.verdictPolicy ?? loadVerdictPolicy(process.env);
+        const receivedHashHex = createHash("sha256")
+          .update(prepared.bytes)
+          .digest("hex");
+        const rawVerdict = await options.registryRepository
+          .verdict(traceId, receivedHashHex)
+          .catch(() => "unavailable" as const);
+        const action = decide(rawVerdict === "unavailable" ? "unavailable" : rawVerdict, policy);
+        if (action.kind === "refuse") {
+          res.status(action.status).json({
+            error: "Trace verdict refused",
+            verdict:
+              rawVerdict === "unavailable"
+                ? "unavailable"
+                : rawVerdict.tag,
+          });
+          return;
+        }
+        verdictAtSale =
+          rawVerdict !== "unavailable" ? rawVerdict : undefined;
+      }
+      // ── End verdict enforcement ─────────────────────────────────────────
+
       const body = JSON.stringify({
         traceId: prepared.record.traceId,
         traceHash: prepared.record.traceHash,
+        verdict: verdictAtSale ?? null,
         content: prepared.content,
       });
       if (payload && paymentId) {
@@ -500,6 +546,35 @@ export function createTraceApi(options: TraceApiOptions): Express {
         throw new Error("Upfront flow must be disabled");
       // SDK 2.26.0 logs thrown before-settle hook errors and continues.
       // Keep this durable CAS outside hooks: storage failure MUST prevent /settle.
+      // ── #306 Pre-settlement verdict re-check ────────────────────────────
+      // Re-run verdict() before transitioning to settling. If the verdict
+      // changed to refuse since the initial check, abort and cancel.
+      if (options.registryRepository && prepared) {
+        const policy = options.verdictPolicy ?? loadVerdictPolicy(process.env);
+        const receivedHashHex = createHash("sha256")
+          .update(prepared.bytes)
+          .digest("hex");
+        const rawVerdict = await options.registryRepository
+          .verdict(traceId, receivedHashHex)
+          .catch(() => "unavailable" as const);
+        const action = decide(rawVerdict === "unavailable" ? "unavailable" : rawVerdict, policy);
+        if (action.kind === "refuse") {
+          if (paymentId)
+            await ledger.transition(paymentId, ["verifying"], "failed", {
+              error: "verdict changed before settlement",
+            }).catch(() => {});
+          if (verified)
+            await verified.cancellationDispatcher
+              .cancel({ reason: "handler_threw", error: new Error("verdict changed") })
+              .catch(() => {});
+          res.status(action.status).json({
+            error: "Trace verdict changed before settlement",
+            verdict: rawVerdict === "unavailable" ? "unavailable" : (rawVerdict as TraceVerdict).tag,
+          });
+          return;
+        }
+      }
+      // ── End pre-settlement re-check ──────────────────────────────────────
       await ledger.transition(paymentId, ["verifying"], "settling");
       const s = await http.processSettlement(
         result.paymentPayload,
@@ -542,6 +617,17 @@ export function createTraceApi(options: TraceApiOptions): Express {
           paymentResponseHeader: responseHeader,
         },
       );
+      // Set X-Trace-Verdict header when a verdict was recorded at sale (#306).
+      if (verdictAtSale) {
+        const tag = verdictAtSale.tag;
+        const reason =
+          tag === "Flagged" && verdictAtSale.values?.[0]
+            ? `;reason=${verdictAtSale.values[0]}`
+            : tag === "AgentRevokedAfter" && verdictAtSale.values?.[0]
+              ? `;effective_from=${verdictAtSale.values[0]}`
+              : "";
+        res.set("X-Trace-Verdict", `${tag}${reason}`);
+      }
       deliver(entry);
       function deliver(entry: PaymentEntry) {
         res.on("finish", () => {
