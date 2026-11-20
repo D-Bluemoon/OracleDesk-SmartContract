@@ -89,18 +89,14 @@ wait_until() {
 
 if [ "$MODE" = "price" ]; then
   [ -n "$ORACLE" ] || { echo "error: --mode price requires contracts.test_oracle in $DEPLOYMENTS (local only)" >&2; exit 1; }
-  echo "### 1/5 create price-mode market (treasury.agent_create_market)"
+  echo "### 1/5 create salted V2 price-mode market (via scripts/seed-market.sh)"
   QUESTION="OracleDesk price demo $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  QUESTION_HASH=$(python3 -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "$QUESTION")
-  CLOSE_TIME=$(( $(date +%s) + CLOSE_IN_SECONDS ))
-  PRICE_SPEC=$(jq -nc --arg oracle "$ORACLE" \
-    '{reflector: $oracle, asset: {Other: "XLM"}, threshold: 2000, direction: "Above", max_staleness: 3600}')
-  RESOLUTION_HASH=$(cargo run --quiet --manifest-path scripts/spec-hash/Cargo.toml -- price "$ORACLE" other:XLM 2000 above 3600)
-  MARKET_ID=$(invoke "$TREASURY" "$AGENT_KEY" agent_create_market \
-    --agent "$AGENT" --question_hash "$QUESTION_HASH" --resolution_hash "$RESOLUTION_HASH" \
-    --meta_uri '"ipfs://oracledesk-price-demo"' --category Crypto --close_time "$CLOSE_TIME" \
-    --seed_amount 1500000000 --initial_yes_bps 5000)
-  invoke "$RESOLVER" "$AGENT_KEY" register_price_spec --market_id "$MARKET_ID" --spec "$PRICE_SPEC"
+  SEED_OUT=$(NETWORK="$NETWORK" IDENTITY_PREFIX="$IDENTITY_PREFIX" DEPLOYMENTS="$DEPLOYMENTS" \
+    PRICE_ASSET=other:XLM PRICE_THRESHOLD=2000 PRICE_DIRECTION=above PRICE_MAX_STALENESS=3600 \
+    ./scripts/seed-market.sh --mode=price 1500000000 5000 "$CLOSE_IN_SECONDS" "$DISPUTE_WINDOW" "$QUESTION")
+  printf '%s\n' "$SEED_OUT"
+  MARKET_ID=$(echo "$SEED_OUT" | sed -n 's/^market_id=//p')
+  CLOSE_TIME=$(echo "$SEED_OUT" | sed -n 's/^close_time=//p')
   # Price timestamp must be <= close_time and inside max_staleness.
   invoke "$ORACLE" "$DEPLOYER_KEY" set_price --asset '{"Other":"XLM"}' --timestamp "$CLOSE_TIME" --price 2100
   echo "### 2/5 wait for close"
@@ -139,7 +135,7 @@ TRACE
   mkdir -p "$TRACE_DIR"
   cp "$TRACE_JSON" "$TRACE_DIR/$TRACE_CID"
   TRACE_ID=$(invoke "$REGISTRY" "$AGENT_KEY" publish_trace \
-    --agent "$AGENT" --market_id "$MARKET_ID" --action '"create_market"' \
+    --agent "$AGENT" --market_id "$MARKET_ID" --action CreateMarket \
     --trace_hash "$TRACE_HASH" --ipfs_cid "\"$TRACE_CID\"")
   echo "trace id: $TRACE_ID"
   echo

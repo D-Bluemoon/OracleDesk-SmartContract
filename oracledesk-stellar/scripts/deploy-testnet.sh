@@ -23,6 +23,15 @@ case "$NETWORK" in
   *) echo "error: NETWORK must be testnet or local (never mainnet)" >&2; exit 1 ;;
 esac
 
+# For testnet, delegate to the declarative TypeScript plan/apply deployer
+# (scripts/deployer/) unless LEGACY_BASH_DEPLOY=1 is explicitly requested.
+# Local quickstart runs (NETWORK=local) continue using the bash flow below.
+if [ "$NETWORK" = "testnet" ] && [ "${LEGACY_BASH_DEPLOY:-0}" != "1" ]; then
+  if command -v npx >/dev/null 2>&1 && [ -f "scripts/deployer/src/cli.ts" ]; then
+    exec npx tsx scripts/deployer/src/cli.ts apply --yes "$@"
+  fi
+fi
+
 IDENTITY_PREFIX=${IDENTITY_PREFIX:-oracledesk}
 DEPLOYER_KEY=${DEPLOYER_KEY:-${IDENTITY_PREFIX}-deployer}
 AGENT_KEY=${AGENT_KEY:-${IDENTITY_PREFIX}-agent}
@@ -141,11 +150,10 @@ predict_id() {
 new_salt() { openssl rand -hex 32; }
 
 # Run an admin-gated call. When the admin is the deployer (`USE_TIMELOCK=0`)
-# it invokes directly; when the timelock owns admin it prints the
-# `schedule`/`execute` pair an operator must run and reports a skip. Building
-# `Vec<Val>` arguments for `schedule` needs the ScVal encoding, which is left
-# to the operator on purpose: an automatic, unverified encoding is how a
-# governance bypass would slip in. See docs/adr/0008-governance-timelock.md.
+# it invokes directly; when the timelock owns admin it prints the governance
+# CLI commands an operator must run and reports a skip. The CLI encodes args
+# from the target's spec, compares it with the deployed spec, simulates the
+# call as the timelock, and keeps proposal records. See docs/governance-cli.md.
 admin_invoke() {
   local target=$1 fn=$2
   shift 2
@@ -155,9 +163,13 @@ admin_invoke() {
     return 0
   fi
   log "timelock owns admin: schedule $fn on $target through $TIMELOCK"
-  log "  stellar contract invoke --id $TIMELOCK --source-account $TIMELOCK_PROPOSER_KEY \\"
-  log "    --network $NETWORK -- schedule --target $target --fn_name $fn --args '<scval-json>'"
-  log "  then execute after ${TIMELOCK_DELAY}s; skipped for now"
+  log "  cd scripts/governance"
+  log "  npm run cli -- propose --network $NETWORK --timelock $TIMELOCK \\"
+  log "    --target $target --contract <binding-name> --fn $fn \\"
+  log "    --args '<json-object>' --title '<review title>' --submit"
+  log "  npm run cli -- status <id> --network $NETWORK"
+  log "  npm run cli -- execute <id> --network $NETWORK --submit"
+  log "  skipped for now; see docs/governance-cli.md"
   return 1
 }
 

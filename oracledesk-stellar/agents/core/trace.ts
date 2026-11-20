@@ -349,3 +349,93 @@ export function commitmentFor(hashHex: string, saltHex: string): string {
 export function newSalt(): string {
   return randomBytes(32).toString("hex");
 }
+
+export const DECISION_DOMAIN = "oracledesk.decision.v1";
+
+export type DecisionAction = "buy" | "sell" | "create_market";
+
+export interface DecisionHashArgs {
+  marketId: bigint;
+  action: DecisionAction;
+  outcomeTag?: number;
+  amount: bigint;
+  bound: bigint;
+  limitPriceBps: number;
+  deadline: bigint;
+}
+
+function u64be(value: bigint): Buffer {
+  if (value < 0n || value > 0xffff_ffff_ffff_ffffn) throw new Error("u64 out of range");
+  const out = Buffer.alloc(8);
+  out.writeBigUInt64BE(value);
+  return out;
+}
+
+function u32be(value: number): Buffer {
+  if (!Number.isInteger(value) || value < 0 || value > 0xffff_ffff) throw new Error("u32 out of range");
+  const out = Buffer.alloc(4);
+  out.writeUInt32BE(value);
+  return out;
+}
+
+function i128be(value: bigint): Buffer {
+  const max = (1n << 128n) - 1n;
+  if (value < -(1n << 127n) || value > max) throw new Error("i128 out of range");
+  const unsigned = value < 0n ? value + (1n << 128n) : value;
+  const out = Buffer.alloc(16);
+  out.writeBigUInt64BE(unsigned >> 64n, 0);
+  out.writeBigUInt64BE(unsigned & 0xffff_ffff_ffff_ffffn, 8);
+  return out;
+}
+
+export function decisionHash(args: DecisionHashArgs): string {
+  const actionTags: Record<DecisionAction, number> = { buy: 2, sell: 3, create_market: 4 };
+  return createHash("sha256")
+    .update(Buffer.from(DECISION_DOMAIN, "utf8"))
+    .update(u64be(args.marketId))
+    .update(u32be(actionTags[args.action]))
+    .update(u32be(args.outcomeTag ?? 0))
+    .update(i128be(args.amount))
+    .update(i128be(args.bound))
+    .update(u32be(args.limitPriceBps))
+    .update(u64be(args.deadline))
+    .digest("hex");
+}
+
+export function decisionHashBuy(args: {
+  marketId: bigint;
+  outcome: "Yes" | "No";
+  collateralIn: bigint;
+  minSharesOut: bigint;
+  limitPriceBps: number;
+  deadline: bigint;
+}): string {
+  return decisionHash({
+    marketId: args.marketId,
+    action: "buy",
+    outcomeTag: args.outcome === "Yes" ? 0 : 1,
+    amount: args.collateralIn,
+    bound: args.minSharesOut,
+    limitPriceBps: args.limitPriceBps,
+    deadline: args.deadline,
+  });
+}
+
+export function decisionHashSell(args: {
+  marketId: bigint;
+  outcome: "Yes" | "No";
+  collateralOut: bigint;
+  maxSharesIn: bigint;
+  limitPriceBps: number;
+  deadline: bigint;
+}): string {
+  return decisionHash({
+    marketId: args.marketId,
+    action: "sell",
+    outcomeTag: args.outcome === "Yes" ? 0 : 1,
+    amount: args.collateralOut,
+    bound: args.maxSharesIn,
+    limitPriceBps: args.limitPriceBps,
+    deadline: args.deadline,
+  });
+}

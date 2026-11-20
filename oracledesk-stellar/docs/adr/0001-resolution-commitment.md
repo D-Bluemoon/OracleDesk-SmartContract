@@ -186,6 +186,73 @@ can commit to.
 * **Manipulation scope.** A TWAP dilutes a single print, but a sustained
   push still moves the average; median filtering is out of scope.
 
+## Amendment: Market-linked resolution (Issue #147)
+
+Issue #147 adds a third `ResolutionSpec` variant, `Market(MarketLinkConfig)`, allowing a market to resolve based on another market's final outcome. This enables conditional markets ("If A resolves YES, will B happen?"), negations, and chained markets without requiring a trusted signer.
+
+### Append-only variant rule
+
+The new variant is **appended as the last enum variant** in `ResolutionSpec`, ensuring existing `Price` and `Signers` commitments remain byte-identical:
+
+```rust
+pub enum ResolutionSpec {
+    Price(PriceConfig),                    // existing, variant 0
+    Signers(SignerConfig),                 // existing, variant 1
+    WeightedKeys(WeightedKeyConfig),       // existing, variant 2
+    SignersDisputable(...),                // existing, variant 3
+    Committee(CommitteeRef),               // existing, variant 4
+    Hybrid(HybridConfig),                  // existing, variant 5
+    Market(MarketLinkConfig),              // NEW, variant 6, appended at end
+}
+```
+
+**Why**: Soroban XDR encodes enums as `Vec[Symbol(variant_name), value]`. Adding a variant at the end does not change the discriminant or encoding of earlier variants. Golden vectors in `contracts/resolver/src/lib.rs` and `scripts/spec-hash` verify that all existing variant hashes (Price, Signers, etc.) remain byte-identical before and after this change.
+
+### Cycle prevention via ordering rule
+
+Markets can link to other markets, but dependency cycles are impossible by construction:
+
+- **Ordering rule**: Require `source_market_id < market_id`. Market IDs come from market-core's monotonically incrementing `NextId`. A source market must have existed (and thus have a smaller ID) when the dependent market was created. Following "points to an earlier ID" edges can never return to the start.
+- **Depth limit**: Store `Depth(market_id) = 1 + depth(source)` if source has a Link, else 1. Reject if `> MAX_LINK_DEPTH` (e.g., 4). Prevents long chains and bounds cross-contract reads at resolution time.
+- **Close-time ordering**: Require `source.close_time <= dependent.close_time`. A conditional market cannot settle before its condition.
+
+**Acyclicity guarantee**: The ordering rule alone makes cycles *impossible* (not just discouraged); the depth limit is defense-in-depth and reduces resource coupling.
+
+### Configuration and resolution
+
+```rust
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketLinkConfig {
+    pub source_market_id: u64,
+    pub on_yes: LinkedResult,     // Yes | No | Void
+    pub on_no: LinkedResult,      // Yes | No | Void
+    pub on_void: LinkedResult,    // Yes | No | Void
+    pub max_wait: u64,            // seconds after this market's close_time
+}
+```
+
+- `register_market_spec` validates commitment match, ordering and depth, and stores the config.
+- `resolve_linked` (permissionless, like `resolve_price`) applies the committed mapping to the source's final `MarketStatus`:
+  - `Resolved(Yes)` → `on_yes`; `Resolved(No)` → `on_no`; `Void` → `on_void`; `Open` (after max_wait) → void dependent
+  - Calls market-core's `resolve` or `void_market` and sets `State = Finalized`
+- `LinkedResolution` event emitted on success, tracking source outcome and result.
+
+### Safe fallback for missing sources
+
+If the source market's storage is archived or does not exist:
+
+- If `now > close_time + max_wait`: void the dependent market (liveness guaranteed).
+- Else: return `SourceNotFinal`, allowing retry once the source settles.
+- `max_wait` is part of the commitment, so traders know the worst-case settlement delay.
+
+### Documentation and testing
+
+- Updated `docs/market-metadata.md` with schema v1 to include `mode: "market"` and `MarketLinkConfig` spec serialization.
+- Updated `docs/events.md` with `LinkedResolution` event and cross-contract event sequence examples.
+- Golden vectors in `docs/market-metadata-vectors.json` include a market-linked example to verify schema stability.
+- Tests: `register_market_spec_valid`, `register_market_spec_rejects_circular_via_ordering`, `resolve_linked_yes/no/void`, `source_open_after_max_wait_voids_dependent`.
+
 ## Liveness fallback
 
 A market whose spec is never revealed, whose committed feed is permanently

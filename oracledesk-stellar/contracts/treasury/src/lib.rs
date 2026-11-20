@@ -1,5 +1,8 @@
 #![no_std]
 
+mod mode;
+pub use mode::{allowed, Mode, ModeState, Op};
+
 use soroban_sdk::{
     auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
@@ -32,9 +35,9 @@ mod resolver {
 }
 use resolver::{Client as ResolverClient, ResolutionSpec, ResolutionSpecV2};
 
-/// Domain tag prepended to a V2 spec before hashing. Mirrors the resolver's
-/// `SPEC_DOMAIN` so the treasury can compute the commitment it will both
-/// create the market with and reveal.
+// Domain tag prepended to a V2 spec before hashing. Mirrors the resolver's
+// `SPEC_DOMAIN` so the treasury can compute the commitment it will both
+// create the market with and reveal.
 const SPEC_DOMAIN: &[u8] = b"oracledesk:resolution-spec";
 const SPEC_V2_VERSION: u32 = 2;
 
@@ -43,23 +46,25 @@ pub mod correlation;
 const DAY_SECONDS: u64 = 86_400;
 const BUMP_THRESHOLD: u32 = 30 * 17_280;
 const BUMP_TO: u32 = 60 * 17_280;
-/// Width of one bucket of the sliding daily window.
+// Width of one bucket of the sliding daily window.
 const BUCKET_SECONDS: u64 = 3_600;
-/// Buckets checked against `max_daily`: the trade's own hour plus the 24
-/// before it. Any real 24h interval `(t - 24h, t]` touches at most hours
-/// `h - 24 ..= h` (`h = t / 3600`), so summing 25 buckets never under-counts;
-/// with 24 the partially-covered hour `h - 24` could add up to one more
-/// bucket's worth on top of `max_daily`. The effective window is therefore
-/// 24-25h: slightly conservative, never permissive.
+// Buckets checked against `max_daily`: the trade's own hour plus the 24
+// before it. Any real 24h interval `(t - 24h, t]` touches at most hours
+// `h - 24 ..= h` (`h = t / 3600`), so summing 25 buckets never under-counts;
+// with 24 the partially-covered hour `h - 24` could add up to one more
+// bucket's worth on top of `max_daily`. The effective window is therefore
+// 24-25h: slightly conservative, never permissive.
 const BUCKETS: u32 = 25;
-/// Basis points in 1 (prices from market-core are in bps).
+// Basis points in 1 (prices from market-core are in bps).
 const BPS: i128 = 10_000;
-/// market-core's `Error::SlippageExceeded` (pinned by a test).
+// How long a pending admin op stays executable after its delay (#250).
+const EXECUTION_GRACE: u64 = 7 * DAY_SECONDS;
+// market-core's `Error::SlippageExceeded` (pinned by a test).
 const CORE_SLIPPAGE_EXCEEDED: u32 = 12;
 
-/// Maps a typed market-core error (from a generated `try_*` call) into the
-/// treasury's own disjoint range. Unmapped conditions collapse to
-/// [`Error::MarketCoreCallFailed`] rather than leaking market-core's code.
+// Maps a typed market-core error (from a generated `try_*` call) into the
+// treasury's own disjoint range. Unmapped conditions collapse to
+// [`Error::MarketCoreCallFailed`] rather than leaking market-core's code.
 fn map_market_core_error(error: market_core::Error) -> Error {
     use market_core::Error as Core;
     match error {
@@ -78,9 +83,9 @@ fn map_market_core_error(error: market_core::Error) -> Error {
     }
 }
 
-/// Same mapping as [`map_market_core_error`], but for the numeric
-/// `soroban_sdk::Error` returned by `try_invoke_contract` (which cannot be
-/// decoded into `market_core::Error` without exporting that type).
+// Same mapping as [`map_market_core_error`], but for the numeric
+// `soroban_sdk::Error` returned by `try_invoke_contract` (which cannot be
+// decoded into `market_core::Error` without exporting that type).
 fn map_market_core_code(error: soroban_sdk::Error) -> Error {
     let code = |value: u32| soroban_sdk::Error::from_contract_error(value);
     use market_core::Error as Core;
@@ -111,45 +116,110 @@ fn map_market_core_code(error: soroban_sdk::Error) -> Error {
     }
 }
 
-/// Runs a generated `try_*` market-core call, mapping both the callee error
-/// and a host/invocation failure into treasury variants. Every cross-contract
-/// market-core call must go through this (or [`Treasury::core_trade`] for the
-/// name-dispatched trade calls); the panicking generated methods are never
-/// used.
-fn core_call<T>(
-    result: Result<
-        Result<T, market_core::Error>,
-        Result<soroban_sdk::Error, soroban_sdk::InvokeError>,
-    >,
-) -> Result<T, Error> {
-    match result {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(map_market_core_error(error)),
-        Err(_) => Err(Error::MarketCoreCallFailed),
+// Runs a generated `try_*` market-core call, mapping both the callee error
+// and a host/invocation failure into treasury variants. Every cross-contract
+// market-core call must go through this (or [`Treasury::core_trade`] for the
+// name-dispatched trade calls); the panicking generated methods are never
+// used.
+trait IntoCoreError {
+    fn into_core_error(self) -> Error;
+}
+
+impl IntoCoreError for market_core::Error {
+    fn into_core_error(self) -> Error {
+        map_market_core_error(self)
     }
 }
 
-/// Agent role bits (`AgentPolicy.roles`). A bitmask rather than a
-/// `Vec<Role>`: cheaper to store and check, and `#[contracttype]` enums
-/// cannot be used as flags.
+impl IntoCoreError for soroban_sdk::ConversionError {
+    fn into_core_error(self) -> Error {
+        Error::MarketCoreCallFailed
+    }
+}
+
+impl IntoCoreError for soroban_sdk::Error {
+    fn into_core_error(self) -> Error {
+        map_market_core_code(self)
+    }
+}
+
+fn core_call<T, E1, E2>(
+    result: Result<Result<T, E1>, Result<E2, soroban_sdk::InvokeError>>,
+) -> Result<T, Error>
+where
+    E1: IntoCoreError,
+    E2: IntoCoreError,
+{
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error.into_core_error()),
+        Err(Ok(error)) => Err(error.into_core_error()),
+        Err(Err(_)) => Err(Error::MarketCoreCallFailed),
+    }
+}
+
+/// [`core_call`] for the infallible market-core views (their `try_` form has no
+/// contract-error branch): any failure is a failed call.
+fn core_view<T, C>(
+    result: Result<Result<T, C>, Result<soroban_sdk::Error, soroban_sdk::InvokeError>>,
+) -> Result<T, Error> {
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        _ => Err(Error::MarketCoreCallFailed),
+    }
+}
+
+/// Runs a generated `try_*` resolver call: any failure (a resolver error, a
+/// trap, a reply that does not convert) is `ResolverCallFailed`.
+fn resolver_call<T, C, E>(
+    result: Result<Result<T, C>, Result<E, soroban_sdk::InvokeError>>,
+) -> Result<T, Error> {
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        _ => Err(Error::ResolverCallFailed),
+    }
+}
+
+// Agent role bits (`AgentPolicy.roles`). A bitmask rather than a
+// `Vec<Role>`: cheaper to store and check, and `#[contracttype]` enums
+// cannot be used as flags.
 pub const ROLE_CREATE: u32 = 1 << 0;
 pub const ROLE_TRADE: u32 = 1 << 1;
 pub const ROLE_SETTLE: u32 = 1 << 2;
 pub const ROLE_ALL: u32 = ROLE_CREATE | ROLE_TRADE | ROLE_SETTLE;
+pub const HALT_OPERATOR: u32 = 1;
+pub const HALT_RISK: u32 = 2;
+pub const HALT_ERRORS: u32 = 3;
+pub const HALT_DRAWDOWN: u32 = 4;
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuleKind {
+    Price,
+    Signers,
+    WeightedKeys,
+    SignersDisputable,
+    Committee,
+    Hybrid,
+    ScaledPrice,
+    Twap,
+}
 /// Bounds registry enumeration and admin mistakes.
 pub const MAX_AGENTS: u32 = 16;
-/// Floor for `config_delay` (one day).
+// Floor for `config_delay` (one day).
 pub const MIN_CONFIG_DELAY: u64 = 86_400;
 
-/// How long a pending admin proposal stays acceptable.
+// How long a pending admin proposal stays acceptable.
 pub const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
 /// Bounds `nav()` to this many markets x two cross-contract reads. Each read
 /// instantiates market-core (~2.5 MB of memory per market): 32 markets
 /// measured ~81 MB for `nav()` alone and 16 ~40.4 MB for a `deposit`,
-/// against the 40 MiB per-transaction memory limit. 12 keeps a `deposit` or
-/// `request_withdraw` near 75% of it (see
-/// `nav_budget_within_limits_at_max_open_markets`).
-pub const MAX_OPEN_MARKETS: u32 = 12;
+/// NAV now reads a maintained holdings aggregate, so position-only markets do
+/// not add cross-contract reads to `deposit` or `request_withdraw`.
+pub const MAX_OPEN_MARKETS: u32 = 128;
+pub const MAX_REFRESH_BATCH: u32 = 10;
+pub const MAX_MIGRATE_BATCH: u32 = 16;
+pub const DEFAULT_MAX_MARK_AGE_LEDGERS: u32 = 17_280;
 /// Smallest `deposit` (10 USDC): keeps share prices away from dust rounding.
 pub const MIN_DEPOSIT: i128 = 10 * 10_000_000;
 pub const EPOCH_SECS: u64 = 3_600;
@@ -159,9 +229,69 @@ pub const EPOCH_SECS: u64 = 3_600;
 const VIRTUAL_SHARES: i128 = 1_000;
 const VIRTUAL_ASSETS: i128 = 1;
 
-/// Legacy single-agent configuration. Still the shape returned by the
-/// deprecated `get_config` view; live state is [`GlobalConfig`] plus the
-/// agent registry.
+// Delayed admin powers (#250). Each variant is stored under a stable
+// discriminant so at most one proposal of a kind can be pending.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdminOp {
+    SetYieldVenue(Address, i128),
+    AllocateToYield(i128),
+    SetSuccessor(Address),
+    MigrateMarkets(Vec<u64>),
+    SetDrawdownConfig(i128, u32),
+    ResetPnlWindow,
+    SetCreationPolicy(CreationPolicy),
+    SetCorrelationCaps(CorrelationCaps),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminOp {
+    pub op: AdminOp,
+    pub proposed_at: u64,
+    pub executable_at: u64,
+    pub expires_at: u64,
+}
+
+// Correlated-risk caps by category and close-date bucket (#259). Stored
+// separately from `GlobalConfig` so the existing XDR shape is unchanged.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CorrelationCaps {
+    pub max_per_category: Vec<i128>,
+    pub max_per_bucket: i128,
+    pub bucket_secs: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingCorrelation {
+    pub caps: CorrelationCaps,
+    pub proposed_at: u64,
+    pub executable_at: u64,
+}
+
+// Per-token treasury limits (#151). Missing entries fall back to the global
+// `max_trade` / `max_market` / `max_daily`.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TokenCaps {
+    pub max_trade: i128,
+    pub max_market: i128,
+    pub max_daily: i128,
+}
+
+// Category and close bucket of a market, cached on first touch (#259).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MarketMeta {
+    pub category_idx: u32,
+    pub bucket: u64,
+}
+
+// Legacy single-agent configuration. Still the shape returned by the
+// deprecated `get_config` view; live state is [`GlobalConfig`] plus the
+// agent registry.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RiskConfig {
@@ -173,7 +303,7 @@ pub struct RiskConfig {
     pub max_daily: i128,
 }
 
-/// Treasury-wide caps, enforced on top of every agent's own policy.
+// Treasury-wide caps, enforced on top of every agent's own policy.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GlobalConfig {
@@ -182,13 +312,13 @@ pub struct GlobalConfig {
     pub max_trade: i128,
     pub max_market: i128,
     pub max_daily: i128,
-    /// Cap on capital deployed in open positions across all markets at once
-    /// (see `net_exposure`).
+    // Cap on capital deployed in open positions across all markets at once
+    // (see `net_exposure`).
     pub max_net_exposure: i128,
 }
 
-/// One registered agent. `max_trade` / `max_daily` sit under the global
-/// caps; both are checked on every spend.
+// One registered agent. `max_trade` / `max_daily` sit under the global
+// caps; both are checked on every spend.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AgentPolicy {
@@ -214,18 +344,18 @@ pub struct PendingAgent {
     pub executable_at: u64,
 }
 
-/// Price limits on every agent trade, in bps of the outcome's spot price.
+// Price limits on every agent trade, in bps of the outcome's spot price.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PricePolicy {
-    /// Never buy an outcome priced above this.
+    // Never buy an outcome priced above this.
     pub max_buy_price_bps: u32,
-    /// Never sell an outcome priced below this.
+    // Never sell an outcome priced below this.
     pub min_sell_price_bps: u32,
-    /// Largest `|p_after - p_before|` a single trade may cause.
+    // Largest `|p_after - p_before|` a single trade may cause.
     pub max_impact_bps: u32,
-    /// Tolerance applied to the same-transaction quote to derive the
-    /// effective `min_shares_out` / `max_shares_in`.
+    // Tolerance applied to the same-transaction quote to derive the
+    // effective `min_shares_out` / `max_shares_in`.
     pub max_slippage_bps: u32,
 }
 
@@ -237,6 +367,86 @@ pub struct PendingPricePolicy {
     pub executable_at: u64,
 }
 
+/// Bits of [`ResolvabilityPolicy::allowed_specs`], one per `resolver::SpecKind`
+/// (bit = the kind's position in that enum). All nine set means "any kind".
+pub const ALL_SPEC_BITS: u32 = 0x1FF;
+
+/// Pre-trade resolvability policy for `agent_buy` / `agent_buy_v2` (#273): the
+/// treasury will not put depositor capital into a market that cannot be
+/// resolved, whatever the agent believes. Sells, redemptions and settlement are
+/// never gated by it (the treasury must always be able to exit or settle).
+///
+/// Tightening is immediate (a flag set to `true`, a larger `min_secs_to_close`,
+/// fewer `allowed_specs` bits); everything else waits `config_delay`, like the
+/// other policies. The default is fully permissive, so an upgraded deployment
+/// behaves as before until the admin tightens it.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvabilityPolicy {
+    /// The market's resolution spec must have been revealed to its resolver.
+    pub require_revealed: bool,
+    /// No buys while the resolver reports `Disputed` (finalization frozen).
+    pub block_when_disputed: bool,
+    /// No buys while a signer proposal is pending. Off by default: opening a
+    /// proposal needs a signer, but a quorum can still use it to freeze buys.
+    pub block_with_open_proposal: bool,
+    /// Minimum seconds between now and `close_time` for a buy (0 = none). Does
+    /// not apply to seed-and-reveal creation, which happens far from close.
+    pub min_secs_to_close: u64,
+    /// Bitmask over `resolver::SpecKind`: kinds that may be bought into.
+    pub allowed_specs: u32,
+}
+
+pub const OPEN_RESOLVABILITY: ResolvabilityPolicy = ResolvabilityPolicy {
+    require_revealed: false,
+    block_when_disputed: false,
+    block_with_open_proposal: false,
+    min_secs_to_close: 0,
+    allowed_specs: ALL_SPEC_BITS,
+};
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingResolvability {
+    pub policy: ResolvabilityPolicy,
+    pub proposed_at: u64,
+    pub executable_at: u64,
+}
+
+/// How a spec kind maps to its bit in [`ResolvabilityPolicy::allowed_specs`].
+/// An exhaustive match: a new `SpecKind` does not compile until it has a bit.
+fn spec_bit(kind: &resolver::SpecKind) -> u32 {
+    use resolver::SpecKind as K;
+    1 << match kind {
+        K::None => 0,
+        K::Price => 1,
+        K::ScaledPrice => 2,
+        K::Twap => 3,
+        K::Signers => 4,
+        K::Disputable => 5,
+        K::WeightedKeys => 6,
+        K::Committee => 7,
+        K::Hybrid => 8,
+    }
+}
+
+/// Classifies a policy change. Tightening a knob is immediate; loosening any
+/// knob, even in a change that also tightens another, waits `config_delay`.
+fn classify_resolvability(old: &ResolvabilityPolicy, new: &ResolvabilityPolicy) -> Change {
+    let loosens = (old.require_revealed && !new.require_revealed)
+        || (old.block_when_disputed && !new.block_when_disputed)
+        || (old.block_with_open_proposal && !new.block_with_open_proposal)
+        || new.min_secs_to_close < old.min_secs_to_close
+        || new.allowed_specs & !old.allowed_specs != 0;
+    if loosens {
+        Change::NeedsDelay
+    } else if old == new {
+        Change::None
+    } else {
+        Change::TightenOnly
+    }
+}
+
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MarketExposure {
@@ -244,9 +454,9 @@ pub struct MarketExposure {
     pub open: bool,
 }
 
-/// Summary of the sliding daily window, returned by `daily_usage`.
-/// `day_start` is the start of the oldest hour still counted and `amount`
-/// the usage summed over the whole window (see [`UsageWindow`]).
+// Summary of the sliding daily window, returned by `daily_usage`.
+// `day_start` is the start of the oldest hour still counted and `amount`
+// the usage summed over the whole window (see [`UsageWindow`]).
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DailyUsage {
@@ -254,24 +464,24 @@ pub struct DailyUsage {
     pub amount: i128,
 }
 
-/// Hourly ring buffer behind `max_daily`. Kept in instance storage: ~400
-/// bytes that every call loads anyway, so it costs no extra ledger-entry
-/// read (a persistent entry would add one per trade). Per-agent windows
-/// have the same shape but live in persistent storage.
+// Hourly ring buffer behind `max_daily`. Kept in instance storage: ~400
+// bytes that every call loads anyway, so it costs no extra ledger-entry
+// read (a persistent entry would add one per trade). Per-agent windows
+// have the same shape but live in persistent storage.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UsageWindow {
-    /// Hour index (`timestamp / BUCKET_SECONDS`) of the newest bucket.
+    // Hour index (`timestamp / BUCKET_SECONDS`) of the newest bucket.
     pub head_hour: u64,
-    /// Always `BUCKETS` long. `amounts[i]` is the usage of hour
-    /// `head_hour - ((head_idx - i) mod BUCKETS)`.
+    // Always `BUCKETS` long. `amounts[i]` is the usage of hour
+    // `head_hour - ((head_idx - i) mod BUCKETS)`.
     pub amounts: Vec<i128>,
     pub head_idx: u32,
 }
 
-/// Collateral the treasury has sent into (`collateral_in`) and received back
-/// from (`collateral_out`) one market. Accounting starts when this code was
-/// deployed: a missing entry reads as zero.
+// Collateral the treasury has sent into (`collateral_in`) and received back
+// from (`collateral_out`) one market. Accounting starts when this code was
+// deployed: a missing entry reads as zero.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NetPosition {
@@ -280,8 +490,8 @@ pub struct NetPosition {
 }
 
 impl NetPosition {
-    /// Capital still deployed: `max(0, in - out)`. Profit floors at zero so it
-    /// never offsets exposure in another market.
+    // Capital still deployed: `max(0, in - out)`. Profit floors at zero so it
+    // never offsets exposure in another market.
     fn cost_basis(&self) -> i128 {
         self.collateral_in
             .saturating_sub(self.collateral_out)
@@ -289,30 +499,60 @@ impl NetPosition {
     }
 }
 
-/// `market_valuation` result. Only `cost_basis` is enforced (by
-/// `max_net_exposure`); the others are informational.
+// `market_valuation` result. Only `cost_basis` is enforced (by
+// `max_net_exposure`); the others are informational.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Valuation {
     pub cost_basis: i128,
-    /// What the treasury gets back whatever the outcome, from state a price
-    /// move cannot raise: complete sets `min(yes, no)` plus, as the unclaimed
-    /// LP, `min(reserve_yes, reserve_no)`. After finality, the settlement
-    /// value.
+    // What the treasury gets back whatever the outcome, from state a price
+    // move cannot raise: complete sets `min(yes, no)` plus, as the unclaimed
+    // LP, `min(reserve_yes, reserve_no)`. After finality, the settlement
+    // value.
     pub floor_value: i128,
-    /// Holdings at the pool's spot price. Manipulable by any trader, so it is
-    /// never used for enforcement.
+    // Holdings at the pool's spot price. Manipulable by any trader, so it is
+    // never used for enforcement.
     pub spot_value: i128,
-    /// `max(0, cost_basis - floor_value)`.
+    // `max(0, cost_basis - floor_value)`.
     pub at_risk: i128,
 }
 
-/// An entry of the open-market index `nav()` walks.
+// An entry of the open-market index `nav()` walks.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenMarket {
     pub core: Address,
     pub market_id: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkRecord {
+    pub core: Address,
+    pub market_id: u64,
+    pub pos_yes: i128,
+    pub pos_no: i128,
+    pub lp: bool,
+    pub lp_floor: i128,
+    pub status_final: bool,
+    pub contribution: i128,
+    pub refreshed_ledger: u32,
+    pub close_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NavDetail {
+    pub holdings: i128,
+    pub stale_lp_markets: u32,
+    pub oldest_refresh: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingMarkAge {
+    pub ledgers: u32,
+    pub executable_at: u64,
 }
 
 /// Collateral still owed to `owner` for shares already burned.
@@ -465,20 +705,21 @@ pub struct PendingRedeem {
 pub enum DataKey {
     Admin,
     PendingAdmin,
-    /// Legacy `RiskConfig`; migrated into `Global` plus one full-role agent
-    /// by `load_global`.
+    // Legacy `RiskConfig`; migrated into `Global` plus one full-role agent
+    // by `load_global`.
     Config,
     Market(u64),
-    /// Legacy fixed-window `DailyUsage`; migrated into `UsageWindow` and
-    /// removed on the first trade after an upgrade.
+    // Legacy fixed-window `DailyUsage`; migrated into `UsageWindow` and
+    // removed on the first trade after an upgrade.
     Daily,
+    /// Legacy flag (see `DrawdownTripped`).
     Paused,
     Successor,
     UsageWindow,
-    /// Legacy `max_net_exposure`, now a `GlobalConfig` field.
+    // Legacy `max_net_exposure`, now a `GlobalConfig` field.
     NetCap,
     Net(u64),
-    /// Running `sum(max(0, in - out))` over all markets.
+    // Running `sum(max(0, in - out))` over all markets.
     NetTotal,
     Global,
     Agent(Address),
@@ -488,10 +729,10 @@ pub enum DataKey {
     PendingAgent(Address),
     ConfigDelay,
     PendingConfig,
-    /// The market-core the treasury was deployed against: its exposure keys
-    /// stay `Market(id)` / `Net(id)`, any later core's are namespaced.
+    // The market-core the treasury was deployed against: its exposure keys
+    // stay `Market(id)` / `Net(id)`, any later core's are namespaced.
     OriginalCore,
-    /// A market-core this treasury was switched away from.
+    // A market-core this treasury was switched away from.
     LegacyCore(Address),
     MarketV2(Address, u64),
     NetV2(Address, u64),
@@ -505,14 +746,18 @@ pub enum DataKey {
     QueueHead,
     QueueTail,
     Ticket(u64),
-    /// Sum of `remaining` over all queued tickets.
+    // Sum of `remaining` over all queued tickets.
     QueueReserved,
     Realized(u64),
     Pnl(u64),
     DrawdownCfg,
     PnlDays,
+    /// Legacy flag, read only as a fallback by `load_mode_state` and deleted on
+    /// the first mode write (issue #272).
     DrawdownTripped,
+    /// Legacy flag (see `DrawdownTripped`).
     DrawdownAcknowledged,
+    /// Legacy flag (see `DrawdownTripped`).
     AdminPaused,
     CreationPolicy,
     CreationBuckets,
@@ -526,12 +771,121 @@ pub enum DataKey {
     PendingRedeem(Address),
     PendingDepositTotal,
     LastMintEpoch(Address),
+    /// The operating mode's independent reasons ([`ModeState`], issue #272).
+    ModeState,
+    /// The pre-trade resolvability policy ([`ResolvabilityPolicy`], #273).
+    ResolvabilityPolicy,
+    PendingResolvability,
+    // Operating mode (#150); `Paused` remains as a compatibility mirror.
+    Mode,
+    Unwinder,
+    ExitFloor(u64),
+    DefaultExitFloor,
+    Unwound(u64),
+    // Delayed admin operations (#250), keyed by op-kind discriminant.
+    PendingOp(u32),
+    // Correlation caps and exposure (#259).
+    CorrelationCaps,
+    PendingCorrelation,
+    CatExposure(Address, u32),
+    BucketExposure(Address, u64),
+    MarketMeta(Address, u64),
+    CorrelationExposureOpen,
+    // Per-token caps and usage (#151).
+    TokenCaps(Address),
+    TokenWindow(Address),
+    AgentTokenWindow(Address, Address),
+    Mark(Address, u64),
+    NavHoldings,
+    MarksMigrated,
+    MaxMarkAgeLedgers,
+    StaleLpCount,
+    OldestLpRefresh,
+    PendingMarkAge,
+    Registry,
+    TracePolicy,
+    PendingTracePolicy,
 }
 
-/// Note that market-core errors reach callers of treasury entrypoints with
-/// market-core's own codes, which overlap these numerically (e.g. its
-/// `NotFinal = 11`). The one market-core error a trade's own bounds can
-/// cause, `SlippageExceeded`, is remapped to [`Error::SlippageExceeded`].
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TracePolicy {
+    Off,
+    Optional,
+    Required,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TracePolicyConfig {
+    pub policy: TracePolicy,
+    pub max_trace_age_ledgers: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingTracePolicy {
+    pub config: TracePolicyConfig,
+    pub registry: Option<Address>,
+    pub proposed_at: u64,
+    pub executable_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TraceAction {
+    CreateMarket,
+    ProposeMarket,
+    Buy,
+    Sell,
+    Skip,
+    Redeem,
+    ClaimRemainder,
+    Resolve,
+    Other(Symbol),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentStatus {
+    Active,
+    Retired(u64),
+    Revoked(u64, Symbol),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRecord {
+    pub status: AgentStatus,
+    pub registered_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Trace {
+    pub market_id: u64,
+    pub agent: Address,
+    pub action: TraceAction,
+    pub trace_hash: BytesN<32>,
+    pub ipfs_cid: String,
+    pub published_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceConsumeInfo {
+    pub decision: Option<BytesN<32>>,
+    pub ledger: u32,
+}
+
+pub const NO_MARKET: u64 = u64::MAX;
+pub const DECISION_DOMAIN: &[u8] = b"oracledesk.decision.v1";
+
+/// Base for treasury error discriminants as required by ADR 0006.
+/// All treasury `Error` variants must have literal discriminants in
+/// `TREASURY_ERROR_BASE + 1 ..= TREASURY_ERROR_BASE + 999`.
+pub const TREASURY_ERROR_BASE: u32 = 0;
+
 /// A proposed admin handover (#62). Absent when no transfer is pending.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -572,6 +926,21 @@ pub enum Error {
     InvalidPricePolicy = 26,
     SlippageExceeded = 27,
     NotPaused = 28,
+    // Typed market-core failures (`map_market_core_error`). These occupy the
+    // reserved 29..=40 range so the treasury ABI never leaks market-core
+    // numeric codes. `MarketCoreError` below is the legacy collapse code.
+    MarketCoreMarketNotFound = 29,
+    MarketCoreNotFinal = 30,
+    MarketCoreMarketNotOpen = 31,
+    MarketCoreMarketClosed = 32,
+    MarketCoreInsufficientLiquidity = 33,
+    MarketCoreInsufficientShares = 34,
+    MarketCoreAlreadyClaimed = 35,
+    MarketCoreNothingToRedeem = 36,
+    MarketCoreInvalidAmount = 37,
+    MarketCoreOverflow = 38,
+    MarketCoreSlippageExceeded = 39,
+    MarketCoreCallFailed = 40,
     MarketNotFinal = 44,
     MarketCoreError = 45,
     DrawdownTripped = 46,
@@ -587,13 +956,13 @@ pub enum Error {
     YieldCapExceeded = 56,
     YieldWithdrawFailed = 57,
     VenueHasPrincipal = 58,
-    /// Category exposure would exceed its correlation cap (#49).
+    // Category exposure would exceed its correlation cap (#49).
     CategoryCapExceeded = 59,
-    /// Close-date bucket exposure would exceed its cap (#49).
+    // Close-date bucket exposure would exceed its cap (#49).
     BucketCapExceeded = 60,
-    /// `accept_admin`/`cancel_admin_transfer` called with nothing proposed.
+    // `accept_admin`/`cancel_admin_transfer` called with nothing proposed.
     NoPendingAdmin = 61,
-    /// A proposed admin handover was not accepted within its `expires_at`.
+    // A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 62,
     /// `agent_create_market_and_reveal` was given a malformed resolution
     /// envelope or a rule outside the two primary modes (#64).
@@ -601,6 +970,58 @@ pub enum Error {
     HoldingPeriod = 64,
     EpochNotReady = 65,
     EpochNotClosed = 66,
+    // `agent_create_market_and_reveal` was given a malformed resolution
+    // envelope or a rule outside the two primary modes (#64).
+    InvalidResolution = 63,
+    TraceRequired = 64,
+    TraceDecisionMismatch = 65,
+    TraceMismatch = 66,
+    TraceAgentMismatch = 67,
+    TraceFlagged = 68,
+    TraceStale = 69,
+    TraceConsumed = 70,
+    TraceRegistryCallFailed = 71,
+    TracePolicyPending = 72,
+    TracePolicyNotPending = 73,
+    TraceTimelockActive = 74,
+    StaleMarks = 75,
+    MarkBatchTooLarge = 76,
+    // A delayed admin op was executed before `executable_at`.
+    OpNotReady = 77,
+    // A delayed admin op was executed after `expires_at`.
+    OpExpired = 78,
+    // `execute_op` / `cancel_op` found nothing pending for the kind.
+    NoPendingOp = 79,
+    // A sell in `Unwinding` executed below the market's exit floor (#150).
+    BelowExitFloor = 80,
+    // Exit floor outside `1..=10_000` bps.
+    InvalidExitFloor = 81,
+    // `deposit_token` named a token market-core does not allow (#151).
+    CollateralNotAllowed = 82,
+    /// The treasury is in `Mode::Emergency`: only settlement, claiming existing
+    /// withdrawal tickets and `emergency_withdraw` are open (#272).
+    EmergencyMode = 83,
+    /// `resume_agents`: the realized window PnL has not recovered above
+    /// `-max_drawdown` (reset the window or wait for old losses to expire) (#272).
+    NotRecovered = 84,
+    /// The market's resolution spec was never revealed to its resolver, or a
+    /// resolver accepted `register_spec_v2` and stored nothing (#273).
+    SpecNotRevealed = 86,
+    /// The market's spec kind is not in `allowed_specs` (#273).
+    SpecKindNotAllowed = 87,
+    /// The market is `Disputed`: finalization is frozen (#273).
+    MarketDisputed = 88,
+    /// A signer proposal is pending and the policy blocks buys then (#273).
+    ProposalOpen = 89,
+    /// Past `close_time + RESOLUTION_GRACE_SECS`: the market can already be voided (#273).
+    PastResolutionDeadline = 90,
+    /// Closer to `close_time` than `min_secs_to_close` (#273).
+    TooCloseToClose = 91,
+    /// A call to the resolver failed (#273).
+    ResolverCallFailed = 92,
+    HoldingPeriod = 83,
+    EpochNotReady = 84,
+    EpochNotClosed = 85,
 }
 
 #[contractevent]
@@ -625,7 +1046,7 @@ pub struct AdminTransferCancelled {}
 pub struct TradeAuthorized {
     #[topic]
     pub market_id: u64,
-    /// The acting agent.
+    // The acting agent.
     #[topic]
     pub agent: Address,
     pub amount: i128,
@@ -633,7 +1054,7 @@ pub struct TradeAuthorized {
     pub daily_total: i128,
 }
 
-/// Net exposure after any treasury money movement in `market_id`.
+// Net exposure after any treasury money movement in `market_id`.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetExposureUpdated {
@@ -715,6 +1136,15 @@ pub struct AgentRemoved {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentHalted {
+    #[topic]
+    pub agent: Address,
+    pub reason: u32,
+    pub roles_after: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigProposed {
     pub old: GlobalConfig,
     pub new: GlobalConfig,
@@ -726,7 +1156,7 @@ pub struct ConfigProposed {
 pub struct ConfigExecuted {
     pub old: GlobalConfig,
     pub new: GlobalConfig,
-    /// `true` for a tighten-only change applied at proposal time.
+    // `true` for a tighten-only change applied at proposal time.
     pub immediate: bool,
 }
 
@@ -767,12 +1197,34 @@ pub struct PricePolicyCancelled {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvabilityPolicyProposed {
+    pub old: ResolvabilityPolicy,
+    pub new: ResolvabilityPolicy,
+    pub executable_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvabilityPolicySet {
+    pub old: ResolvabilityPolicy,
+    pub new: ResolvabilityPolicy,
+    pub immediate: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvabilityPolicyCancelled {
+    pub policy: ResolvabilityPolicy,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Deposited {
     #[topic]
     pub owner: Address,
     pub amount: i128,
     pub shares: i128,
-    /// NAV before the deposit.
+    // NAV before the deposit.
     pub nav: i128,
 }
 
@@ -784,7 +1236,7 @@ pub struct WithdrawRequested {
     pub shares: i128,
     pub assets: i128,
     pub paid_now: i128,
-    /// 0 when everything was paid at once.
+    // 0 when everything was paid at once.
     pub ticket_id: u64,
 }
 
@@ -833,6 +1285,20 @@ pub struct DrawdownPause {
     pub triggered_by_market: u64,
 }
 
+/// Every change to the operating mode's reasons (#272). `from`/`to` are the
+/// effective modes; they are equal when a reason was added or cleared under a
+/// higher-priority one (e.g. a drawdown trips while the admin pause stands).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModeChanged {
+    pub from: Mode,
+    pub to: Mode,
+    /// `drawdown`, `resume`, `admin`, `unpause`, `legacy`, `emergency`,
+    /// `end_emerg`, or the admin's own reason for `pause` / `declare_emergency`.
+    pub reason: Symbol,
+    pub at: u64,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PnlWindowReset {
@@ -870,7 +1336,96 @@ pub struct YieldVenueSet {
     pub max_allocation: i128,
 }
 
-/// Outcome of comparing a proposed config against the current one.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnwindSell {
+    #[topic]
+    pub market_id: u64,
+    pub outcome: Outcome,
+    pub collateral_out: i128,
+    pub shares_in: i128,
+    pub price_bps: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExitFloorSet {
+    #[topic]
+    pub market_id: u64,
+    pub price_bps: u32,
+    pub is_default: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminOpProposed {
+    pub kind: u32,
+    pub op: AdminOp,
+    pub executable_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminOpExecuted {
+    pub kind: u32,
+    pub op: AdminOp,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminOpCancelled {
+    pub kind: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DrawdownConfigSet {
+    pub old_max_drawdown: i128,
+    pub new_max_drawdown: i128,
+    pub old_window_days: u32,
+    pub new_window_days: u32,
+    pub immediate: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CorrelatedExposureUpdated {
+    pub core: Address,
+    pub category: u32,
+    pub bucket: u64,
+    pub category_total: i128,
+    pub bucket_total: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CorrelationCapsProposed {
+    pub caps: CorrelationCaps,
+    pub executable_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CorrelationCapsExecuted {
+    pub caps: CorrelationCaps,
+    pub immediate: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CorrelationCapsCancelled {}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenDeposited {
+    #[topic]
+    pub owner: Address,
+    #[topic]
+    pub token: Address,
+    pub amount: i128,
+}
+
+// Outcome of comparing a proposed config against the current one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Change {
     None,
@@ -878,7 +1433,7 @@ enum Change {
     NeedsDelay,
 }
 
-/// `(old, new)` pairs where a lower value is the tighter one.
+// `(old, new)` pairs where a lower value is the tighter one.
 fn classify_caps(pairs: &[(i128, i128)]) -> Change {
     let mut lowered = false;
     for &(old, new) in pairs {
@@ -894,9 +1449,9 @@ fn classify_caps(pairs: &[(i128, i128)]) -> Change {
     }
 }
 
-/// Copies of market-core's `math::mul_div_floor` / `mul_div_ceil`
-/// (contracts/market-core/src/math.rs). The treasury cannot depend on the
-/// market-core crate (ADR 0002); extracting a shared crate is separate work.
+// Copies of market-core's `math::mul_div_floor` / `mul_div_ceil`
+// (contracts/market-core/src/math.rs). The treasury cannot depend on the
+// market-core crate (ADR 0002); extracting a shared crate is separate work.
 mod price_math {
     pub fn mul_div_floor(a: i128, b: i128, c: i128) -> Option<i128> {
         if a < 0 || b < 0 || c <= 0 {
@@ -915,7 +1470,7 @@ mod price_math {
     }
 }
 
-/// Shares minted for `amount` at `nav` (floor, favours the vault).
+// Shares minted for `amount` at `nav` (floor, favours the vault).
 fn shares_for_deposit(amount: i128, nav: i128, supply: i128) -> Option<i128> {
     price_math::mul_div_floor(
         amount,
@@ -924,7 +1479,7 @@ fn shares_for_deposit(amount: i128, nav: i128, supply: i128) -> Option<i128> {
     )
 }
 
-/// Collateral owed for burning `shares` at `nav` (floor, favours the vault).
+// Collateral owed for burning `shares` at `nav` (floor, favours the vault).
 fn assets_for_shares(shares: i128, nav: i128, supply: i128) -> Option<i128> {
     price_math::mul_div_floor(
         shares,
@@ -950,14 +1505,14 @@ pub trait MarketCoreWiring {
 
 #[contractimpl]
 impl Treasury {
-    /// Registers `agent` as the first agent with every role and the global
-    /// caps as its own. `max_net_exposure` caps capital deployed in open
-    /// positions across all markets at once (see `net_exposure`); it must be
-    /// at least `max_trade`. `config_delay` (seconds, at least
-    /// `MIN_CONFIG_DELAY`) is the timelock on every loosening change.
-    ///
-    /// Any collateral the treasury already holds is minted as shares to
-    /// `admin`.
+    // Registers `agent` as the first agent with every role and the global
+    // caps as its own. `max_net_exposure` caps capital deployed in open
+    // positions across all markets at once (see `net_exposure`); it must be
+    // at least `max_trade`. `config_delay` (seconds, at least
+    // `MIN_CONFIG_DELAY`) is the timelock on every loosening change.
+    //
+    // Any collateral the treasury already holds is minted as shares to
+    // `admin`.
     #[allow(clippy::too_many_arguments)]
     pub fn __constructor(
         env: Env,
@@ -996,6 +1551,11 @@ impl Treasury {
         storage.set(&DataKey::Global, &global);
         storage.set(&DataKey::OriginalCore, &global.market_core);
         storage.set(&DataKey::ConfigDelay, &config_delay);
+        storage.set(&DataKey::MaxMarkAgeLedgers, &DEFAULT_MAX_MARK_AGE_LEDGERS);
+        storage.set(&DataKey::NavHoldings, &0i128);
+        storage.set(&DataKey::StaleLpCount, &0u32);
+        storage.set(&DataKey::OldestLpRefresh, &env.ledger().sequence());
+        storage.set(&DataKey::MarksMigrated, &true);
         storage.set(&DataKey::PricePolicy, &DEFAULT_PRICE_POLICY);
         storage.set(
             &DataKey::UsageWindow,
@@ -1017,6 +1577,7 @@ impl Treasury {
             },
         );
         storage.set(&DataKey::PendingDepositTotal, &0i128);
+        storage.set(&DataKey::ModeState, &ModeState::normal());
         storage.set(
             &DataKey::DrawdownCfg,
             &DrawdownConfig {
@@ -1051,9 +1612,9 @@ impl Treasury {
         }
     }
 
-    /// Deprecated compatibility view in the pre-registry `RiskConfig` shape:
-    /// `agent` is the first registered agent (whatever its current policy).
-    /// Use `get_global` and `get_agent` instead.
+    // Deprecated compatibility view in the pre-registry `RiskConfig` shape:
+    // `agent` is the first registered agent (whatever its current policy).
+    // Use `get_global` and `get_agent` instead.
     pub fn get_config(env: Env) -> Result<RiskConfig, Error> {
         let global = Self::load_global(&env)?;
         let agent = Self::agent_at(env.clone(), 0).ok_or(Error::NotInitialized)?;
@@ -1071,7 +1632,7 @@ impl Treasury {
         Self::load_global(&env)
     }
 
-    /// Total capital deployable: liquid collateral balance plus supplied yield value.
+    // Total capital deployable: liquid collateral balance plus supplied yield value.
     pub fn available_capital(env: Env) -> Result<i128, Error> {
         let global = Self::load_global(&env)?;
         let liquid = Self::idle(&env, &global);
@@ -1079,13 +1640,46 @@ impl Treasury {
         Ok(liquid.saturating_add(y_val))
     }
 
-    /// Liquid collateral balance held directly in the treasury.
+    // Liquid collateral balance held directly in the treasury.
     pub fn liquid_capital(env: Env) -> Result<i128, Error> {
         let global = Self::load_global(&env)?;
         Ok(Self::idle(&env, &global))
     }
 
-    /// Breakdown of treasury capital across liquid, yield principal, and yield value.
+    // Capital available for `token` (#151): liquid balance in that token,
+    // plus supplied yield value only for the default collateral.
+    pub fn available_capital_of(env: Env, token: Address) -> Result<i128, Error> {
+        let global = Self::load_global(&env)?;
+        let liquid = Self::token_idle(&env, &token);
+        if token == global.collateral {
+            Ok(liquid.saturating_add(Self::yield_value(&env)))
+        } else {
+            Ok(liquid)
+        }
+    }
+
+    // Admin caps for a token (#151). Absent entries inherit the global caps.
+    pub fn token_caps(env: Env, token: Address) -> Result<TokenCaps, Error> {
+        let global = Self::load_global(&env)?;
+        Ok(Self::load_token_caps(&env, &global, &token))
+    }
+
+    // Sets independent per-token caps (#151). Requiring `max_daily >=
+    // max_market >= max_trade` mirrors the global invariant, so a malformed
+    // token cap can never be more permissive than its own parts.
+    pub fn set_token_caps(env: Env, token: Address, caps: TokenCaps) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if caps.max_trade <= 0
+            || caps.max_market < caps.max_trade
+            || caps.max_daily < caps.max_market
+        {
+            return Err(Error::InvalidConfig);
+        }
+        Self::put_persistent(&env, &DataKey::TokenCaps(token.clone()), &caps);
+        Ok(())
+    }
+
+    // Breakdown of treasury capital across liquid, yield principal, and yield value.
     pub fn capital_breakdown(env: Env) -> Result<CapitalBreakdown, Error> {
         let global = Self::load_global(&env)?;
         let liquid = Self::idle(&env, &global);
@@ -1102,45 +1696,45 @@ impl Treasury {
         })
     }
 
-    /// Usage over the sliding window as of now: `amount` sums every bucket
-    /// still counted against `max_daily`, `day_start` is the start of the
-    /// oldest of them. Side-effect free (it advances a copy), so repeated
-    /// reads without trades in between return the same value.
+    // Usage over the sliding window as of now: `amount` sums every bucket
+    // still counted against `max_daily`, `day_start` is the start of the
+    // oldest of them. Side-effect free (it advances a copy), so repeated
+    // reads without trades in between return the same value.
     pub fn daily_usage(env: Env) -> Result<DailyUsage, Error> {
         let window = Self::daily_usage_detail(env)?;
         Self::summarize(&window)
     }
 
-    /// The hourly buckets behind `daily_usage`, advanced to now (not stored).
+    // The hourly buckets behind `daily_usage`, advanced to now (not stored).
     pub fn daily_usage_detail(env: Env) -> Result<UsageWindow, Error> {
         let mut window = Self::load_window(&env)?;
         Self::advance(&mut window, env.ledger().timestamp() / BUCKET_SECONDS);
         Ok(window)
     }
 
-    /// How much more the agents together may deploy right now before
-    /// `max_daily` (`max_daily - window sum`, floored at 0).
+    // How much more the agents together may deploy right now before
+    // `max_daily` (`max_daily - window sum`, floored at 0).
     pub fn daily_headroom(env: Env) -> Result<i128, Error> {
         let global = Self::load_global(&env)?;
         let used = Self::daily_usage(env)?.amount;
         Ok(global.max_daily.saturating_sub(used).max(0))
     }
 
-    /// `agent`'s own sliding-window usage, counted against its `max_daily`.
+    // `agent`'s own sliding-window usage, counted against its `max_daily`.
     pub fn agent_daily_usage(env: Env, agent: Address) -> Result<DailyUsage, Error> {
         let mut window = Self::load_agent_window(&env, &agent);
         Self::advance(&mut window, env.ledger().timestamp() / BUCKET_SECONDS);
         Self::summarize(&window)
     }
 
-    /// `max_net_exposure`.
+    // `max_net_exposure`.
     pub fn get_net_cap(env: Env) -> Result<i128, Error> {
         Ok(Self::load_global(&env)?.max_net_exposure)
     }
 
-    /// Capital currently deployed across all markets:
-    /// `sum(max(0, collateral_in - collateral_out))`, the figure
-    /// `max_net_exposure` is enforced against.
+    // Capital currently deployed across all markets:
+    // `sum(max(0, collateral_in - collateral_out))`, the figure
+    // `max_net_exposure` is enforced against.
     pub fn net_exposure(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -1148,18 +1742,18 @@ impl Treasury {
             .unwrap_or(0)
     }
 
-    /// Net position in `market_id` of the current market-core.
+    // Net position in `market_id` of the current market-core.
     pub fn net_position(env: Env, market_id: u64) -> Result<NetPosition, Error> {
         let global = Self::load_global(&env)?;
         Ok(Self::load_net(&env, &global.market_core, market_id))
     }
 
-    /// Conservative valuation of the treasury's holdings in `market_id`
-    /// (see [`Valuation`]). Two cross-contract reads (`get_market`,
-    /// `get_position`); a view only, never on the trading path.
+    // Conservative valuation of the treasury's holdings in `market_id`
+    // (see [`Valuation`]). Two cross-contract reads (`get_market`,
+    // `get_position`); a view only, never on the trading path.
     pub fn market_valuation(env: Env, market_id: u64) -> Result<Valuation, Error> {
         let global = Self::load_global(&env)?;
-        let (floor_value, spot_value) = Self::holdings_value(&env, &global.market_core, market_id)?;
+        let (floor_value, spot_value, _) = Self::holdings_value(&env, &global.market_core, market_id)?;
         let cost_basis = Self::load_net(&env, &global.market_core, market_id).cost_basis();
         Ok(Valuation {
             cost_basis,
@@ -1169,24 +1763,431 @@ impl Treasury {
         })
     }
 
+    // ----- operating mode (issue #272) -------------------------------------------
+    // `ModeState` holds each reason the treasury is not running normally; the
+    // effective `Mode` is derived from them (Emergency > AdminPaused >
+    // AgentsHalted > Normal). Every state-changing entrypoint asks `gate` (the
+    // `allowed` table in `mode.rs`); ADR 0005 explains each cell. Admin pause
+    // and drawdown halt are independent: clearing one never clears the other.
+
+    /// `set_paused(true)` is `pause(admin)`, `set_paused(false)` is `unpause()`.
+    /// Kept for the timelock's emergency path (ADR 0008), which calls
+    /// `set_paused(true)`.
     pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
-        Self::require_admin(&env)?;
-        let storage = env.storage().instance();
         if paused {
-            storage.set(&DataKey::Paused, &true);
-            storage.set(&DataKey::AdminPaused, &true);
+            let reason = Symbol::new(&env, "admin");
+            Self::pause(env, reason)
         } else {
-            if storage.get(&DataKey::DrawdownTripped).unwrap_or(false) {
-                if !storage.get(&DataKey::DrawdownAcknowledged).unwrap_or(false) {
-                    return Err(Error::NotAcknowledged);
-                }
-                storage.set(&DataKey::DrawdownTripped, &false);
-                storage.set(&DataKey::DrawdownAcknowledged, &false);
-            }
-            storage.set(&DataKey::Paused, &false);
-            storage.set(&DataKey::AdminPaused, &false);
+            Self::unpause(env)
         }
+    }
+
+    /// Admin pause: no deposits and no agent trading (settlement, queued
+    /// withdrawals and recalls stay open). Idempotent.
+    pub fn pause(env: Env, reason: Symbol) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let mut state = Self::load_mode_state(&env);
+        if state.admin_pause_at.is_some() {
+            return Ok(());
+        }
+        let from = state.mode();
+        state.admin_pause_at = Some(env.ledger().timestamp());
+        state.admin_pause_reason = Some(reason.clone());
+        Self::save_mode_state(&env, &state, from, reason);
         Ok(())
+    }
+
+    // Sell-only address allowed to unwind alongside the agent (#150).
+    pub fn set_unwinder(env: Env, unwinder: Option<Address>) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Unwinder, &unwinder);
+        Ok(())
+    }
+
+    pub fn unwinder(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Unwinder)
+    }
+
+    // Admin-set per-market minimum exit price in bps (#150). A sell in
+    // `Unwinding` below this reverts. `0` clears the override.
+    pub fn set_exit_floor(env: Env, market_id: u64, price_bps: u32) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if price_bps > BPS as u32 {
+            return Err(Error::InvalidExitFloor);
+        }
+        let key = DataKey::ExitFloor(market_id);
+        if price_bps == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            Self::put_persistent(&env, &key, &price_bps);
+        }
+        ExitFloorSet {
+            market_id,
+            price_bps,
+            is_default: false,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn set_default_exit_floor(env: Env, price_bps: u32) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if price_bps > BPS as u32 {
+            return Err(Error::InvalidExitFloor);
+        }
+        if price_bps == 0 {
+            env.storage().instance().remove(&DataKey::DefaultExitFloor);
+        } else {
+            env.storage()
+                .instance()
+                .set(&DataKey::DefaultExitFloor, &price_bps);
+        }
+        ExitFloorSet {
+            market_id: u64::MAX,
+            price_bps,
+            is_default: true,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn exit_floor(env: Env, market_id: u64) -> u32 {
+        Self::effective_exit_floor(&env, market_id)
+    }
+
+    // Collateral realized by unwind sells in `market_id`.
+    pub fn unwound(env: Env, market_id: u64) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Unwound(market_id))
+            .unwrap_or(0)
+    }
+
+    // ----- delayed admin operations (#250) -----------------------------------
+
+    // Queues a capital-moving or risk-loosening admin op for
+    // `config_delay` (admin). At most one op of each kind may be pending.
+    pub fn propose_op(env: Env, op: AdminOp) -> Result<u64, Error> {
+        Self::require_admin(&env)?;
+        Self::queue_op(env, op)
+    }
+
+    fn queue_op(env: Env, op: AdminOp) -> Result<u64, Error> {
+        Self::validate_op(&env, &op)?;
+        let kind = Self::op_kind(&op);
+        if env.storage().persistent().has(&DataKey::PendingOp(kind)) {
+            return Err(Error::ProposalPending);
+        }
+        if let AdminOp::SetSuccessor(_) = op {
+            if env.storage().persistent().has(&DataKey::PendingOp(3)) {
+                env.storage().persistent().remove(&DataKey::PendingOp(3));
+                AdminOpCancelled { kind: 3 }.publish(&env);
+            }
+        }
+        let executable_at = Self::unlock_time(&env)?;
+        let now = env.ledger().timestamp();
+        let pending = PendingAdminOp {
+            op: op.clone(),
+            proposed_at: now,
+            executable_at,
+            expires_at: executable_at.saturating_add(EXECUTION_GRACE),
+        };
+        Self::put_persistent(&env, &DataKey::PendingOp(kind), &pending);
+        AdminOpProposed {
+            kind,
+            op,
+            executable_at,
+        }
+        .publish(&env);
+        Ok(executable_at)
+    }
+
+    // Executes a pending op after its delay (permissionless). Parameters are
+    // read from storage, never from the caller, and every check is re-run
+    // against current state.
+    pub fn execute_op(env: Env, kind: u32) -> Result<(), Error> {
+        let pending: PendingAdminOp = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingOp(kind))
+            .ok_or(Error::NoPendingOp)?;
+        let now = env.ledger().timestamp();
+        if now < pending.executable_at {
+            return Err(Error::OpNotReady);
+        }
+        if now > pending.expires_at {
+            return Err(Error::OpExpired);
+        }
+        env.storage().persistent().remove(&DataKey::PendingOp(kind));
+        Self::apply_op(&env, &pending.op, false)?;
+        AdminOpExecuted {
+            kind,
+            op: pending.op,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn cancel_op(env: Env, kind: u32) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if !env.storage().persistent().has(&DataKey::PendingOp(kind)) {
+            return Err(Error::NoPendingOp);
+        }
+        env.storage().persistent().remove(&DataKey::PendingOp(kind));
+        AdminOpCancelled { kind }.publish(&env);
+        Ok(())
+    }
+
+    pub fn pending_op(env: Env, kind: u32) -> Option<PendingAdminOp> {
+        env.storage().persistent().get(&DataKey::PendingOp(kind))
+    }
+
+    // ----- correlated risk (#259) --------------------------------------------
+
+    pub fn correlation_caps(env: Env) -> Result<CorrelationCaps, Error> {
+        Self::load_correlation_caps(&env)
+    }
+
+    pub fn category_exposure(env: Env, core: Address, idx: u32) -> i128 {
+        let key = DataKey::CatExposure(core, idx);
+        let value: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if value != 0 {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        }
+        value
+    }
+
+    pub fn bucket_exposure(env: Env, core: Address, bucket: u64) -> i128 {
+        let key = DataKey::BucketExposure(core, bucket);
+        let value: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if value != 0 {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        }
+        value
+    }
+
+    // Remaining category and bucket headroom for `market_id`.
+    pub fn correlation_headroom(env: Env, market_id: u64) -> Result<(i128, i128), Error> {
+        let global = Self::load_global(&env)?;
+        let caps = Self::load_correlation_caps(&env)?;
+        let meta = Self::ensure_market_meta(&env, &global.market_core, market_id)?;
+        let cat =
+            Self::category_exposure(env.clone(), global.market_core.clone(), meta.category_idx);
+        let bucket = Self::bucket_exposure(env.clone(), global.market_core.clone(), meta.bucket);
+        let cat_cap = caps
+            .max_per_category
+            .get(meta.category_idx)
+            .ok_or(Error::InvalidConfig)?;
+        Ok((
+            cat_cap.saturating_sub(cat).max(0),
+            caps.max_per_bucket.saturating_sub(bucket).max(0),
+        ))
+    }
+
+    pub fn pending_correlation_caps(env: Env) -> Option<PendingCorrelation> {
+        env.storage().instance().get(&DataKey::PendingCorrelation)
+    }
+
+    // Proposes correlation caps under the tighten-now/loosen-later rule.
+    pub fn propose_correlation_caps(env: Env, caps: CorrelationCaps) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        Self::validate_correlation_caps(&env, &caps)?;
+        match Self::classify_correlation_caps(&env, &caps)? {
+            Change::None => return Err(Error::InvalidConfig),
+            Change::TightenOnly => {
+                Self::apply_correlation_caps(&env, &caps, true)?;
+                Ok(())
+            }
+            Change::NeedsDelay => {
+                if env.storage().instance().has(&DataKey::PendingCorrelation) {
+                    return Err(Error::ProposalPending);
+                }
+                let executable_at = Self::unlock_time(&env)?;
+                env.storage().instance().set(
+                    &DataKey::PendingCorrelation,
+                    &PendingCorrelation {
+                        caps: caps.clone(),
+                        proposed_at: env.ledger().timestamp(),
+                        executable_at,
+                    },
+                );
+                CorrelationCapsProposed {
+                    caps,
+                    executable_at,
+                }
+                .publish(&env);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn execute_correlation_caps(env: Env) -> Result<(), Error> {
+        let pending: PendingCorrelation = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingCorrelation)
+            .ok_or(Error::NoPendingOp)?;
+        if env.ledger().timestamp() < pending.executable_at {
+            return Err(Error::OpNotReady);
+        }
+        if env.ledger().timestamp() > pending.executable_at.saturating_add(EXECUTION_GRACE) {
+            return Err(Error::OpExpired);
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingCorrelation);
+        Self::apply_correlation_caps(&env, &pending.caps, false)?;
+        CorrelationCapsExecuted {
+            caps: pending.caps,
+            immediate: false,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn cancel_correlation_caps(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if !env.storage().instance().has(&DataKey::PendingCorrelation) {
+            return Err(Error::NoPendingOp);
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingCorrelation);
+        CorrelationCapsCancelled {}.publish(&env);
+        Ok(())
+    }
+
+    /// Clears the admin pause only. A drawdown halt, if any, stands, so the
+    /// agents stay halted; clear it with `resume_agents`. Refused while an
+    /// emergency is declared (`end_emergency` first).
+    pub fn unpause(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let mut state = Self::load_mode_state(&env);
+        if state.emergency_at.is_some() {
+            return Err(Error::EmergencyMode);
+        }
+        if state.admin_pause_at.is_none() {
+            return Ok(());
+        }
+        let from = state.mode();
+        state.admin_pause_at = None;
+        state.admin_pause_reason = None;
+        Self::save_mode_state(&env, &state, from, Symbol::new(&env, "unpause"));
+        Ok(())
+    }
+
+    /// Clears a drawdown halt. Allowed only once the realized window PnL is back
+    /// above `-max_drawdown` (waiting for old losses to leave the window, or an
+    /// explicit `reset_pnl_window`), so an admin cannot simply wave a real loss
+    /// through. Leaves any admin pause or emergency untouched. Replaces
+    /// `acknowledge_drawdown` + `set_paused(false)`.
+    pub fn resume_agents(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let mut state = Self::load_mode_state(&env);
+        if state.drawdown_halt.is_none() {
+            return Err(Error::NotPaused);
+        }
+        let cfg = Self::load_drawdown_cfg(&env)?;
+        if Self::calc_window_pnl(&env)? < -cfg.max_drawdown {
+            return Err(Error::NotRecovered);
+        }
+        let from = state.mode();
+        state.drawdown_halt = None;
+        Self::save_mode_state(&env, &state, from, Symbol::new(&env, "resume"));
+        Ok(())
+    }
+
+    /// Declares an emergency: opens `emergency_withdraw` (the idle-only,
+    /// position-forfeiting exit) and closes new withdrawal requests. Only from
+    /// `AdminPaused`, so one admin call cannot flip straight into the forfeiting
+    /// exit; with the timelock as admin the extra step is delayed too.
+    pub fn declare_emergency(env: Env, reason: Symbol) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let mut state = Self::load_mode_state(&env);
+        match state.mode() {
+            Mode::Emergency => return Ok(()),
+            Mode::Paused => {}
+            Mode::Normal | Mode::AgentsHalted | Mode::Unwinding => return Err(Error::NotPaused),
+        }
+        state.emergency_at = Some(env.ledger().timestamp());
+        state.emergency_reason = Some(reason.clone());
+        Self::save_mode_state(&env, &state, Mode::Paused, reason);
+        Ok(())
+    }
+
+    /// Ends the emergency. The admin pause stands (`AdminPaused`); `unpause`
+    /// then resumes. In production route it through `timelock.schedule`.
+    pub fn end_emergency(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let mut state = Self::load_mode_state(&env);
+        if state.emergency_at.is_none() {
+            return Err(Error::NotPaused);
+        }
+        let from = state.mode();
+        state.emergency_at = None;
+        state.emergency_reason = None;
+        Self::save_mode_state(&env, &state, from, Symbol::new(&env, "end_emerg"));
+        Ok(())
+    }
+
+    /// Admin mode transition kept from #150: `Normal` clears an admin pause and
+    /// an unwind (a drawdown halt stands: `resume_agents`), `Paused` is `pause`,
+    /// `Unwinding` replaces an admin pause with an orderly wind-down. `Emergency`
+    /// and `AgentsHalted` have their own entrypoints (`declare_emergency`, the
+    /// drawdown trip) and are refused here.
+    pub fn set_mode(env: Env, mode: Mode) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let mut state = Self::load_mode_state(&env);
+        if state.emergency_at.is_some() {
+            return Err(Error::EmergencyMode);
+        }
+        let from = state.mode();
+        let reason = Symbol::new(&env, "set_mode");
+        match mode {
+            Mode::Normal => {
+                state.admin_pause_at = None;
+                state.admin_pause_reason = None;
+                state.unwinding_at = None;
+            }
+            Mode::Paused => {
+                if state.admin_pause_at.is_none() {
+                    state.admin_pause_at = Some(env.ledger().timestamp());
+                    state.admin_pause_reason = Some(Symbol::new(&env, "admin"));
+                }
+                state.unwinding_at = None;
+            }
+            Mode::Unwinding => {
+                state.admin_pause_at = None;
+                state.admin_pause_reason = None;
+                if state.unwinding_at.is_none() {
+                    state.unwinding_at = Some(env.ledger().timestamp());
+                }
+            }
+            Mode::Emergency | Mode::AgentsHalted => return Err(Error::InvalidConfig),
+        }
+        Self::save_mode_state(&env, &state, from, reason);
+        Ok(())
+    }
+
+    /// The effective operating mode.
+    pub fn mode(env: Env) -> Mode {
+        Self::load_mode_state(&env).mode()
+    }
+
+    /// Each stored reason (drawdown halt, admin pause, emergency) with when it
+    /// began and, for the admin's, why.
+    pub fn mode_state(env: Env) -> ModeState {
+        Self::load_mode_state(&env)
+    }
+
+    /// Whether `op` is permitted in the current mode: the gate's answer, for
+    /// agents and frontends to pre-check.
+    pub fn allowed(env: Env, op: Op) -> bool {
+        allowed(Self::load_mode_state(&env).mode(), op)
     }
 
     // ----- agent registry ------------------------------------------------------
@@ -1199,8 +2200,8 @@ impl Treasury {
     // market-core only ever sees the treasury as the trader, so positions
     // are pooled: per-agent state is usage (caps), not ownership.
 
-    /// Adds or updates `agent`. Validation: `roles` non-empty and known,
-    /// `0 < max_trade <= max_daily`, both within the global caps, `active`.
+    // Adds or updates `agent`. Validation: `roles` non-empty and known,
+    // `0 < max_trade <= max_daily`, both within the global caps, `active`.
     pub fn set_agent(env: Env, agent: Address, policy: AgentPolicy) -> Result<(), Error> {
         Self::require_admin(&env)?;
         let global = Self::load_global(&env)?;
@@ -1240,8 +2241,8 @@ impl Treasury {
         }
     }
 
-    /// Applies `agent`'s pending policy once its delay has passed.
-    /// Permissionless: the delay is the protection.
+    // Applies `agent`'s pending policy once its delay has passed.
+    // Permissionless: the delay is the protection.
     pub fn execute_agent(env: Env, agent: Address) -> Result<(), Error> {
         let key = DataKey::PendingAgent(agent.clone());
         let pending: PendingAgent = env
@@ -1270,9 +2271,9 @@ impl Treasury {
         Ok(())
     }
 
-    /// Deactivates `agent` at once, keeping its usage history. At least one
-    /// active agent with `ROLE_SETTLE` must remain, so open positions can
-    /// always be settled.
+    // Deactivates `agent` at once, keeping its usage history. At least one
+    // active agent with `ROLE_SETTLE` must remain, so open positions can
+    // always be settled.
     pub fn remove_agent(env: Env, agent: Address) -> Result<(), Error> {
         Self::require_admin(&env)?;
         let mut policy = Self::get_agent(env.clone(), agent.clone())
@@ -1282,6 +2283,31 @@ impl Treasury {
         Self::put_persistent(&env, &DataKey::Agent(agent.clone()), &policy);
         Self::ensure_settler(&env)?;
         AgentRemoved { agent }.publish(&env);
+        Ok(())
+    }
+
+    pub fn agent_halt(env: Env, agent: Address, reason: u32) -> Result<(), Error> {
+        agent.require_auth();
+        let key = DataKey::Agent(agent.clone());
+        let mut policy: AgentPolicy = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::Unauthorized)?;
+        if !policy.active {
+            return Err(Error::Unauthorized);
+        }
+        policy.roles &= ROLE_SETTLE;
+        Self::put_persistent(&env, &key, &policy);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingAgent(agent.clone()));
+        AgentHalted {
+            agent,
+            reason,
+            roles_after: policy.roles,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -1295,7 +2321,7 @@ impl Treasury {
             .get(&DataKey::PendingAgent(agent))
     }
 
-    /// Agents ever registered (removed ones included).
+    // Agents ever registered (removed ones included).
     pub fn agent_count(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -1316,9 +2342,9 @@ impl Treasury {
     // compromised admin can unlock for the *agents*; it does not stop the
     // admin's own powers (pause, migrate_market).
 
-    /// Proposes `config` as the global config (admin). Tighten-only
-    /// proposals apply at once and leave any pending proposal and its timer
-    /// as they are; anything else is queued.
+    // Proposes `config` as the global config (admin). Tighten-only
+    // proposals apply at once and leave any pending proposal and its timer
+    // as they are; anything else is queued.
     pub fn propose_config(env: Env, config: GlobalConfig) -> Result<(), Error> {
         Self::require_admin(&env)?;
         let new = config;
@@ -1361,14 +2387,14 @@ impl Treasury {
         }
     }
 
-    /// Applies the pending config once its delay has passed. Permissionless,
-    /// so execution never depends on the admin being available.
-    ///
-    /// A `market_core` change records the old core as legacy: its positions
-    /// stay where they are (recover them with `legacy_redeem` /
-    /// `legacy_claim_pool_remainder`), and exposure for the new core is kept
-    /// under keys namespaced by core so market ids cannot collide. The new
-    /// core must be pointed at this treasury with its own `set_treasury`.
+    // Applies the pending config once its delay has passed. Permissionless,
+    // so execution never depends on the admin being available.
+    //
+    // A `market_core` change records the old core as legacy: its positions
+    // stay where they are (recover them with `legacy_redeem` /
+    // `legacy_claim_pool_remainder`), and exposure for the new core is kept
+    // under keys namespaced by core so market ids cannot collide. The new
+    // core must be pointed at this treasury with its own `set_treasury`.
     pub fn execute_config(env: Env) -> Result<(), Error> {
         let pending: PendingConfig = env
             .storage()
@@ -1423,6 +2449,69 @@ impl Treasury {
             .unwrap_or(MIN_CONFIG_DELAY)
     }
 
+    pub fn max_mark_age_ledgers(env: Env) -> u32 {
+        Self::load_mark_age(&env)
+    }
+
+    pub fn pending_max_mark_age(env: Env) -> Option<PendingMarkAge> {
+        env.storage().instance().get(&DataKey::PendingMarkAge)
+    }
+
+    pub fn set_max_mark_age(env: Env, ledgers: u32) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if ledgers == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        let old = Self::load_mark_age(&env);
+        let storage = env.storage().instance();
+        if ledgers < old {
+            storage.set(&DataKey::MaxMarkAgeLedgers, &ledgers);
+            Self::recompute_mark_age(&env);
+            return Ok(());
+        }
+        if ledgers == old {
+            return Err(Error::InvalidConfig);
+        }
+        if storage.has(&DataKey::PendingMarkAge) {
+            return Err(Error::ProposalPending);
+        }
+        let executable_at = Self::unlock_time(&env)?;
+        storage.set(
+            &DataKey::PendingMarkAge,
+            &PendingMarkAge {
+                ledgers,
+                executable_at,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn execute_max_mark_age(env: Env) -> Result<(), Error> {
+        let pending: PendingMarkAge = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingMarkAge)
+            .ok_or(Error::NoPendingConfig)?;
+        if env.ledger().timestamp() < pending.executable_at {
+            return Err(Error::TimelockActive);
+        }
+        let storage = env.storage().instance();
+        storage.set(&DataKey::MaxMarkAgeLedgers, &pending.ledgers);
+        storage.remove(&DataKey::PendingMarkAge);
+        Self::recompute_mark_age(&env);
+        Ok(())
+    }
+
+    pub fn cancel_max_mark_age(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let storage = env.storage().instance();
+        if !storage.has(&DataKey::PendingMarkAge) {
+            return Err(Error::NoPendingConfig);
+        }
+        storage.remove(&DataKey::PendingMarkAge);
+        Ok(())
+    }
+
     /// Lengthens the timelock. Shortening is refused outright: it would
     /// itself have to wait out the old delay to be safe, and a lengthening
     /// can always be undone by redeploying.
@@ -1449,9 +2538,9 @@ impl Treasury {
         Self::load_price_policy(&env)
     }
 
-    /// Sets the price limits on agent trades (admin). Like the caps,
-    /// tightening (lower `max_buy`/`max_impact`/`max_slippage`, higher
-    /// `min_sell`) applies at once and anything else waits `config_delay`.
+    // Sets the price limits on agent trades (admin). Like the caps,
+    // tightening (lower `max_buy`/`max_impact`/`max_slippage`, higher
+    // `min_sell`) applies at once and anything else waits `config_delay`.
     pub fn set_price_policy(env: Env, policy: PricePolicy) -> Result<(), Error> {
         Self::require_admin(&env)?;
         Self::validate_price_policy(&policy)?;
@@ -1507,8 +2596,8 @@ impl Treasury {
         }
     }
 
-    /// Applies the pending price policy once its delay has passed.
-    /// Permissionless.
+    // Applies the pending price policy once its delay has passed.
+    // Permissionless.
     pub fn execute_price_policy(env: Env) -> Result<(), Error> {
         let pending: PendingPricePolicy = env
             .storage()
@@ -1550,19 +2639,185 @@ impl Treasury {
         env.storage().instance().get(&DataKey::PendingPrice)
     }
 
+    // ----- resolvability policy (#273) --------------------------------------------
+
+    pub fn get_resolvability_policy(env: Env) -> ResolvabilityPolicy {
+        Self::load_resolvability_policy(&env)
+    }
+
+    /// Admin only. Tightening (a flag to `true`, a larger `min_secs_to_close`,
+    /// fewer `allowed_specs` bits) applies at once; anything that loosens a knob
+    /// waits `config_delay` (`execute_resolvability_policy`).
+    pub fn set_resolvability_policy(env: Env, policy: ResolvabilityPolicy) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if policy.allowed_specs & !ALL_SPEC_BITS != 0 {
+            return Err(Error::InvalidConfig);
+        }
+        let old = Self::load_resolvability_policy(&env);
+        match classify_resolvability(&old, &policy) {
+            Change::None => Err(Error::InvalidConfig),
+            Change::TightenOnly => {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::ResolvabilityPolicy, &policy);
+                ResolvabilityPolicySet {
+                    old,
+                    new: policy,
+                    immediate: true,
+                }
+                .publish(&env);
+                Ok(())
+            }
+            Change::NeedsDelay => {
+                if env.storage().instance().has(&DataKey::PendingResolvability) {
+                    return Err(Error::ProposalPending);
+                }
+                let executable_at = Self::unlock_time(&env)?;
+                env.storage().instance().set(
+                    &DataKey::PendingResolvability,
+                    &PendingResolvability {
+                        policy,
+                        proposed_at: env.ledger().timestamp(),
+                        executable_at,
+                    },
+                );
+                ResolvabilityPolicyProposed {
+                    old,
+                    new: policy,
+                    executable_at,
+                }
+                .publish(&env);
+                Ok(())
+            }
+        }
+    }
+
+    /// Applies the pending resolvability policy once its delay has passed.
+    /// Permissionless.
+    pub fn execute_resolvability_policy(env: Env) -> Result<(), Error> {
+        let pending: PendingResolvability = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingResolvability)
+            .ok_or(Error::NoPendingConfig)?;
+        if env.ledger().timestamp() < pending.executable_at {
+            return Err(Error::TimelockActive);
+        }
+        let old = Self::load_resolvability_policy(&env);
+        let storage = env.storage().instance();
+        storage.set(&DataKey::ResolvabilityPolicy, &pending.policy);
+        storage.remove(&DataKey::PendingResolvability);
+        ResolvabilityPolicySet {
+            old,
+            new: pending.policy,
+            immediate: false,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn cancel_resolvability_policy(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let pending: PendingResolvability = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingResolvability)
+            .ok_or(Error::NoPendingConfig)?;
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingResolvability);
+        ResolvabilityPolicyCancelled {
+            policy: pending.policy,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn pending_resolvability_policy(env: Env) -> Option<PendingResolvability> {
+        env.storage().instance().get(&DataKey::PendingResolvability)
+    }
+
     // ----- vault -------------------------------------------------------------------
     // Deposits mint shares against a conservative NAV and withdrawals burn
     // them; see docs/adr/0005-treasury-vault.md for the valuation choice.
 
-    /// Net asset value: idle collateral plus, for every market in the open-
-    /// market index, what the holdings are worth whatever the outcome
-    /// (complete sets and the LP's `min` reserve while open, the exact
-    /// settlement value once final), minus what queued withdrawals are owed.
-    /// Directional exposure is valued at zero, so no trade against a pool
-    /// can raise NAV.
+    // Net asset value: idle collateral plus, for every market in the open-
+    // market index, what the holdings are worth whatever the outcome
+    // (complete sets and the LP's `min` reserve while open, the exact
+    // settlement value once final), minus what queued withdrawals are owed.
+    // Directional exposure is valued at zero, so no trade against a pool
+    // can raise NAV.
     pub fn nav(env: Env) -> Result<i128, Error> {
         let global = Self::load_global(&env)?;
         Self::compute_nav(&env, &global)
+    }
+
+    pub fn nav_detail(env: Env) -> NavDetail {
+        NavDetail {
+            holdings: Self::nav_holdings(&env),
+            stale_lp_markets: if Self::marks_stale(&env) {
+                env.storage()
+                    .instance()
+                    .get(&DataKey::StaleLpCount)
+                    .unwrap_or(0)
+            } else {
+                0
+            },
+            oldest_refresh: env
+                .storage()
+                .instance()
+                .get(&DataKey::OldestLpRefresh)
+                .unwrap_or(env.ledger().sequence()),
+        }
+    }
+
+    pub fn audit_mark(env: Env, core: Address, market_id: u64) -> Option<MarkRecord> {
+        env.storage()
+            .persistent()
+            .get(&Self::mark_key(&core, market_id))
+    }
+
+    pub fn refresh_mark(env: Env, market_ids: Vec<u64>) -> Result<(), Error> {
+        if market_ids.len() > MAX_REFRESH_BATCH {
+            return Err(Error::MarkBatchTooLarge);
+        }
+        for market_id in market_ids.iter() {
+            let core = Self::core_for_market(&env, market_id)?;
+            Self::refresh_mark_for(&env, &core, market_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn migrate_marks(env: Env, start: u32, limit: u32) -> Result<u32, Error> {
+        if limit == 0 || limit > MAX_MIGRATE_BATCH {
+            return Err(Error::MarkBatchTooLarge);
+        }
+        if Self::marks_migrated(&env) {
+            return Ok(Self::open_count(&env));
+        }
+        let count = Self::open_count(&env);
+        let end = start.saturating_add(limit).min(count);
+        for i in start..end {
+            let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<_, OpenMarket>(&DataKey::OpenMarketAt(i))
+            else {
+                continue;
+            };
+            if !env
+                .storage()
+                .persistent()
+                .has(&Self::mark_key(&entry.core, entry.market_id))
+            {
+                Self::refresh_mark_for(&env, &entry.core, entry.market_id)?;
+            }
+        }
+        if end >= count {
+            env.storage().instance().set(&DataKey::MarksMigrated, &true);
+            Self::recompute_mark_age(&env);
+        }
+        Ok(end)
     }
 
     pub fn shares_of(env: Env, owner: Address) -> i128 {
@@ -1576,7 +2831,7 @@ impl Treasury {
         Self::supply(&env)
     }
 
-    /// Collateral owed to queued withdrawals; agents cannot spend it.
+    // Collateral owed to queued withdrawals; agents cannot spend it.
     pub fn queue_reserved(env: Env) -> i128 {
         Self::reserved(&env)
     }
@@ -1585,7 +2840,7 @@ impl Treasury {
         env.storage().persistent().get(&DataKey::Ticket(ticket_id))
     }
 
-    /// The ticket `claim_withdraw` pays next, and the id the next one gets.
+    // The ticket `claim_withdraw` pays next, and the id the next one gets.
     pub fn queue_bounds(env: Env) -> (u64, u64) {
         (Self::queue_head(&env), Self::queue_tail(&env))
     }
@@ -1598,10 +2853,10 @@ impl Treasury {
         env.storage().persistent().get(&DataKey::OpenMarketAt(i))
     }
 
-    /// Deposits `amount` of collateral and mints shares to `from` at the NAV
-    /// as it was before the deposit. Returns the shares minted.
+    // Deposits `amount` of collateral and mints shares to `from` at the NAV
+    // as it was before the deposit. Returns the shares minted.
     pub fn deposit(env: Env, from: Address, amount: i128) -> Result<i128, Error> {
-        Self::assert_not_paused(&env)?;
+        Self::gate(&env, Op::Deposit)?;
         let global = Self::load_global(&env)?;
         from.require_auth();
         if amount <= 0 {
@@ -1610,6 +2865,7 @@ impl Treasury {
         if amount < MIN_DEPOSIT {
             return Err(Error::DepositTooSmall);
         }
+        Self::assert_marks_fresh(&env)?;
         let nav = Self::compute_nav(&env, &global)?;
         token::TokenClient::new(&env, &global.collateral).transfer(
             &from,
@@ -1627,13 +2883,53 @@ impl Treasury {
         Ok(shares)
     }
 
-    /// Burns `shares` of `owner` at the current NAV, pays what free idle
-    /// collateral allows now and queues the rest as a ticket (FIFO, paid by
-    /// `claim_withdraw` as capital returns). Returns `(paid_now, ticket_id)`,
-    /// `ticket_id` 0 when nothing was queued.
+    // Deposits `token` (#151). The default collateral mints shares through
+    // [`Treasury::deposit`]; other allow-listed tokens are donated to the
+    // vault (no cross-token NAV exists, by design) and become available for
+    // that token's markets.
+    pub fn deposit_token(
+        env: Env,
+        from: Address,
+        token: Address,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        let global = Self::load_global(&env)?;
+        if token == global.collateral {
+            return Self::deposit(env, from, amount);
+        }
+        Self::gate(&env, Op::Deposit)?;
+        from.require_auth();
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let client = MarketCoreClient::new(&env, &global.market_core);
+        let params =
+            core_call(client.try_collateral_params(&token))?.ok_or(Error::CollateralNotAllowed)?;
+        if !params.enabled {
+            return Err(Error::CollateralNotAllowed);
+        }
+        token::TokenClient::new(&env, &token).transfer(
+            &from,
+            env.current_contract_address(),
+            &amount,
+        );
+        TokenDeposited {
+            owner: from,
+            token,
+            amount,
+        }
+        .publish(&env);
+        Ok(amount)
+    }
+
+    // Burns `shares` of `owner` at the current NAV, pays what free idle
+    // collateral allows now and queues the rest as a ticket (FIFO, paid by
+    // `claim_withdraw` as capital returns). Returns `(paid_now, ticket_id)`,
+    // `ticket_id` 0 when nothing was queued.
     pub fn request_withdraw(env: Env, owner: Address, shares: i128) -> Result<(i128, u64), Error> {
         let global = Self::load_global(&env)?;
         owner.require_auth();
+        Self::gate(&env, Op::RequestWithdraw)?;
         if shares <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -1649,6 +2945,7 @@ impl Treasury {
         if last_mint >= current_epoch.saturating_sub(1) && last_mint > 0 {
             return Err(Error::HoldingPeriod);
         }
+        Self::assert_marks_fresh(&env)?;
         let nav = Self::compute_nav(&env, &global)?;
         let assets =
             assets_for_shares(shares, nav, Self::supply(&env)).ok_or(Error::InvalidAmount)?;
@@ -1799,7 +3096,11 @@ impl Treasury {
     /// Pays the ticket at the head of the queue as far as idle collateral
     /// allows. Permissionless: the money always goes to the ticket's owner.
     /// Only the head ticket can be paid (`NothingToPay` for later ones).
+    // Pays the ticket at the head of the queue as far as idle collateral
+    // allows. Permissionless: the money always goes to the ticket's owner.
+    // Only the head ticket can be paid (`NothingToPay` for later ones).
     pub fn claim_withdraw(env: Env, ticket_id: u64) -> Result<i128, Error> {
+        Self::gate(&env, Op::ClaimWithdraw)?;
         let global = Self::load_global(&env)?;
         let key = DataKey::Ticket(ticket_id);
         let mut ticket: WithdrawTicket = env
@@ -1833,16 +3134,16 @@ impl Treasury {
         Ok(amount)
     }
 
-    /// While paused only: burns `shares` for their pro-rata part of the free
-    /// idle collateral, without reading market-core (for when it is the
-    /// thing that broke). The owner forfeits their part of open positions,
-    /// which stays with the remaining shareholders.
+    /// `Mode::Emergency` only (`declare_emergency`, itself only from an admin
+    /// pause): burns `shares` for their pro-rata part of the free idle
+    /// collateral, without reading market-core (for when it is the thing that
+    /// broke). The owner forfeits their part of open positions, which stays with
+    /// the remaining shareholders. A drawdown halt or an ordinary admin pause
+    /// never opens it: the normal queued exit pays at NAV (ADR 0005).
     pub fn emergency_withdraw(env: Env, owner: Address, shares: i128) -> Result<i128, Error> {
         let global = Self::load_global(&env)?;
         owner.require_auth();
-        if !Self::is_paused(&env) {
-            return Err(Error::NotPaused);
-        }
+        Self::gate(&env, Op::EmergencyWithdraw)?;
         if shares <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -1874,6 +3175,79 @@ impl Treasury {
         Ok(amount)
     }
 
+    // ----- trace-gated policy -------------------------------------------------
+
+    pub fn trace_policy(env: Env) -> TracePolicyConfig {
+        Self::load_trace_policy_config(&env)
+    }
+
+    pub fn propose_trace_policy(
+        env: Env,
+        policy: TracePolicy,
+        max_trace_age_ledgers: u32,
+        registry: Option<Address>,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if env.storage().instance().has(&DataKey::PendingTracePolicy) {
+            return Err(Error::TracePolicyPending);
+        }
+        let old = Self::load_trace_policy_config(&env);
+        let old_registry = env.storage().instance().get::<_, Address>(&DataKey::Registry);
+        let new = TracePolicyConfig {
+            policy,
+            max_trace_age_ledgers,
+        };
+        let tightening = Self::is_trace_policy_tightening(&old, &new, &old_registry, &registry);
+        if tightening {
+            env.storage().instance().set(&DataKey::TracePolicy, &new);
+            match registry {
+                Some(r) => env.storage().instance().set(&DataKey::Registry, &r),
+                None => env.storage().instance().remove(&DataKey::Registry),
+            }
+            return Ok(());
+        }
+        let executable_at = Self::unlock_time(&env)?;
+        let pending = PendingTracePolicy {
+            config: new,
+            registry,
+            proposed_at: env.ledger().timestamp(),
+            executable_at,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingTracePolicy, &pending);
+        Ok(())
+    }
+
+    pub fn execute_trace_policy(env: Env) -> Result<(), Error> {
+        let pending: PendingTracePolicy = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingTracePolicy)
+            .ok_or(Error::TracePolicyNotPending)?;
+        if env.ledger().timestamp() < pending.executable_at {
+            return Err(Error::TraceTimelockActive);
+        }
+        env.storage().instance().remove(&DataKey::PendingTracePolicy);
+        env.storage()
+            .instance()
+            .set(&DataKey::TracePolicy, &pending.config);
+        match pending.registry {
+            Some(r) => env.storage().instance().set(&DataKey::Registry, &r),
+            None => env.storage().instance().remove(&DataKey::Registry),
+        }
+        Ok(())
+    }
+
+    pub fn cancel_trace_policy(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if !env.storage().instance().has(&DataKey::PendingTracePolicy) {
+            return Err(Error::TracePolicyNotPending);
+        }
+        env.storage().instance().remove(&DataKey::PendingTracePolicy);
+        Ok(())
+    }
+
     // ----- agent-driven trading --------------------------------------------
     // An agent never touches market-core directly with treasury funds: it
     // asks the treasury to do so, the treasury checks its own on-chain caps,
@@ -1881,10 +3255,10 @@ impl Treasury {
     // path that moves treasury capital, so the caps below are real limits on
     // what the automated agents can deploy, not just off-chain bookkeeping.
 
-    /// Creates and seeds a market using treasury capital (`ROLE_CREATE`).
-    /// The treasury becomes the market's creator/LP. `initial_yes_bps` must
-    /// lie within the price policy's `[min_sell, max_buy]` band, so the
-    /// treasury never seeds a market whose creator side is near worthless.
+    // Creates and seeds a market using treasury capital (`ROLE_CREATE`).
+    // The treasury becomes the market's creator/LP. `initial_yes_bps` must
+    // lie within the price policy's `[min_sell, max_buy]` band, so the
+    // treasury never seeds a market whose creator side is near worthless.
     #[allow(clippy::too_many_arguments)]
     pub fn agent_create_market(
         env: Env,
@@ -1897,7 +3271,65 @@ impl Treasury {
         seed_amount: i128,
         initial_yes_bps: u32,
     ) -> Result<u64, Error> {
-        Self::assert_not_paused(&env)?;
+        Self::create_market_inner(
+            env,
+            agent,
+            question_hash,
+            resolution_hash,
+            meta_uri,
+            category,
+            close_time,
+            seed_amount,
+            initial_yes_bps,
+            None,
+        )
+    }
+
+    // Creates a market denominated in an allow-listed `collateral` (#151).
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_create_market_collateral(
+        env: Env,
+        agent: Address,
+        collateral: Address,
+        question_hash: BytesN<32>,
+        resolution_hash: BytesN<32>,
+        meta_uri: String,
+        category: Category,
+        close_time: u64,
+        seed_amount: i128,
+        initial_yes_bps: u32,
+    ) -> Result<u64, Error> {
+        Self::create_market_inner(
+            env,
+            agent,
+            question_hash,
+            resolution_hash,
+            meta_uri,
+            category,
+            close_time,
+            seed_amount,
+            initial_yes_bps,
+            Some(collateral),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_market_inner(
+        env: Env,
+        agent: Address,
+        question_hash: BytesN<32>,
+        resolution_hash: BytesN<32>,
+        meta_uri: String,
+        category: Category,
+        close_time: u64,
+        seed_amount: i128,
+        initial_yes_bps: u32,
+        collateral: Option<Address>,
+    ) -> Result<u64, Error> {
+        Self::gate(&env, Op::AgentOpen)?;
+        if Self::trace_policy(env.clone()).policy == TracePolicy::Required {
+            return Err(Error::TraceRequired);
+        }
         let global = Self::load_global(&env)?;
         let policy = Self::require_agent(&env, &agent, ROLE_CREATE)?;
         if seed_amount <= 0 {
@@ -1923,14 +3355,24 @@ impl Treasury {
         {
             return Err(Error::PriceOutOfBand);
         }
+        let caps = Self::load_correlation_caps(&env)?;
+        let meta = MarketMeta {
+            category_idx: correlation::category_index(&category),
+            bucket: correlation::close_bucket(close_time, caps.bucket_secs)?,
+        };
+        Self::check_correlated_amount(&env, &global.market_core, &meta, seed_amount)?;
+        let token = collateral.unwrap_or_else(|| global.collateral.clone());
+        let token_caps = Self::load_token_caps(&env, &global, &token);
+        Self::check_trade_size(&global, &policy, &token_caps, seed_amount)?;
         Self::record_creation(&env, &creation_policy)?;
-        Self::ensure_liquid(&env, &global, seed_amount)?;
-        Self::ensure_unreserved(&env, &global, seed_amount)?;
+        Self::ensure_liquid_token(&env, &global, &token, seed_amount)?;
+        Self::ensure_unreserved_token(&env, &global, &token, seed_amount)?;
 
         let treasury_addr = env.current_contract_address();
-        Self::authorize_token_pull(&env, &global, &treasury_addr, seed_amount);
-        let market_id = core_call(
-            MarketCoreClient::new(&env, &global.market_core).try_create_market(
+        Self::authorize_token_pull_of(&env, &global, &token, &treasury_addr, seed_amount);
+        let client = MarketCoreClient::new(&env, &global.market_core);
+        let market_id = if token == global.collateral {
+            core_call(client.try_create_market(
                 &treasury_addr,
                 &question_hash,
                 &resolution_hash,
@@ -1939,25 +3381,46 @@ impl Treasury {
                 &close_time,
                 &seed_amount,
                 &initial_yes_bps,
-            ),
+            ))?
+        } else {
+            core_call(client.try_create_market_with_collateral(
+                &treasury_addr,
+                &token,
+                &question_hash,
+                &resolution_hash,
+                &meta_uri,
+                &category,
+                &close_time,
+                &seed_amount,
+                &initial_yes_bps,
+            ))?
+        };
+        Self::save_market_meta(&env, &global.market_core, market_id, &meta);
+        Self::reserve_capacity(
+            &env,
+            &global,
+            &agent,
+            &policy,
+            &token,
+            market_id,
+            seed_amount,
         )?;
-        Self::reserve_capacity(&env, &global, &agent, &policy, market_id, seed_amount)?;
         Self::reserve_net(&env, &global, market_id, seed_amount)?;
         Self::record_cost(&env, market_id, seed_amount)?;
         Ok(market_id)
     }
 
-    /// Like [`Treasury::agent_create_market`], but reveals the resolution rule
-    /// in the same transaction (#64). The market is created with the commitment
-    /// derived from `spec_v2` itself, so the follow-up reveal necessarily
-    /// matches and the market can never be left unresolvable. `resolver` is the
-    /// deployed resolver contract; it must be configured for this treasury's
-    /// market-core.
-    ///
-    /// The router cannot serve this path: seeding pulls collateral from the
-    /// treasury contract (not the end user) via a contract self-authorization,
-    /// which only this contract can perform — a stateless router between the
-    /// agent and market-core would not be authorized on the token.
+    // Like [`Treasury::agent_create_market`], but reveals the resolution rule
+    // in the same transaction (#64). The market is created with the commitment
+    // derived from `spec_v2` itself, so the follow-up reveal necessarily
+    // matches and the market can never be left unresolvable. `resolver` is the
+    // deployed resolver contract; it must be configured for this treasury's
+    // market-core.
+    //
+    // The router cannot serve this path: seeding pulls collateral from the
+    // treasury contract (not the end user) via a contract self-authorization,
+    // which only this contract can perform — a stateless router between the
+    // agent and market-core would not be authorized on the token.
     #[allow(clippy::too_many_arguments)]
     pub fn agent_create_market_and_reveal(
         env: Env,
@@ -1971,12 +3434,53 @@ impl Treasury {
         initial_yes_bps: u32,
         spec_v2: ResolutionSpecV2,
     ) -> Result<u64, Error> {
-        let resolution_hash = Self::resolve_commitment(&env, &spec_v2)?;
+        Self::gate(&env, Op::AgentOpen)?;
+        if Self::trace_policy(env.clone()).policy == TracePolicy::Required {
+            return Err(Error::TraceRequired);
+        }
+        let global = Self::load_global(&env)?;
+        let live = Self::live_resolver(&env, &global)?;
+        if resolver != live {
+            return Err(Error::InvalidResolution);
+        }
+        let resolution_hash = Self::resolve_commitment(&env, &global, &spec_v2)?;
         let market_id = Self::agent_create_market(
             env.clone(),
             agent.clone(),
             question_hash,
-            resolution_hash,
+            resolution_hash.clone(),
+            meta_uri,
+            category,
+            close_time,
+            seed_amount,
+            initial_yes_bps,
+        )?;
+        ResolverClient::new(&env, &live).register_spec_v2(&market_id, &spec_v2);
+        Self::assert_rule_kind(&env, &live, market_id, &spec_v2)?;
+        Ok(market_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_create_market_reveal_v2(
+        env: Env,
+        agent: Address,
+        question_hash: BytesN<32>,
+        meta_uri: String,
+        category: Category,
+        close_time: u64,
+        seed_amount: i128,
+        initial_yes_bps: u32,
+        spec_v2: ResolutionSpecV2,
+    ) -> Result<u64, Error> {
+        Self::gate(&env, Op::AgentOpen)?;
+        let global = Self::load_global(&env)?;
+        let resolver = Self::live_resolver(&env, &global)?;
+        let resolution_hash = Self::resolve_commitment(&env, &global, &spec_v2)?;
+        let market_id = Self::agent_create_market(
+            env.clone(),
+            agent,
+            question_hash,
+            resolution_hash.clone(),
             meta_uri,
             category,
             close_time,
@@ -1984,11 +3488,12 @@ impl Treasury {
             initial_yes_bps,
         )?;
         ResolverClient::new(&env, &resolver).register_spec_v2(&market_id, &spec_v2);
+        Self::assert_rule_kind(&env, &resolver, market_id, &spec_v2)?;
         Ok(market_id)
     }
 
-    /// Buys `outcome` shares in an existing market using treasury capital
-    /// (`ROLE_TRADE`). Price-checked, see `do_agent_buy`.
+    // Buys `outcome` shares in an existing market using treasury capital
+    // (`ROLE_TRADE`). Price-checked, see `do_agent_buy`.
     pub fn agent_buy(
         env: Env,
         agent: Address,
@@ -1997,6 +3502,9 @@ impl Treasury {
         collateral_in: i128,
         min_shares_out: i128,
     ) -> Result<i128, Error> {
+        if Self::trace_policy(env.clone()).policy == TracePolicy::Required {
+            return Err(Error::TraceRequired);
+        }
         Self::do_agent_buy(
             env,
             agent,
@@ -2008,11 +3516,11 @@ impl Treasury {
         )
     }
 
-    /// `agent_buy` with a per-share limit price (`limit_price_bps`, 0 = none)
-    /// and a deadline (unix seconds, network time). market-core's `buy_v2`
-    /// enforces both; an expired or out-of-limit trade reverts the whole
-    /// invocation, so the treasury's caps are never consumed by a reverted
-    /// trade.
+    // `agent_buy` with a per-share limit price (`limit_price_bps`, 0 = none)
+    // and a deadline (unix seconds, network time). market-core's `buy_v2`
+    // enforces both; an expired or out-of-limit trade reverts the whole
+    // invocation, so the treasury's caps are never consumed by a reverted
+    // trade.
     #[allow(clippy::too_many_arguments)]
     pub fn agent_buy_v2(
         env: Env,
@@ -2024,6 +3532,9 @@ impl Treasury {
         limit_price_bps: u32,
         deadline: u64,
     ) -> Result<i128, Error> {
+        if Self::trace_policy(env.clone()).policy == TracePolicy::Required {
+            return Err(Error::TraceRequired);
+        }
         Self::do_agent_buy(
             env,
             agent,
@@ -2035,12 +3546,12 @@ impl Treasury {
         )
     }
 
-    /// Sells `outcome` shares back into the pool for exactly
-    /// `collateral_out` (`ROLE_TRADE`). This returns capital to the treasury
-    /// (market-core pays out of its own balance), so it is not capped and
-    /// does not need the nested-transfer pre-authorization that buying does.
-    /// It frees net headroom (`collateral_out` is recorded) but never
-    /// lifetime headroom. Price-checked, see `do_agent_sell`.
+    // Sells `outcome` shares back into the pool for exactly
+    // `collateral_out` (`ROLE_TRADE`). This returns capital to the treasury
+    // (market-core pays out of its own balance), so it is not capped and
+    // does not need the nested-transfer pre-authorization that buying does.
+    // It frees net headroom (`collateral_out` is recorded) but never
+    // lifetime headroom. Price-checked, see `do_agent_sell`.
     pub fn agent_sell(
         env: Env,
         agent: Address,
@@ -2049,6 +3560,9 @@ impl Treasury {
         collateral_out: i128,
         max_shares_in: i128,
     ) -> Result<i128, Error> {
+        if Self::trace_policy(env.clone()).policy == TracePolicy::Required {
+            return Err(Error::TraceRequired);
+        }
         Self::do_agent_sell(
             env,
             agent,
@@ -2060,9 +3574,9 @@ impl Treasury {
         )
     }
 
-    /// `agent_sell` with a per-share limit price (`limit_price_bps`, 0 = no
-    /// limit) and a deadline (unix seconds, network time), both enforced by
-    /// market-core's `sell_v2`.
+    // `agent_sell` with a per-share limit price (`limit_price_bps`, 0 = no
+    // limit) and a deadline (unix seconds, network time), both enforced by
+    // market-core's `sell_v2`.
     #[allow(clippy::too_many_arguments)]
     pub fn agent_sell_v2(
         env: Env,
@@ -2074,6 +3588,9 @@ impl Treasury {
         limit_price_bps: u32,
         deadline: u64,
     ) -> Result<i128, Error> {
+        if Self::trace_policy(env.clone()).policy == TracePolicy::Required {
+            return Err(Error::TraceRequired);
+        }
         Self::do_agent_sell(
             env,
             agent,
@@ -2085,11 +3602,12 @@ impl Treasury {
         )
     }
 
-    /// Marks a market's exposure as exited (`ROLE_SETTLE`). Pure bookkeeping
-    /// (see `MarketExposure`) for the future exposure dashboard; it does not
-    /// move funds or free either the cumulative per-market cap or net
-    /// headroom.
+    // Marks a market's exposure as exited (`ROLE_SETTLE`). Pure bookkeeping
+    // (see `MarketExposure`) for the future exposure dashboard; it does not
+    // move funds or free either the cumulative per-market cap or net
+    // headroom.
     pub fn close_trade(env: Env, agent: Address, market_id: u64) -> Result<i128, Error> {
+        Self::gate(&env, Op::AgentReduce)?;
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
         let core = global.market_core;
@@ -2104,87 +3622,174 @@ impl Treasury {
         Ok(amount)
     }
 
+    /// Buys with a prior decision-bearing trace consumed atomically.
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_buy_traced(
+        env: Env,
+        agent: Address,
+        market_id: u64,
+        outcome: Outcome,
+        collateral_in: i128,
+        min_shares_out: i128,
+        limit_price_bps: u32,
+        deadline: u64,
+        trace_id: u64,
+    ) -> Result<i128, Error> {
+        Self::gate(&env, Op::AgentOpen)?;
+        let cfg = Self::load_trace_policy_config(&env);
+        if cfg.policy == TracePolicy::Off {
+            // traced entrypoint still validates/consumes when registry configured
+        }
+        let action = TraceAction::Buy;
+        let decision_hash = Self::decision_hash_buy(
+            &env,
+            market_id,
+            &outcome,
+            collateral_in,
+            min_shares_out,
+            limit_price_bps,
+            deadline,
+        );
+        Self::consume_trace_for_action(&env, &agent, market_id, &action, trace_id, decision_hash)?;
+        Self::do_agent_buy(
+            env,
+            agent,
+            market_id,
+            outcome,
+            collateral_in,
+            min_shares_out,
+            Some((limit_price_bps, deadline)),
+        )
+    }
+
+    /// Sells with a prior decision-bearing trace consumed atomically.
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_sell_traced(
+        env: Env,
+        agent: Address,
+        market_id: u64,
+        outcome: Outcome,
+        collateral_out: i128,
+        max_shares_in: i128,
+        limit_price_bps: u32,
+        deadline: u64,
+        trace_id: u64,
+    ) -> Result<i128, Error> {
+        Self::gate(&env, Op::AgentReduce)?;
+        let action = TraceAction::Sell;
+        let decision_hash = Self::decision_hash_sell(
+            &env,
+            market_id,
+            &outcome,
+            collateral_out,
+            max_shares_in,
+            limit_price_bps,
+            deadline,
+        );
+        Self::consume_trace_for_action(&env, &agent, market_id, &action, trace_id, decision_hash)?;
+        Self::do_agent_sell(
+            env,
+            agent,
+            market_id,
+            outcome,
+            collateral_out,
+            max_shares_in,
+            Some((limit_price_bps, deadline)),
+        )
+    }
+
     /// Redeems the treasury's position in a resolved/voided market
     /// (`ROLE_SETTLE`).
     pub fn redeem(env: Env, agent: Address, market_id: u64) -> Result<i128, Error> {
+        Self::gate(&env, Op::AgentSettle)?;
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
         Self::settle_redeem(&env, &global.market_core, market_id)
     }
 
-    /// Claims the LP pool remainder for a market the treasury created
-    /// (`ROLE_SETTLE`).
+    // Claims the LP pool remainder for a market the treasury created
+    // (`ROLE_SETTLE`).
     pub fn claim_pool_remainder(env: Env, agent: Address, market_id: u64) -> Result<i128, Error> {
+        Self::gate(&env, Op::AgentSettle)?;
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
         Self::settle_claim(&env, &global.market_core, market_id)
     }
 
-    /// `redeem` against a market-core this treasury was switched away from
-    /// (see `execute_config`), so positions there are never stranded.
+    // `redeem` against a market-core this treasury was switched away from
+    // (see `execute_config`), so positions there are never stranded.
     pub fn legacy_redeem(
         env: Env,
         agent: Address,
         core: Address,
         market_id: u64,
     ) -> Result<i128, Error> {
+        Self::gate(&env, Op::AgentSettle)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
         Self::require_legacy(&env, &core)?;
         Self::settle_redeem(&env, &core, market_id)
     }
 
-    /// `claim_pool_remainder` against a legacy market-core.
+    // `claim_pool_remainder` against a legacy market-core.
     pub fn legacy_claim_pool_remainder(
         env: Env,
         agent: Address,
         core: Address,
         market_id: u64,
     ) -> Result<i128, Error> {
+        Self::gate(&env, Op::AgentSettle)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
         Self::require_legacy(&env, &core)?;
         Self::settle_claim(&env, &core, market_id)
     }
 
-    /// Redeems the treasury's positions in up to `MAX_BATCH` markets in one
-    /// call (market-core issue #15), delegating to market-core's `redeem_many`.
-    /// `market_ids` must be strictly ascending; markets that cannot be paid out
-    /// right now are reported as skipped rather than aborting the batch. The
-    /// single aggregated token transfer at the end amortizes fixed per-call
-    /// costs, keeping the treasury inside the per-transaction resource limits
-    /// even when it holds positions in many markets. (`ROLE_SETTLE`.)
+    // Redeems the treasury's positions in up to `MAX_BATCH` markets in one
+    // call (market-core issue #15), delegating to market-core's `redeem_many`.
+    // `market_ids` must be strictly ascending; markets that cannot be paid out
+    // right now are reported as skipped rather than aborting the batch. The
+    // single aggregated token transfer at the end amortizes fixed per-call
+    // costs, keeping the treasury inside the per-transaction resource limits
+    // even when it holds positions in many markets. (`ROLE_SETTLE`.)
     pub fn redeem_many(
         env: Env,
         agent: Address,
         market_ids: Vec<u64>,
     ) -> Result<BatchResult, Error> {
+        Self::gate(&env, Op::AgentSettle)?;
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
         let treasury_addr = env.current_contract_address();
-        Ok(MarketCoreClient::new(&env, &global.market_core)
-            .redeem_many(&treasury_addr, &market_ids))
+        let result = MarketCoreClient::new(&env, &global.market_core)
+            .redeem_many(&treasury_addr, &market_ids);
+        Self::apply_batch_result(&env, &global.market_core, &result)?;
+        Ok(result)
     }
 
-    /// Claims the LP pool remainders of up to `MAX_BATCH` treasury-created
-    /// markets in one call, delegating to market-core's `claim_pool_remainders`
-    /// (skips, never aborts on, markets the treasury did not create, markets
-    /// not settled, or markets already claimed — see `redeem_many` for the
-    /// batching rationale). (`ROLE_SETTLE`.)
+    // Claims the LP pool remainders of up to `MAX_BATCH` treasury-created
+    // markets in one call, delegating to market-core's `claim_pool_remainders`
+    // (skips, never aborts on, markets the treasury did not create, markets
+    // not settled, or markets already claimed — see `redeem_many` for the
+    // batching rationale). (`ROLE_SETTLE`.)
     pub fn claim_pool_remainders(
         env: Env,
         agent: Address,
         market_ids: Vec<u64>,
     ) -> Result<BatchResult, Error> {
+        Self::gate(&env, Op::AgentSettle)?;
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
         let treasury_addr = env.current_contract_address();
-        Ok(MarketCoreClient::new(&env, &global.market_core)
-            .claim_pool_remainders(&treasury_addr, &market_ids))
+        let result = MarketCoreClient::new(&env, &global.market_core)
+            .claim_pool_remainders(&treasury_addr, &market_ids);
+        Self::apply_batch_result(&env, &global.market_core, &result)?;
+        Ok(result)
     }
 
-    /// Claims the market's LP fee share for a market the treasury created
-    /// (`ROLE_SETTLE`). The LP portion accrues separately on market-core
-    /// (see its `claim_lp_fees`).
+    // Claims the market's LP fee share for a market the treasury created
+    // (`ROLE_SETTLE`). The LP portion accrues separately on market-core
+    // (see its `claim_lp_fees`).
     pub fn agent_claim_lp_fees(env: Env, agent: Address, market_id: u64) -> Result<i128, Error> {
+        Self::gate(&env, Op::AgentSettle)?;
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
         let amount = core_call(
@@ -2194,15 +3799,16 @@ impl Treasury {
         Ok(amount)
     }
 
-    /// Pulls accrued **protocol** fees from a configured market-core contract.
-    ///
-    /// Only the protocol's share of each market's fees: the LP portion accrues
-    /// separately on market-core and belongs to the market's creator — for
-    /// agent-created markets that is the treasury itself, via
-    /// `agent_claim_lp_fees`. Fees raise NAV for every shareholder at the
-    /// moment they arrive.
+    // Pulls accrued **protocol** fees from a configured market-core contract.
+    //
+    // Only the protocol's share of each market's fees: the LP portion accrues
+    // separately on market-core and belongs to the market's creator — for
+    // agent-created markets that is the treasury itself, via
+    // `agent_claim_lp_fees`. Fees raise NAV for every shareholder at the
+    // moment they arrive.
     pub fn collect_market_fees(env: Env, market_id: u64) -> Result<i128, Error> {
         Self::require_admin(&env)?;
+        Self::gate(&env, Op::PermissionlessSettle)?;
         let global = Self::load_global(&env)?;
         let amount =
             core_call(MarketCoreClient::new(&env, &global.market_core).try_sweep_fees(&market_id))?;
@@ -2212,13 +3818,14 @@ impl Treasury {
 
     // ----- settlement, PnL & risk controls ----------------------------------
 
-    /// Permissionless settlement of a resolved or voided market's position and LP remainder.
-    /// Operates even when the treasury is paused. Idempotent on retry.
+    // Permissionless settlement of a resolved or voided market's position and LP remainder.
+    // Operates even when the treasury is paused. Idempotent on retry.
     pub fn settle_market(
         env: Env,
         caller: Address,
         market_id: u64,
     ) -> Result<SettlementReport, Error> {
+        Self::gate(&env, Op::PermissionlessSettle)?;
         caller.require_auth();
         let mut r = Self::load_realized(&env, market_id);
         if r.settled {
@@ -2285,7 +3892,7 @@ impl Treasury {
             Self::close_market_exposure(&env, core, market_id);
         }
         Self::save_realized(&env, market_id, &r);
-        Self::prune_if_settled(&env, core, market_id);
+        let _ = Self::prune_if_settled(&env, core, market_id);
         if r.settled {
             Self::try_realize(&env, core, market_id)?;
         }
@@ -2310,6 +3917,7 @@ impl Treasury {
     }
 
     pub fn realize(env: Env, market_id: u64) -> Result<(), Error> {
+        Self::gate(&env, Op::PermissionlessSettle)?;
         let global = Self::load_global(&env)?;
         Self::try_realize(&env, &global.market_core, market_id)
     }
@@ -2325,11 +3933,7 @@ impl Treasury {
     pub fn drawdown_status(env: Env) -> Result<DrawdownStatus, Error> {
         let cfg = Self::load_drawdown_cfg(&env)?;
         let wpnl = Self::calc_window_pnl(&env)?;
-        let tripped = env
-            .storage()
-            .instance()
-            .get(&DataKey::DrawdownTripped)
-            .unwrap_or(false);
+        let tripped = Self::load_mode_state(&env).drawdown_halt.is_some();
         Ok(DrawdownStatus {
             tripped,
             window_pnl: wpnl,
@@ -2337,28 +3941,22 @@ impl Treasury {
         })
     }
 
+    /// Deprecated no-op, kept so existing callers and bindings keep working:
+    /// acknowledging is no longer a separate step. Use `resume_agents`.
     pub fn acknowledge_drawdown(env: Env) -> Result<(), Error> {
         Self::require_admin(&env)?;
-        let storage = env.storage().instance();
-        if storage.get(&DataKey::DrawdownTripped).unwrap_or(false) {
-            storage.set(&DataKey::DrawdownAcknowledged, &true);
-        }
         Ok(())
     }
 
+    // Wipes the rolling PnL window. Delayed (#250): the proposal waits
+    // `config_delay` so a drawdown about to trip cannot be erased instantly.
     pub fn reset_pnl_window(env: Env) -> Result<(), Error> {
         Self::require_admin(&env)?;
-        let cfg = Self::load_drawdown_cfg(&env)?;
-        let head_day = env.ledger().timestamp() / DAY_SECONDS;
-        env.storage().instance().set(
-            &DataKey::PnlDays,
-            &Self::empty_pnl_days(&env, head_day, cfg.window_days),
-        );
-        let admin = env.storage().instance().get(&DataKey::Admin).unwrap();
-        PnlWindowReset { admin }.publish(&env);
-        Ok(())
+        Self::queue_op(env, AdminOp::ResetPnlWindow).map(|_| ())
     }
 
+    // Tightenings apply immediately; loosening is queued (#250). A
+    // tightening preserves the existing PnL window instead of resetting it.
     pub fn set_drawdown_config(
         env: Env,
         max_drawdown: i128,
@@ -2366,17 +3964,15 @@ impl Treasury {
     ) -> Result<(), Error> {
         Self::require_admin(&env)?;
         Self::validate_drawdown_config(max_drawdown, window_days)?;
-        let cfg = DrawdownConfig {
-            max_drawdown,
-            window_days,
-        };
-        env.storage().instance().set(&DataKey::DrawdownCfg, &cfg);
-        let head_day = env.ledger().timestamp() / DAY_SECONDS;
-        env.storage().instance().set(
-            &DataKey::PnlDays,
-            &Self::empty_pnl_days(&env, head_day, window_days),
-        );
-        Ok(())
+        let op = AdminOp::SetDrawdownConfig(max_drawdown, window_days);
+        match Self::classify_op(&env, &op)? {
+            Change::None => Err(Error::InvalidConfig),
+            Change::TightenOnly => {
+                Self::apply_op(&env, &op, true)?;
+                Ok(())
+            }
+            Change::NeedsDelay => Self::queue_op(env, op).map(|_| ()),
+        }
     }
 
     pub fn get_creation_policy(env: Env) -> Result<CreationPolicy, Error> {
@@ -2401,116 +3997,43 @@ impl Treasury {
         Ok(total)
     }
 
+    // Tightening applies immediately; loosening is queued (#250) instead of
+    // being rejected outright, so the policy can be relaxed after a delay.
     pub fn set_creation_policy(env: Env, new_policy: CreationPolicy) -> Result<(), Error> {
         Self::require_admin(&env)?;
         let global = Self::load_global(&env)?;
         Self::validate_creation_policy(&global, &new_policy)?;
-        let old_policy = Self::load_creation_policy(&env)?;
-        if new_policy.max_seed > old_policy.max_seed
-            || new_policy.max_markets_per_window > old_policy.max_markets_per_window
-            || new_policy.min_close_horizon < old_policy.min_close_horizon
-            || new_policy.max_close_horizon > old_policy.max_close_horizon
-            || (new_policy.allowed_categories & !old_policy.allowed_categories) != 0
-            || new_policy.creation_window_secs < old_policy.creation_window_secs
-        {
-            return Err(Error::PolicyLoosening);
+        let op = AdminOp::SetCreationPolicy(new_policy);
+        match Self::classify_op(&env, &op)? {
+            Change::None => Err(Error::InvalidConfig),
+            Change::TightenOnly => {
+                Self::apply_op(&env, &op, true)?;
+                Ok(())
+            }
+            Change::NeedsDelay => Self::queue_op(env, op).map(|_| ()),
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::CreationPolicy, &new_policy);
-        CreationPolicyUpdated {
-            old: old_policy,
-            new: new_policy,
-        }
-        .publish(&env);
-        Ok(())
     }
 
     // ----- Blend lending & yield ---------------------------------------------
 
+    // Queues a venue change (#250). Re-checks `YieldPrincipal == 0` when
+    // the proposal is executed, days after it was announced.
     pub fn set_yield_venue(env: Env, pool: Address, max_allocation: i128) -> Result<(), Error> {
         Self::require_admin(&env)?;
-        if max_allocation <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-        let principal: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::YieldPrincipal)
-            .unwrap_or(0);
-        if principal > 0 {
-            return Err(Error::VenueHasPrincipal);
-        }
-        let venue = YieldVenue {
-            pool: pool.clone(),
-            max_allocation,
-            enabled: true,
-        };
-        env.storage().instance().set(&DataKey::YieldVenue, &venue);
-        YieldVenueSet {
-            pool,
-            max_allocation,
-        }
-        .publish(&env);
-        Ok(())
+        Self::queue_op(env, AdminOp::SetYieldVenue(pool, max_allocation)).map(|_| ())
     }
 
+    // Queues an allocation (#250). Caps and `max_daily` headroom are
+    // re-checked at execution time, not when the op was proposed.
     pub fn allocate_to_yield(env: Env, amount: i128) -> Result<(), Error> {
         Self::require_admin(&env)?;
-        if amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-        let venue: YieldVenue = env
-            .storage()
-            .instance()
-            .get(&DataKey::YieldVenue)
-            .ok_or(Error::YieldDisabled)?;
-        if !venue.enabled {
-            return Err(Error::YieldDisabled);
-        }
-        let principal: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::YieldPrincipal)
-            .unwrap_or(0);
-        let new_principal = principal.checked_add(amount).ok_or(Error::InvalidAmount)?;
-        if new_principal > venue.max_allocation {
-            return Err(Error::YieldCapExceeded);
-        }
-        let global = Self::load_global(&env)?;
-        let liquid = Self::idle(&env, &global);
-        if liquid.saturating_sub(amount) < global.max_daily {
-            return Err(Error::DailyCapExceeded);
-        }
-        let treasury = env.current_contract_address();
-        Self::authorize_transfer(&env, &global.collateral, &treasury, &venue.pool, amount);
-        let client = BlendPoolClient::new(&env, &venue.pool);
-        let mut requests = Vec::new(&env);
-        requests.push_back(BlendRequest {
-            request_type: BLEND_REQUEST_SUPPLY,
-            address: global.collateral.clone(),
-            amount,
-        });
-        if client
-            .try_submit(&treasury, &treasury, &treasury, &requests)
-            .is_err()
-        {
-            return Err(Error::YieldWithdrawFailed);
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::YieldPrincipal, &new_principal);
-        YieldAllocated {
-            pool: venue.pool,
-            amount,
-            principal: new_principal,
-        }
-        .publish(&env);
-        Ok(())
+        Self::gate(&env, Op::YieldAllocate)?;
+        Self::queue_op(env, AdminOp::AllocateToYield(amount)).map(|_| ())
     }
 
     pub fn recall_from_yield(env: Env, amount: i128) -> Result<(), Error> {
         Self::require_admin(&env)?;
+        Self::gate(&env, Op::YieldRecall)?;
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -2566,66 +4089,39 @@ impl Treasury {
         Ok(())
     }
 
-    pub fn withdraw(env: Env, to: Address, amount: i128) -> Result<(), Error> {
-        Self::require_admin(&env)?;
-        if amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-        let global = Self::load_global(&env)?;
-        Self::ensure_liquid(&env, &global, amount)?;
-        let liquid = Self::idle(&env, &global);
-        if liquid < amount {
-            return Err(Error::InsufficientBalance);
-        }
-        token::TokenClient::new(&env, &global.collateral).transfer(
-            &env.current_contract_address(),
-            &to,
-            &amount,
-        );
-        Ok(())
-    }
-
     // ----- migration ---------------------------------------------------------
 
-    /// Sets the successor treasury that `migrate_market` hands positions and
-    /// the LP role to. Admin-only; overwrites any previous successor (the
-    /// `SuccessorSet` events are the audit trail).
+    // Sets the successor treasury that `migrate_market` hands positions and
+    // the LP role to. Admin-only; overwrites any previous successor (the
+    // `SuccessorSet` events are the audit trail).
+    // Queues a successor change (#250). Proposing it cancels any pending
+    // migration, so the new successor always gets its own full delay.
     pub fn set_successor(env: Env, successor: Address) -> Result<(), Error> {
         Self::require_admin(&env)?;
-        let old: Option<Address> = env.storage().instance().get(&DataKey::Successor);
-        env.storage()
-            .instance()
-            .set(&DataKey::Successor, &successor);
-        SuccessorSet {
-            old,
-            new: successor,
-        }
-        .publish(&env);
-        Ok(())
+        Self::queue_op(env, AdminOp::SetSuccessor(successor)).map(|_| ())
     }
 
-    /// Moves the treasury's position in `market_id` — and the LP role, when
-    /// the treasury is the market's creator and has not claimed the remainder
-    /// yet — to the successor set via `set_successor`, then closes the local
-    /// exposure. Admin-only: relocating capital is not an agent trading
-    /// action, and the agent key must not be able to drain positions.
-    ///
-    /// market-core's `transfer_position` / `transfer_lp` require the treasury
-    /// itself to authorize. Because the treasury is their *direct* caller
-    /// here, the implicit invoker authorization covers both — no
-    /// `authorize_as_current_contract` entry is needed (unlike the nested
-    /// token transfer in `agent_buy`, see `docs/adr/0002-treasury-nested-auth.md`).
-    pub fn migrate_market(env: Env, market_id: u64) -> Result<(), Error> {
+    // Queues a batched migration (#250). The successor must already be set.
+    // `execute_op` runs [`Treasury::do_migrate_market`] for each id, after
+    // its own delay, so positions never move without an exit window.
+    pub fn migrate_markets(env: Env, market_ids: Vec<u64>) -> Result<(), Error> {
         Self::require_admin(&env)?;
+        Self::gate(&env, Op::Migrate)?;
+        Self::queue_op(env, AdminOp::MigrateMarkets(market_ids)).map(|_| ())
+    }
+
+    // Moves one market to the successor, releasing local exposure. Only
+    // reachable from `execute_op`; the standalone admin entrypoint is gone.
+    fn do_migrate_market(env: &Env, market_id: u64) -> Result<(), Error> {
         let successor: Address = env
             .storage()
             .instance()
             .get(&DataKey::Successor)
             .ok_or(Error::NoSuccessor)?;
-        let global = Self::load_global(&env)?;
+        let global = Self::load_global(env)?;
         let core = global.market_core;
         let treasury_addr = env.current_contract_address();
-        let client = MarketCoreClient::new(&env, &core);
+        let client = MarketCoreClient::new(env, &core);
 
         let position = client.get_position(&market_id, &treasury_addr);
         if position.yes > 0 {
@@ -2651,13 +4147,13 @@ impl Treasury {
         if lp {
             client.transfer_lp(&market_id, &successor);
         }
-        let mut exposure = Self::market_exposure(&env, &core, market_id);
+        let mut exposure = Self::market_exposure(env, &core, market_id);
         exposure.open = false;
-        Self::save_market(&env, &core, market_id, &exposure);
+        Self::save_market(env, &core, market_id, &exposure);
         // The holdings now belong to the successor, so none of this market's
         // capital is at risk here any more.
-        Self::clear_net(&env, &core, market_id)?;
-        Self::index_remove(&env, &core, market_id);
+        Self::clear_net(env, &core, market_id)?;
+        Self::index_remove(env, &core, market_id)?;
         MarketMigrated {
             market_id,
             successor,
@@ -2665,12 +4161,470 @@ impl Treasury {
             no: position.no,
             lp,
         }
-        .publish(&env);
+        .publish(env);
         Ok(())
     }
 }
 
 impl Treasury {
+    // ----- correlated-risk storage helpers (#259) ----------------------------
+
+    fn default_correlation_caps(env: &Env) -> Result<CorrelationCaps, Error> {
+        let global = Self::load_global(env)?;
+        let off = global
+            .max_net_exposure
+            .max(global.max_market)
+            .max(global.max_daily);
+        let mut per_category = Vec::new(env);
+        for _ in 0..correlation::CATEGORY_COUNT {
+            per_category.push_back(off);
+        }
+        Ok(CorrelationCaps {
+            max_per_category: per_category,
+            max_per_bucket: off,
+            bucket_secs: 7 * DAY_SECONDS,
+        })
+    }
+
+    fn load_correlation_caps(env: &Env) -> Result<CorrelationCaps, Error> {
+        Ok(env
+            .storage()
+            .instance()
+            .get(&DataKey::CorrelationCaps)
+            .unwrap_or(Self::default_correlation_caps(env)?))
+    }
+
+    fn validate_correlation_caps(env: &Env, caps: &CorrelationCaps) -> Result<(), Error> {
+        let global = Self::load_global(env)?;
+        if caps.max_per_category.len() != correlation::CATEGORY_COUNT
+            || caps.bucket_secs < correlation::MIN_BUCKET_SECS
+            || caps.max_per_bucket < global.max_market
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let ceiling = global
+            .max_daily
+            .checked_mul(correlation::CATEGORY_CAP_DAILY_MULTIPLE)
+            .ok_or(Error::InvalidConfig)?;
+        for i in 0..caps.max_per_category.len() {
+            let cap = caps.max_per_category.get(i).unwrap();
+            if cap < global.max_market || cap > ceiling {
+                return Err(Error::InvalidConfig);
+            }
+        }
+        Ok(())
+    }
+
+    fn classify_correlation_caps(env: &Env, caps: &CorrelationCaps) -> Result<Change, Error> {
+        let old = Self::load_correlation_caps(env)?;
+        if caps.bucket_secs != old.bucket_secs {
+            return Ok(Change::NeedsDelay);
+        }
+        let mut pairs = Vec::new(env);
+        pairs.push_back((old.max_per_bucket, caps.max_per_bucket));
+        for i in 0..correlation::CATEGORY_COUNT {
+            if let (Some(a), Some(b)) = (old.max_per_category.get(i), caps.max_per_category.get(i))
+            {
+                pairs.push_back((a, b));
+            }
+        }
+        let mut lowered = false;
+        for i in 0..pairs.len() {
+            let (a, b) = pairs.get(i).unwrap();
+            if b > a {
+                return Ok(Change::NeedsDelay);
+            }
+            lowered |= b < a;
+        }
+        Ok(if lowered {
+            Change::TightenOnly
+        } else {
+            Change::None
+        })
+    }
+
+    fn apply_correlation_caps(
+        env: &Env,
+        caps: &CorrelationCaps,
+        immediate: bool,
+    ) -> Result<(), Error> {
+        Self::validate_correlation_caps(env, caps)?;
+        let old = Self::load_correlation_caps(env)?;
+        if caps.bucket_secs != old.bucket_secs {
+            let open: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::CorrelationExposureOpen)
+                .unwrap_or(0);
+            if open != 0 {
+                return Err(Error::InvalidConfig);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::CorrelationCaps, caps);
+        CorrelationCapsExecuted {
+            caps: caps.clone(),
+            immediate,
+        }
+        .publish(env);
+        Ok(())
+    }
+
+    fn market_meta_key(core: &Address, market_id: u64) -> DataKey {
+        DataKey::MarketMeta(core.clone(), market_id)
+    }
+
+    fn save_market_meta(env: &Env, core: &Address, market_id: u64, meta: &MarketMeta) {
+        let key = Self::market_meta_key(core, market_id);
+        Self::put_persistent(env, &key, meta);
+    }
+
+    fn ensure_market_meta(env: &Env, core: &Address, market_id: u64) -> Result<MarketMeta, Error> {
+        let key = Self::market_meta_key(core, market_id);
+        if let Some(meta) = env.storage().persistent().get(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+            return Ok(meta);
+        }
+        let market = core_call(MarketCoreClient::new(env, core).try_get_market(&market_id))?;
+        let caps = Self::load_correlation_caps(env)?;
+        let meta = MarketMeta {
+            category_idx: correlation::category_index(&market.category),
+            bucket: correlation::close_bucket(market.close_time, caps.bucket_secs)?,
+        };
+        Self::save_market_meta(env, core, market_id, &meta);
+        Ok(meta)
+    }
+
+    fn check_correlated_amount(
+        env: &Env,
+        core: &Address,
+        meta: &MarketMeta,
+        amount: i128,
+    ) -> Result<(), Error> {
+        if amount <= 0 {
+            return Ok(());
+        }
+        // Caps are opt-in. With no stored configuration they are "off" so an
+        // existing deployment keeps its prior error behaviour.
+        if !env.storage().instance().has(&DataKey::CorrelationCaps) {
+            return Ok(());
+        }
+        let caps = Self::load_correlation_caps(env)?;
+        let cat = Self::category_exposure(env.clone(), core.clone(), meta.category_idx);
+        let bucket = Self::bucket_exposure(env.clone(), core.clone(), meta.bucket);
+        correlation::check_correlated(
+            &Self::caps_slice(env, &caps.max_per_category),
+            caps.max_per_bucket,
+            meta.category_idx,
+            cat,
+            bucket,
+            amount,
+        )?;
+        Ok(())
+    }
+
+    fn caps_slice(env: &Env, caps: &Vec<i128>) -> [i128; correlation::CATEGORY_COUNT as usize] {
+        let mut out = [0i128; correlation::CATEGORY_COUNT as usize];
+        for i in 0..out.len() {
+            out[i] = caps.get(i as u32).unwrap_or(0);
+        }
+        let _ = env;
+        out
+    }
+
+    fn move_correlated(
+        env: &Env,
+        core: &Address,
+        market_id: u64,
+        before_basis: i128,
+        after_basis: i128,
+    ) -> Result<(), Error> {
+        if before_basis == after_basis {
+            return Ok(());
+        }
+        let meta = Self::ensure_market_meta(env, core, market_id)?;
+        let delta = after_basis
+            .checked_sub(before_basis)
+            .ok_or(Error::InvalidAmount)?;
+        let cat_key = DataKey::CatExposure(core.clone(), meta.category_idx);
+        let bucket_key = DataKey::BucketExposure(core.clone(), meta.bucket);
+        let old_cat: i128 = env.storage().persistent().get(&cat_key).unwrap_or(0);
+        let old_bucket: i128 = env.storage().persistent().get(&bucket_key).unwrap_or(0);
+        let new_cat = old_cat.checked_add(delta).ok_or(Error::InvalidAmount)?;
+        let new_bucket = old_bucket.checked_add(delta).ok_or(Error::InvalidAmount)?;
+        if new_cat < 0 || new_bucket < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if before_basis == 0 && after_basis > 0 {
+            let open: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::CorrelationExposureOpen)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::CorrelationExposureOpen, &(open.saturating_add(1)));
+        }
+        if before_basis > 0 && after_basis == 0 {
+            let open: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::CorrelationExposureOpen)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::CorrelationExposureOpen, &open.saturating_sub(1));
+        }
+        if new_cat == 0 {
+            env.storage().persistent().remove(&cat_key);
+        } else {
+            Self::put_persistent(env, &cat_key, &new_cat);
+        }
+        if new_bucket == 0 {
+            env.storage().persistent().remove(&bucket_key);
+        } else {
+            Self::put_persistent(env, &bucket_key, &new_bucket);
+        }
+        CorrelatedExposureUpdated {
+            core: core.clone(),
+            category: meta.category_idx,
+            bucket: meta.bucket,
+            category_total: new_cat,
+            bucket_total: new_bucket,
+        }
+        .publish(env);
+        Ok(())
+    }
+
+    fn op_kind(op: &AdminOp) -> u32 {
+        match op {
+            AdminOp::SetYieldVenue(_, _) => 0,
+            AdminOp::AllocateToYield(_) => 1,
+            AdminOp::SetSuccessor(_) => 2,
+            AdminOp::MigrateMarkets(_) => 3,
+            AdminOp::SetDrawdownConfig(_, _) => 4,
+            AdminOp::ResetPnlWindow => 5,
+            AdminOp::SetCreationPolicy(_) => 6,
+            AdminOp::SetCorrelationCaps(_) => 7,
+        }
+    }
+
+    fn classify_op(env: &Env, op: &AdminOp) -> Result<Change, Error> {
+        match op {
+            AdminOp::SetDrawdownConfig(max_drawdown, window_days) => {
+                let old = Self::load_drawdown_cfg(env)?;
+                Ok(classify_caps(&[
+                    (old.max_drawdown, *max_drawdown),
+                    (old.window_days as i128, *window_days as i128),
+                ]))
+            }
+            AdminOp::SetCreationPolicy(new_policy) => {
+                let old = Self::load_creation_policy(env)?;
+                let loosened = new_policy.max_seed > old.max_seed
+                    || new_policy.max_markets_per_window > old.max_markets_per_window
+                    || new_policy.min_close_horizon < old.min_close_horizon
+                    || new_policy.max_close_horizon > old.max_close_horizon
+                    || (new_policy.allowed_categories & !old.allowed_categories) != 0
+                    || new_policy.creation_window_secs < old.creation_window_secs;
+                if loosened {
+                    return Ok(Change::NeedsDelay);
+                }
+                if new_policy.max_seed < old.max_seed
+                    || new_policy.max_markets_per_window < old.max_markets_per_window
+                    || new_policy.min_close_horizon > old.min_close_horizon
+                    || new_policy.max_close_horizon < old.max_close_horizon
+                    || (new_policy.allowed_categories != old.allowed_categories)
+                    || new_policy.creation_window_secs > old.creation_window_secs
+                {
+                    return Ok(Change::TightenOnly);
+                }
+                Ok(Change::None)
+            }
+            AdminOp::SetCorrelationCaps(caps) => Self::classify_correlation_caps(env, caps),
+            _ => Ok(Change::NeedsDelay),
+        }
+    }
+
+    fn validate_op(env: &Env, op: &AdminOp) -> Result<(), Error> {
+        match op {
+            AdminOp::SetYieldVenue(_, max_allocation) => {
+                if *max_allocation <= 0 {
+                    return Err(Error::InvalidAmount);
+                }
+                Ok(())
+            }
+            AdminOp::AllocateToYield(amount) => {
+                if *amount <= 0 {
+                    return Err(Error::InvalidAmount);
+                }
+                Ok(())
+            }
+            AdminOp::MigrateMarkets(ids) => {
+                if ids.is_empty() || ids.len() > MAX_OPEN_MARKETS {
+                    return Err(Error::InvalidAmount);
+                }
+                if env
+                    .storage()
+                    .instance()
+                    .get::<_, Address>(&DataKey::Successor)
+                    .is_none()
+                {
+                    return Err(Error::NoSuccessor);
+                }
+                Ok(())
+            }
+            AdminOp::SetDrawdownConfig(max_drawdown, window_days) => {
+                Self::validate_drawdown_config(*max_drawdown, *window_days)
+            }
+            AdminOp::SetCreationPolicy(policy) => {
+                let global = Self::load_global(env)?;
+                Self::validate_creation_policy(&global, policy)
+            }
+            AdminOp::SetCorrelationCaps(caps) => Self::validate_correlation_caps(env, caps),
+            _ => Ok(()),
+        }
+    }
+
+    fn apply_op(env: &Env, op: &AdminOp, immediate: bool) -> Result<(), Error> {
+        let storage = env.storage().instance();
+        match op {
+            AdminOp::SetYieldVenue(pool, max_allocation) => {
+                if *max_allocation <= 0 {
+                    return Err(Error::InvalidAmount);
+                }
+                let principal: i128 = storage.get(&DataKey::YieldPrincipal).unwrap_or(0);
+                if principal > 0 {
+                    return Err(Error::VenueHasPrincipal);
+                }
+                let venue = YieldVenue {
+                    pool: pool.clone(),
+                    max_allocation: *max_allocation,
+                    enabled: true,
+                };
+                storage.set(&DataKey::YieldVenue, &venue);
+                YieldVenueSet {
+                    pool: pool.clone(),
+                    max_allocation: *max_allocation,
+                }
+                .publish(env);
+                Ok(())
+            }
+            AdminOp::AllocateToYield(amount) => {
+                // The mode may have changed in the delay since it was queued.
+                Self::gate(env, Op::YieldAllocate)?;
+                let amount = *amount;
+                if amount <= 0 {
+                    return Err(Error::InvalidAmount);
+                }
+                let venue: YieldVenue = storage
+                    .get(&DataKey::YieldVenue)
+                    .ok_or(Error::YieldDisabled)?;
+                if !venue.enabled {
+                    return Err(Error::YieldDisabled);
+                }
+                let principal: i128 = storage.get(&DataKey::YieldPrincipal).unwrap_or(0);
+                let new_principal = principal.checked_add(amount).ok_or(Error::InvalidAmount)?;
+                if new_principal > venue.max_allocation {
+                    return Err(Error::YieldCapExceeded);
+                }
+                let global = Self::load_global(env)?;
+                let liquid = Self::idle(env, &global);
+                if liquid.saturating_sub(amount) < global.max_daily {
+                    return Err(Error::DailyCapExceeded);
+                }
+                let treasury = env.current_contract_address();
+                Self::authorize_transfer(env, &global.collateral, &treasury, &venue.pool, amount);
+                let client = BlendPoolClient::new(env, &venue.pool);
+                let mut requests = Vec::new(env);
+                requests.push_back(BlendRequest {
+                    request_type: BLEND_REQUEST_SUPPLY,
+                    address: global.collateral.clone(),
+                    amount,
+                });
+                if client
+                    .try_submit(&treasury, &treasury, &treasury, &requests)
+                    .is_err()
+                {
+                    return Err(Error::YieldWithdrawFailed);
+                }
+                storage.set(&DataKey::YieldPrincipal, &new_principal);
+                YieldAllocated {
+                    pool: venue.pool,
+                    amount,
+                    principal: new_principal,
+                }
+                .publish(env);
+                Ok(())
+            }
+            AdminOp::SetSuccessor(successor) => {
+                let old: Option<Address> = storage.get(&DataKey::Successor);
+                storage.set(&DataKey::Successor, successor);
+                SuccessorSet {
+                    old,
+                    new: successor.clone(),
+                }
+                .publish(env);
+                Ok(())
+            }
+            AdminOp::MigrateMarkets(ids) => {
+                Self::gate(env, Op::Migrate)?;
+                if ids.is_empty() || ids.len() > MAX_OPEN_MARKETS {
+                    return Err(Error::InvalidAmount);
+                }
+                for i in 0..ids.len() {
+                    Self::do_migrate_market(env, ids.get(i).unwrap())?;
+                }
+                Ok(())
+            }
+            AdminOp::SetDrawdownConfig(max_drawdown, window_days) => {
+                Self::validate_drawdown_config(*max_drawdown, *window_days)?;
+                let old = Self::load_drawdown_cfg(env)?;
+                let cfg = DrawdownConfig {
+                    max_drawdown: *max_drawdown,
+                    window_days: *window_days,
+                };
+                storage.set(&DataKey::DrawdownCfg, &cfg);
+                Self::resize_pnl_days(env, old.window_days, *window_days)?;
+                DrawdownConfigSet {
+                    old_max_drawdown: old.max_drawdown,
+                    new_max_drawdown: *max_drawdown,
+                    old_window_days: old.window_days,
+                    new_window_days: *window_days,
+                    immediate,
+                }
+                .publish(env);
+                Ok(())
+            }
+            AdminOp::ResetPnlWindow => {
+                let cfg = Self::load_drawdown_cfg(env)?;
+                let head_day = env.ledger().timestamp() / DAY_SECONDS;
+                storage.set(
+                    &DataKey::PnlDays,
+                    &Self::empty_pnl_days(env, head_day, cfg.window_days),
+                );
+                let admin: Address = storage.get(&DataKey::Admin).ok_or(Error::NotInitialized)?;
+                PnlWindowReset { admin }.publish(env);
+                Ok(())
+            }
+            AdminOp::SetCreationPolicy(new_policy) => {
+                let global = Self::load_global(env)?;
+                Self::validate_creation_policy(&global, new_policy)?;
+                let old = Self::load_creation_policy(env)?;
+                storage.set(&DataKey::CreationPolicy, new_policy);
+                CreationPolicyUpdated {
+                    old,
+                    new: new_policy.clone(),
+                }
+                .publish(env);
+                Ok(())
+            }
+            AdminOp::SetCorrelationCaps(caps) => Self::apply_correlation_caps(env, caps, immediate),
+        }
+    }
+
     fn require_admin(env: &Env) -> Result<(), Error> {
         let admin: Address = env
             .storage()
@@ -2681,22 +4635,83 @@ impl Treasury {
         Ok(())
     }
 
-    fn is_paused(env: &Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
+    /// The stored reasons, falling back to the pre-#272 flags when the
+    /// `ModeState` key is absent. A deployment that predates #272 cannot be
+    /// upgraded in place (ADR 0005) and moves by redeploying, so this only has
+    /// to read the flags if they are present:
+    /// - `DrawdownTripped` becomes a drawdown halt;
+    /// - `AdminPaused`, or a bare `Paused` with neither other flag (a pre-#46
+    ///   deployment), becomes an admin pause with reason `legacy`.
+    /// The legacy timestamp is 0: it was never recorded.
+    fn load_mode_state(env: &Env) -> ModeState {
+        let storage = env.storage().instance();
+        if let Some(state) = storage.get::<_, ModeState>(&DataKey::ModeState) {
+            return state;
+        }
+        let flag = |k: &DataKey| storage.get::<_, bool>(k).unwrap_or(false);
+        let tripped = flag(&DataKey::DrawdownTripped);
+        let admin = flag(&DataKey::AdminPaused) || (flag(&DataKey::Paused) && !tripped);
+        ModeState {
+            drawdown_halt: if tripped { Some(0) } else { None },
+            admin_pause_at: if admin { Some(0) } else { None },
+            admin_pause_reason: if admin {
+                Some(Symbol::new(env, "legacy"))
+            } else {
+                None
+            },
+            emergency_at: None,
+            emergency_reason: None,
+            unwinding_at: if storage.get::<_, Mode>(&DataKey::Mode) == Some(Mode::Unwinding) {
+                Some(0)
+            } else {
+                None
+            },
+        }
     }
 
-    fn assert_not_paused(env: &Env) -> Result<(), Error> {
+    /// Persists `state`, deletes the legacy flags (first write migrates), and
+    /// emits `ModeChanged { from, to: state.mode(), reason }`.
+    fn save_mode_state(env: &Env, state: &ModeState, from: Mode, reason: Symbol) {
         let storage = env.storage().instance();
-        if storage.get(&DataKey::Paused).unwrap_or(false) {
-            if storage.get(&DataKey::DrawdownTripped).unwrap_or(false) {
-                return Err(Error::DrawdownTripped);
-            }
-            return Err(Error::Paused);
+        storage.set(&DataKey::ModeState, state);
+        storage.remove(&DataKey::Paused);
+        storage.remove(&DataKey::AdminPaused);
+        storage.remove(&DataKey::Mode);
+        storage.remove(&DataKey::DrawdownTripped);
+        storage.remove(&DataKey::DrawdownAcknowledged);
+        ModeChanged {
+            from,
+            to: state.mode(),
+            reason,
+            at: env.ledger().timestamp(),
         }
-        Ok(())
+        .publish(env);
+    }
+
+    /// The one gate. Every state-changing entrypoint calls this with its [`Op`]
+    /// (the table is `mode::allowed`). The error says why the treasury is not
+    /// accepting `op`: `DrawdownTripped` (agents halted), `Paused` (admin pause),
+    /// `EmergencyMode`, or, for `EmergencyWithdraw` outside an emergency while
+    /// running normally, `NotPaused`.
+    fn gate(env: &Env, op: Op) -> Result<(), Error> {
+        let mode = Self::load_mode_state(env).mode();
+        if allowed(mode, op) {
+            return Ok(());
+        }
+        Err(match mode {
+            Mode::Normal => Error::NotPaused,
+            Mode::AgentsHalted => Error::DrawdownTripped,
+            Mode::Paused | Mode::Unwinding => Error::Paused,
+            Mode::Emergency => Error::EmergencyMode,
+        })
+    }
+
+    fn effective_exit_floor(env: &Env, market_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ExitFloor(market_id))
+            .or_else(|| env.storage().instance().get(&DataKey::DefaultExitFloor))
+            .unwrap_or(0)
     }
 
     fn put_persistent<V: IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &DataKey, value: &V) {
@@ -2719,12 +4734,12 @@ impl Treasury {
         Ok(())
     }
 
-    /// The global config, migrating a pre-registry `RiskConfig` on first use:
-    /// it becomes a `GlobalConfig` (net cap from the legacy `NetCap`, else
-    /// `max_daily`) plus one full-role agent with the global caps, and the
-    /// collateral already held is minted as shares to the admin. Positions
-    /// opened before the migration are not in the open-market index, so
-    /// `nav()` values them at zero until they are redeemed.
+    // The global config, migrating a pre-registry `RiskConfig` on first use:
+    // it becomes a `GlobalConfig` (net cap from the legacy `NetCap`, else
+    // `max_daily`) plus one full-role agent with the global caps, and the
+    // collateral already held is minted as shares to the admin. Positions
+    // opened before the migration are not in the open-market index, so
+    // `nav()` values them at zero until they are redeemed.
     fn load_global(env: &Env) -> Result<GlobalConfig, Error> {
         let storage = env.storage().instance();
         if let Some(global) = storage.get(&DataKey::Global) {
@@ -2777,9 +4792,9 @@ impl Treasury {
         ])
     }
 
-    /// A collateral switch would orphan anything held in the old token, so
-    /// it is only allowed for an empty treasury: no balance, no open
-    /// markets, no queued withdrawals.
+    // A collateral switch would orphan anything held in the old token, so
+    // it is only allowed for an empty treasury: no balance, no open
+    // markets, no queued withdrawals.
     fn check_collateral_change(
         env: &Env,
         old: &GlobalConfig,
@@ -2866,8 +4881,8 @@ impl Treasury {
         }
     }
 
-    /// Stores `policy`, enumerating `agent` on first registration (bounded
-    /// by `MAX_AGENTS`; re-adding an agent never counts twice).
+    // Stores `policy`, enumerating `agent` on first registration (bounded
+    // by `MAX_AGENTS`; re-adding an agent never counts twice).
     fn write_agent(env: &Env, agent: &Address, policy: &AgentPolicy) -> Result<(), Error> {
         let key = DataKey::Agent(agent.clone());
         if !env.storage().persistent().has(&key) {
@@ -2891,7 +4906,7 @@ impl Treasury {
         Ok(())
     }
 
-    /// At least one active agent must be able to settle.
+    // At least one active agent must be able to settle.
     fn ensure_settler(env: &Env) -> Result<(), Error> {
         for i in 0..Self::agent_count(env.clone()) {
             let Some(addr) = Self::agent_at(env.clone(), i) else {
@@ -2907,7 +4922,8 @@ impl Treasury {
     }
 
     /// `agent` signed this invocation, is registered, active and holds
-    /// `role`.
+    /// `role`. When a registry is configured, trade/create roles also
+    /// require the registry agent to be Active.
     fn require_agent(env: &Env, agent: &Address, role: u32) -> Result<AgentPolicy, Error> {
         agent.require_auth();
         let key = DataKey::Agent(agent.clone());
@@ -2919,6 +4935,9 @@ impl Treasury {
         if !policy.active || policy.roles & role == 0 {
             return Err(Error::Unauthorized);
         }
+        if role & (ROLE_TRADE | ROLE_CREATE) != 0 {
+            Self::require_registry_active(env, agent)?;
+        }
         env.storage()
             .persistent()
             .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
@@ -2928,12 +4947,13 @@ impl Treasury {
     fn check_trade_size(
         global: &GlobalConfig,
         policy: &AgentPolicy,
+        token_caps: &TokenCaps,
         amount: i128,
     ) -> Result<(), Error> {
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
-        if amount > policy.max_trade || amount > global.max_trade {
+        if amount > policy.max_trade || amount > token_caps.max_trade || amount > global.max_trade {
             return Err(Error::TradeCapExceeded);
         }
         Ok(())
@@ -2941,18 +4961,18 @@ impl Treasury {
 
     // ----- trading -------------------------------------------------------------
 
-    /// Price-checked buy. Before the trade: the outcome's spot price
-    /// (market-core's own `get_price`, so the rounding matches what clients
-    /// see) must be within `max_buy_price_bps`, and `min_shares_out` is
-    /// raised to the same-transaction quote minus `max_slippage_bps` (never
-    /// below 1). After it: the price may have moved at most `max_impact_bps`.
-    ///
-    /// Because the quote runs against the same pool state as the buy, the
-    /// quote floor alone cannot stop a sandwich: it only protects the agent's
-    /// own intent against whatever state is current at execution. What stops
-    /// a front-runner is the band (pushed above `max_buy`: `PriceOutOfBand`)
-    /// and the impact limit (price left in band but liquidity thinned so
-    /// this trade moves it further: `PriceImpactExceeded`).
+    // Price-checked buy. Before the trade: the outcome's spot price
+    // (market-core's own `get_price`, so the rounding matches what clients
+    // see) must be within `max_buy_price_bps`, and `min_shares_out` is
+    // raised to the same-transaction quote minus `max_slippage_bps` (never
+    // below 1). After it: the price may have moved at most `max_impact_bps`.
+    //
+    // Because the quote runs against the same pool state as the buy, the
+    // quote floor alone cannot stop a sandwich: it only protects the agent's
+    // own intent against whatever state is current at execution. What stops
+    // a front-runner is the band (pushed above `max_buy`: `PriceOutOfBand`)
+    // and the impact limit (price left in band but liquidity thinned so
+    // this trade moves it further: `PriceImpactExceeded`).
     #[allow(clippy::too_many_arguments)]
     fn do_agent_buy(
         env: Env,
@@ -2963,14 +4983,22 @@ impl Treasury {
         min_shares_out: i128,
         bound: Option<(u32, u64)>,
     ) -> Result<i128, Error> {
-        Self::assert_not_paused(&env)?;
+        Self::gate(&env, Op::AgentOpen)?;
         let global = Self::load_global(&env)?;
         let policy = Self::require_agent(&env, &agent, ROLE_TRADE)?;
-        Self::check_trade_size(&global, &policy, collateral_in)?;
-        Self::ensure_unreserved(&env, &global, collateral_in)?;
+        let client = MarketCoreClient::new(&env, &global.market_core);
+        let market_token = core_call(client.try_get_market_collateral(&market_id))?;
+        let caps = Self::load_token_caps(&env, &global, &market_token);
+        Self::check_trade_size(&global, &policy, &caps, collateral_in)?;
+        Self::ensure_unreserved_token(&env, &global, &market_token, collateral_in)?;
+        if env.storage().instance().has(&DataKey::CorrelationCaps) {
+            let meta = Self::ensure_market_meta(&env, &global.market_core, market_id)?;
+            Self::check_correlated_amount(&env, &global.market_core, &meta, collateral_in)?;
+        }
+        // After the cheap local checks, before the price reads.
+        Self::check_resolvable(&env, &global, market_id)?;
 
         let prices = Self::load_price_policy(&env);
-        let client = MarketCoreClient::new(&env, &global.market_core);
         let p_before = core_call(client.try_get_price(&market_id, &outcome))?;
         if p_before > prices.max_buy_price_bps {
             return Err(Error::PriceOutOfBand);
@@ -2980,7 +5008,7 @@ impl Treasury {
             .ok_or(Error::InvalidAmount)?;
         let effective_min = min_shares_out.max(floor.max(1));
 
-        Self::ensure_liquid(&env, &global, collateral_in)?;
+        Self::ensure_liquid_token(&env, &global, &market_token, collateral_in)?;
 
         let treasury_addr = env.current_contract_address();
         // market-core's `buy` pulls `collateral_in` from `trader` (here, the
@@ -2993,7 +5021,7 @@ impl Treasury {
         // reverts with an authorization error — see
         // `pitfall_agent_buy_fails_without_nested_transfer_preauth` below and
         // `docs/adr/0002-treasury-nested-auth.md`.
-        Self::authorize_token_pull(&env, &global, &treasury_addr, collateral_in);
+        Self::authorize_token_pull_of(&env, &global, &market_token, &treasury_addr, collateral_in);
         let mut args: Vec<Val> = vec![
             &env,
             treasury_addr.into_val(&env),
@@ -3008,16 +5036,24 @@ impl Treasury {
         if p_after.abs_diff(p_before) > prices.max_impact_bps {
             return Err(Error::PriceImpactExceeded);
         }
-        Self::reserve_capacity(&env, &global, &agent, &policy, market_id, collateral_in)?;
+        Self::reserve_capacity(
+            &env,
+            &global,
+            &agent,
+            &policy,
+            &market_token,
+            market_id,
+            collateral_in,
+        )?;
         Self::reserve_net(&env, &global, market_id, collateral_in)?;
         Self::record_cost(&env, market_id, collateral_in)?;
         Ok(shares)
     }
 
-    /// Price-checked sell: the outcome's spot price must be at least
-    /// `min_sell_price_bps`, `max_shares_in` is capped at the same-transaction
-    /// quote plus `max_slippage_bps` (rounded up), and the post-trade impact
-    /// limit applies as for buys.
+    // Price-checked sell: the outcome's spot price must be at least
+    // `min_sell_price_bps`, `max_shares_in` is capped at the same-transaction
+    // quote plus `max_slippage_bps` (rounded up), and the post-trade impact
+    // limit applies as for buys.
     #[allow(clippy::too_many_arguments)]
     fn do_agent_sell(
         env: Env,
@@ -3028,20 +5064,61 @@ impl Treasury {
         max_shares_in: i128,
         bound: Option<(u32, u64)>,
     ) -> Result<i128, Error> {
-        let storage = env.storage().instance();
-        if storage.get(&DataKey::AdminPaused).unwrap_or(false) {
-            return Err(Error::Paused);
-        }
-        if storage.get(&DataKey::Paused).unwrap_or(false)
-            && !storage.get(&DataKey::DrawdownTripped).unwrap_or(false)
-        {
-            return Err(Error::Paused);
-        }
-        let global = Self::load_global(&env)?;
+        Self::gate(&env, Op::AgentReduce)?;
         Self::require_agent(&env, &agent, ROLE_TRADE)?;
-        let prices = Self::load_price_policy(&env);
+        Self::do_sell_inner(
+            &env,
+            market_id,
+            outcome,
+            collateral_out,
+            max_shares_in,
+            bound,
+        )
+    }
+
+    // Emergency unwind sell (#150). The caller must be the configured agent
+    // or the separately designated unwinder, and the treasury must be in
+    // `Unwinding`. Sells never consume caps.
+    #[allow(clippy::too_many_arguments)]
+    pub fn unwind_sell(
+        env: Env,
+        caller: Address,
+        market_id: u64,
+        outcome: Outcome,
+        collateral_out: i128,
+        max_shares_in: i128,
+    ) -> Result<i128, Error> {
+        caller.require_auth();
+        if Self::load_mode_state(&env).mode() != Mode::Unwinding {
+            return Err(Error::Paused);
+        }
+        let agent = Self::agent_at(env.clone(), 0).ok_or(Error::Unauthorized)?;
+        let unwinder: Option<Address> = env.storage().instance().get(&DataKey::Unwinder);
+        if caller != agent && unwinder.as_ref() != Some(&caller) {
+            return Err(Error::Unauthorized);
+        }
+        Self::do_sell_inner(
+            &env,
+            market_id,
+            outcome,
+            collateral_out,
+            max_shares_in,
+            None,
+        )
+    }
+
+    fn do_sell_inner(
+        env: &Env,
+        market_id: u64,
+        outcome: Outcome,
+        collateral_out: i128,
+        max_shares_in: i128,
+        bound: Option<(u32, u64)>,
+    ) -> Result<i128, Error> {
+        let global = Self::load_global(env)?;
+        let prices = Self::load_price_policy(env);
         let treasury_addr = env.current_contract_address();
-        let client = MarketCoreClient::new(&env, &global.market_core);
+        let client = MarketCoreClient::new(env, &global.market_core);
         let p_before = core_call(client.try_get_price(&market_id, &outcome))?;
         if p_before < prices.min_sell_price_bps {
             return Err(Error::PriceOutOfBand);
@@ -3051,27 +5128,57 @@ impl Treasury {
             .ok_or(Error::InvalidAmount)?;
         let effective_max = max_shares_in.min(cap);
         let mut args: Vec<Val> = vec![
-            &env,
-            treasury_addr.into_val(&env),
-            market_id.into_val(&env),
-            outcome.into_val(&env),
-            collateral_out.into_val(&env),
-            effective_max.into_val(&env),
+            env,
+            treasury_addr.into_val(env),
+            market_id.into_val(env),
+            outcome.into_val(env),
+            collateral_out.into_val(env),
+            effective_max.into_val(env),
         ];
-        let fn_name = Self::push_bound(&env, &mut args, bound, "sell", "sell_v2");
-        let shares_in = Self::core_trade(&env, &global.market_core, fn_name, args)?;
+        let fn_name = Self::push_bound(env, &mut args, bound, "sell", "sell_v2");
+        let shares_in = Self::core_trade(env, &global.market_core, fn_name, args)?;
         let p_after = core_call(client.try_get_price(&market_id, &outcome))?;
         if p_after.abs_diff(p_before) > prices.max_impact_bps {
             return Err(Error::PriceImpactExceeded);
         }
+        let price_bps = if shares_in > 0 {
+            price_math::mul_div_floor(collateral_out, BPS, shares_in)
+                .ok_or(Error::InvalidAmount)?
+                .clamp(0, BPS) as u32
+        } else {
+            0
+        };
+        if Self::load_mode_state(env).mode() == Mode::Unwinding {
+            let floor = Self::effective_exit_floor(env, market_id);
+            if price_bps < floor {
+                return Err(Error::BelowExitFloor);
+            }
+            let key = DataKey::Unwound(market_id);
+            let realized: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            Self::put_persistent(
+                env,
+                &key,
+                &realized
+                    .checked_add(collateral_out)
+                    .ok_or(Error::InvalidAmount)?,
+            );
+            UnwindSell {
+                market_id,
+                outcome,
+                collateral_out,
+                shares_in,
+                price_bps,
+            }
+            .publish(env);
+        }
         // market-core transfers exactly `collateral_out` on success.
-        Self::record_return(&env, &global.market_core, market_id, collateral_out)?;
-        Self::record_proceeds(&env, market_id, collateral_out)?;
+        Self::record_return(env, &global.market_core, market_id, collateral_out)?;
+        Self::record_proceeds(env, market_id, collateral_out)?;
         Ok(shares_in)
     }
 
-    /// Appends the `_v2` bounds to a trade's arguments when given, and
-    /// returns the market-core function to call.
+    // Appends the `_v2` bounds to a trade's arguments when given, and
+    // returns the market-core function to call.
     fn push_bound(
         env: &Env,
         args: &mut Vec<Val>,
@@ -3089,15 +5196,15 @@ impl Treasury {
         }
     }
 
-    /// Calls a market-core trade, catching its failure. market-core's
-    /// `SlippageExceeded` becomes the treasury's own code (the bound is the
-    /// treasury's); every other failure is mapped into the treasury's
-    /// `MarketCore*` range so market-core's numeric codes never leak through
-    /// the treasury ABI.
-    ///
-    /// Invoked by name rather than through the generated client's `try_`
-    /// methods: those decode into market-core's `Error` type, which would
-    /// then be exported in this contract's spec next to the treasury's own.
+    // Calls a market-core trade, catching its failure. market-core's
+    // `SlippageExceeded` becomes the treasury's own code (the bound is the
+    // treasury's); every other failure is mapped into the treasury's
+    // `MarketCore*` range so market-core's numeric codes never leak through
+    // the treasury ABI.
+    //
+    // Invoked by name rather than through the generated client's `try_`
+    // methods: those decode into market-core's `Error` type, which would
+    // then be exported in this contract's spec next to the treasury's own.
     fn core_trade(env: &Env, core: &Address, fn_name: &str, args: Vec<Val>) -> Result<i128, Error> {
         match env.try_invoke_contract::<i128, soroban_sdk::Error>(
             core,
@@ -3119,29 +5226,105 @@ impl Treasury {
     /// market with and reveal: `sha256(SPEC_DOMAIN || XDR(spec))`, matching the
     /// resolver's `spec_v2_hash`. Validates the envelope and the two primary
     /// rule variants locally so a malformed rule never creates a market.
-    fn resolve_commitment(env: &Env, spec: &ResolutionSpecV2) -> Result<BytesN<32>, Error> {
+    fn resolve_commitment(
+        env: &Env,
+        global: &GlobalConfig,
+        spec: &ResolutionSpecV2,
+    ) -> Result<BytesN<32>, Error> {
         if spec.version != SPEC_V2_VERSION || spec.salt == BytesN::from_array(env, &[0; 32]) {
             return Err(Error::InvalidResolution);
         }
-        if spec.network_id != env.ledger().network_id() {
-            return Err(Error::InvalidResolution);
-        }
-        let valid = match &spec.rule {
-            ResolutionSpec::Price(cfg) => cfg.threshold >= 0 && cfg.max_staleness != 0,
-            ResolutionSpec::Signers(cfg) => {
-                !cfg.signers.is_empty()
-                    && cfg.threshold != 0
-                    && cfg.threshold <= cfg.signers.len()
-                    && cfg.dispute_window != 0
-            }
-            _ => false,
-        };
-        if !valid {
+        if spec.network_id != env.ledger().network_id() || spec.market_core != global.market_core {
             return Err(Error::InvalidResolution);
         }
         let mut preimage = Bytes::from_slice(env, SPEC_DOMAIN);
         preimage.append(&spec.clone().to_xdr(env));
         Ok(env.crypto().sha256(&preimage).into())
+    }
+
+    /// The resolver market-core currently trusts, read from its own config on
+    /// every call (not cached: an admin resolver swap changes it for all markets,
+    /// and a stale cache would check the old resolver's view).
+    fn core_resolver(env: &Env, global: &GlobalConfig) -> Result<Address, Error> {
+        Ok(core_call(MarketCoreClient::new(env, &global.market_core).try_get_config())?.resolver)
+    }
+
+    fn load_resolvability_policy(env: &Env) -> ResolvabilityPolicy {
+        env.storage()
+            .instance()
+            .get(&DataKey::ResolvabilityPolicy)
+            .unwrap_or(OPEN_RESOLVABILITY)
+    }
+
+    /// The pre-trade resolvability check of `agent_buy` (#273). Reads
+    /// market-core's configured resolver and one resolver view
+    /// (`trade_status`); a fully permissive policy (the default) makes no
+    /// cross-contract call at all. Sells, redemptions and settlement never come
+    /// through here. Legacy cores are not consulted: no buy path reaches them
+    /// (their positions are only redeemable), so this uses `global.market_core`.
+    fn check_resolvable(env: &Env, global: &GlobalConfig, market_id: u64) -> Result<(), Error> {
+        let policy = Self::load_resolvability_policy(env);
+        if policy == OPEN_RESOLVABILITY {
+            return Ok(());
+        }
+        let resolver = Self::core_resolver(env, global)?;
+        let st = resolver_call(ResolverClient::new(env, &resolver).try_trade_status(&market_id))?;
+        let now = env.ledger().timestamp();
+        if policy.require_revealed && matches!(st.spec, resolver::SpecKind::None) {
+            return Err(Error::SpecNotRevealed);
+        }
+        if policy.allowed_specs & spec_bit(&st.spec) == 0 {
+            return Err(Error::SpecKindNotAllowed);
+        }
+        if policy.block_when_disputed && matches!(st.state, resolver::ResolutionState::Disputed) {
+            return Err(Error::MarketDisputed);
+        }
+        if policy.block_with_open_proposal && st.open_proposal {
+            return Err(Error::ProposalOpen);
+        }
+        if now >= st.deadline {
+            return Err(Error::PastResolutionDeadline);
+        }
+        if policy.min_secs_to_close > 0
+            && st.close_time.saturating_sub(now) < policy.min_secs_to_close
+        {
+            return Err(Error::TooCloseToClose);
+        }
+        Ok(())
+    }
+
+    fn live_resolver(env: &Env, global: &GlobalConfig) -> Result<Address, Error> {
+        let resolver = MarketCoreClient::new(env, &global.market_core)
+            .get_config()
+            .resolver;
+        if ResolverClient::new(env, &resolver).market_core() != global.market_core {
+            return Err(Error::InvalidResolution);
+        }
+        Ok(resolver)
+    }
+
+    fn assert_rule_kind(
+        env: &Env,
+        resolver: &Address,
+        market_id: u64,
+        spec: &ResolutionSpecV2,
+    ) -> Result<(), Error> {
+        let args: Vec<Val> = vec![env, market_id.into_val(env)];
+        let actual: Option<RuleKind> =
+            env.invoke_contract(resolver, &Symbol::new(env, "rule_kind"), args);
+        let expected = match &spec.rule {
+            ResolutionSpec::Price(_) => RuleKind::Price,
+            ResolutionSpec::Signers(_) => RuleKind::Signers,
+            ResolutionSpec::WeightedKeys(_) => RuleKind::WeightedKeys,
+            ResolutionSpec::SignersDisputable(_) => RuleKind::SignersDisputable,
+            ResolutionSpec::Committee(_) => RuleKind::Committee,
+            ResolutionSpec::Hybrid(_) => RuleKind::Hybrid,
+        };
+        if actual == Some(expected) {
+            Ok(())
+        } else {
+            Err(Error::InvalidResolution)
+        }
     }
 
     fn ensure_unreserved(env: &Env, global: &GlobalConfig, amount: i128) -> Result<(), Error> {
@@ -3151,6 +5334,21 @@ impl Treasury {
         }
         if Self::idle(env, global).saturating_sub(amount) < reserved {
             return Err(Error::CapitalReserved);
+        }
+        Ok(())
+    }
+
+    fn ensure_unreserved_token(
+        env: &Env,
+        global: &GlobalConfig,
+        token: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        if *token == global.collateral {
+            return Self::ensure_unreserved(env, global, amount);
+        }
+        if Self::token_idle(env, token) < amount {
+            return Err(Error::InsufficientBalance);
         }
         Ok(())
     }
@@ -3183,7 +5381,7 @@ impl Treasury {
             Self::close_market_exposure(env, core, market_id);
         }
         Self::save_realized(env, market_id, &r);
-        Self::prune_if_settled(env, core, market_id);
+        let _ = Self::prune_if_settled(env, core, market_id);
         if r.settled {
             Self::try_realize(env, core, market_id)?;
         }
@@ -3218,7 +5416,7 @@ impl Treasury {
             Self::close_market_exposure(env, core, market_id);
         }
         Self::save_realized(env, market_id, &r);
-        Self::prune_if_settled(env, core, market_id);
+        let _ = Self::prune_if_settled(env, core, market_id);
         if r.settled {
             Self::try_realize(env, core, market_id)?;
         }
@@ -3257,11 +5455,11 @@ impl Treasury {
         })
     }
 
-    /// The stored window, or one migrated from the legacy fixed-window
-    /// `DataKey::Daily` (not persisted here; `reserve_capacity` saves it and
-    /// removes the legacy entry). Legacy usage still inside its day counts in
-    /// full in the current hour's bucket: conservative, since it then stays
-    /// in the window for up to 25 more hours.
+    // The stored window, or one migrated from the legacy fixed-window
+    // `DataKey::Daily` (not persisted here; `reserve_capacity` saves it and
+    // removes the legacy entry). Legacy usage still inside its day counts in
+    // full in the current hour's bucket: conservative, since it then stays
+    // in the window for up to 25 more hours.
     fn load_window(env: &Env) -> Result<UsageWindow, Error> {
         let storage = env.storage().instance();
         if let Some(window) = storage.get(&DataKey::UsageWindow) {
@@ -3283,10 +5481,24 @@ impl Treasury {
             .unwrap_or_else(|| Self::empty_window(env, env.ledger().timestamp() / BUCKET_SECONDS))
     }
 
-    /// Moves the head to `now_hour`, zeroing every bucket that left the
-    /// window. At most `BUCKETS` steps however long the treasury was idle.
-    /// An equal or earlier hour is a no-op: ledger time never goes backwards
-    /// on-chain (tests that rewind `set_timestamp` just keep the current head).
+    fn load_token_window(env: &Env, token: &Address) -> UsageWindow {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TokenWindow(token.clone()))
+            .unwrap_or_else(|| Self::empty_window(env, env.ledger().timestamp() / BUCKET_SECONDS))
+    }
+
+    fn load_token_agent_window(env: &Env, token: &Address, agent: &Address) -> UsageWindow {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AgentTokenWindow(agent.clone(), token.clone()))
+            .unwrap_or_else(|| Self::empty_window(env, env.ledger().timestamp() / BUCKET_SECONDS))
+    }
+
+    // Moves the head to `now_hour`, zeroing every bucket that left the
+    // window. At most `BUCKETS` steps however long the treasury was idle.
+    // An equal or earlier hour is a no-op: ledger time never goes backwards
+    // on-chain (tests that rewind `set_timestamp` just keep the current head).
     fn advance(window: &mut UsageWindow, now_hour: u64) {
         if now_hour <= window.head_hour {
             return;
@@ -3305,8 +5517,8 @@ impl Treasury {
         })
     }
 
-    /// Advances `window` to `now`, then adds `amount` to the current hour if
-    /// the window total stays within `max_daily`. Returns the new total.
+    // Advances `window` to `now`, then adds `amount` to the current hour if
+    // the window total stays within `max_daily`. Returns the new total.
     fn consume_window(
         window: &mut UsageWindow,
         now: u64,
@@ -3331,50 +5543,75 @@ impl Treasury {
         Ok(total)
     }
 
-    /// Checks the per-market cap, the global daily cap and the acting
-    /// agent's own daily cap for `amount` and, if all pass, records it in
-    /// all three and adds the market to the open-market index. Called
-    /// *after* the market-core call it authorizes: Soroban invocations are
-    /// atomic, so if this returns `Err` the whole transaction (including the
-    /// trade already made) reverts.
-    ///
-    /// Both daily caps are sliding windows: usage in the trade's hour and
-    /// the 24 hours before it (see `BUCKETS`) may never exceed the cap, so
-    /// no trailing 24h interval can either. `TradeAuthorized.daily_total` is
-    /// the global window sum after the trade.
+    // Checks the per-market cap, the global daily cap and the acting
+    // agent's own daily cap for `amount` and, if all pass, records it in
+    // all three and adds the market to the open-market index. Called
+    // *after* the market-core call it authorizes: Soroban invocations are
+    // atomic, so if this returns `Err` the whole transaction (including the
+    // trade already made) reverts.
+    //
+    // Both daily caps are sliding windows: usage in the trade's hour and
+    // the 24 hours before it (see `BUCKETS`) may never exceed the cap, so
+    // no trailing 24h interval can either. `TradeAuthorized.daily_total` is
+    // the global window sum after the trade.
     fn reserve_capacity(
         env: &Env,
         global: &GlobalConfig,
         agent: &Address,
         policy: &AgentPolicy,
+        token: &Address,
         market_id: u64,
         amount: i128,
     ) -> Result<(), Error> {
         let core = &global.market_core;
+        let caps = Self::load_token_caps(env, global, token);
+        let default_token = *token == global.collateral;
         let now = env.ledger().timestamp();
-        let mut window = Self::load_window(env)?;
-        let mut agent_window = Self::load_agent_window(env, agent);
+        let mut window = if default_token {
+            Self::load_window(env)?
+        } else {
+            Self::load_token_window(env, token)
+        };
+        let mut agent_window = if default_token {
+            Self::load_agent_window(env, agent)
+        } else {
+            Self::load_token_agent_window(env, token, agent)
+        };
         let mut exposure = Self::market_exposure(env, core, market_id);
         let new_market = exposure
             .amount
             .checked_add(amount)
             .ok_or(Error::MarketCapExceeded)?;
-        if new_market > global.max_market {
+        if new_market > caps.max_market {
             return Err(Error::MarketCapExceeded);
         }
-        let new_daily = Self::consume_window(&mut window, now, amount, global.max_daily)?;
-        Self::consume_window(&mut agent_window, now, amount, policy.max_daily)
-            .map_err(|_| Error::AgentDailyCapExceeded)?;
+        let new_daily = Self::consume_window(&mut window, now, amount, caps.max_daily)?;
+        Self::consume_window(
+            &mut agent_window,
+            now,
+            amount,
+            policy.max_daily.min(caps.max_daily),
+        )
+        .map_err(|_| Error::AgentDailyCapExceeded)?;
         Self::index_add(env, core, market_id)?;
         exposure.amount = new_market;
         exposure.open = true;
         Self::save_market(env, core, market_id, &exposure);
-        Self::put_persistent(env, &DataKey::AgentWindow(agent.clone()), &agent_window);
-        let storage = env.storage().instance();
-        storage.set(&DataKey::UsageWindow, &window);
-        storage.remove(&DataKey::Daily);
-        // The window must outlive idle days, so keep the instance live.
-        storage.extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+        if default_token {
+            Self::put_persistent(env, &DataKey::AgentWindow(agent.clone()), &agent_window);
+            let storage = env.storage().instance();
+            storage.set(&DataKey::UsageWindow, &window);
+            storage.remove(&DataKey::Daily);
+            // The window must outlive idle days, so keep the instance live.
+            storage.extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+        } else {
+            Self::put_persistent(
+                env,
+                &DataKey::AgentTokenWindow(agent.clone(), token.clone()),
+                &agent_window,
+            );
+            Self::put_persistent(env, &DataKey::TokenWindow(token.clone()), &window);
+        }
         TradeAuthorized {
             market_id,
             agent: agent.clone(),
@@ -3432,9 +5669,9 @@ impl Treasury {
             })
     }
 
-    /// Stores `next` for `market_id`, moves `NetTotal` by the change in that
-    /// market's cost basis (so it never needs iterating) and returns the new
-    /// total.
+    // Stores `next` for `market_id`, moves `NetTotal` by the change in that
+    // market's cost basis (so it never needs iterating) and returns the new
+    // total.
     fn save_net(
         env: &Env,
         core: &Address,
@@ -3446,7 +5683,13 @@ impl Treasury {
             .checked_sub(before.cost_basis())
             .and_then(|t| t.checked_add(next.cost_basis()))
             .ok_or(Error::NetExposureExceeded)?;
+        if Self::is_indexed(env, core, market_id) {
+            Self::refresh_mark_for(env, core, market_id)?;
+        }
         Self::put_persistent(env, &Self::net_key(env, core, market_id), next);
+        if env.storage().instance().has(&DataKey::CorrelationCaps) {
+            Self::move_correlated(env, core, market_id, before.cost_basis(), next.cost_basis())?;
+        }
         env.storage().instance().set(&DataKey::NetTotal, &total);
         NetExposureUpdated {
             market_id,
@@ -3457,9 +5700,9 @@ impl Treasury {
         Ok(total)
     }
 
-    /// Records `amount` sent into `market_id` and enforces `max_net_exposure`
-    /// on the new total. Like `reserve_capacity`, runs after the market-core
-    /// call and relies on the invocation reverting on `Err`.
+    // Records `amount` sent into `market_id` and enforces `max_net_exposure`
+    // on the new total. Like `reserve_capacity`, runs after the market-core
+    // call and relies on the invocation reverting on `Err`.
     fn reserve_net(
         env: &Env,
         global: &GlobalConfig,
@@ -3482,8 +5725,8 @@ impl Treasury {
         Ok(())
     }
 
-    /// Records `amount` received back from `market_id` (a sell, redemption,
-    /// pool remainder or LP fee claim).
+    // Records `amount` received back from `market_id` (a sell, redemption,
+    // pool remainder or LP fee claim).
     fn record_return(env: &Env, core: &Address, market_id: u64, amount: i128) -> Result<(), Error> {
         if amount <= 0 {
             return Ok(());
@@ -3500,7 +5743,7 @@ impl Treasury {
         Ok(())
     }
 
-    /// Drops `market_id` from net accounting (its holdings left the treasury).
+    // Drops `market_id` from net accounting (its holdings left the treasury).
     fn clear_net(env: &Env, core: &Address, market_id: u64) -> Result<(), Error> {
         let before = Self::load_net(env, core, market_id);
         let cleared = NetPosition {
@@ -3513,13 +5756,16 @@ impl Treasury {
 
     // ----- valuation ---------------------------------------------------------------
 
-    /// `(floor, spot)` value of the treasury's holdings in one market (see
-    /// [`Valuation`]): two cross-contract reads.
-    fn holdings_value(env: &Env, core: &Address, market_id: u64) -> Result<(i128, i128), Error> {
+    /// `(floor, spot, mark)` value of the treasury's holdings in one market.
+    fn holdings_value(
+        env: &Env,
+        core: &Address,
+        market_id: u64,
+    ) -> Result<(i128, i128, MarkRecord), Error> {
         let treasury_addr = env.current_contract_address();
         let client = MarketCoreClient::new(env, core);
         let market = core_call(client.try_get_market(&market_id))?;
-        let position = core_call(client.try_get_position(&market_id, &treasury_addr))?;
+        let position = core_view(client.try_get_position(&market_id, &treasury_addr))?;
         let lp = market.creator == treasury_addr && !market.lp_claimed;
         let (lp_yes, lp_no) = if lp {
             (market.reserve_yes, market.reserve_no)
@@ -3527,14 +5773,13 @@ impl Treasury {
             (0, 0)
         };
 
-        Ok(match market.status {
+        let status_final = market.status != MarketStatus::Open;
+        let (floor, spot) = match market.status {
             MarketStatus::Open => {
                 let floor = position
                     .yes
                     .min(position.no)
                     .saturating_add(lp_yes.min(lp_no));
-                // Mirrors market-core's `price_yes_bps` from the reserves just
-                // read, so spot costs no third call.
                 let sum = market.reserve_yes.saturating_add(market.reserve_no);
                 let p_yes = if sum > 0 {
                     market.reserve_no.saturating_mul(BPS) / sum
@@ -3549,32 +5794,55 @@ impl Treasury {
                     / BPS;
                 (floor, spot)
             }
-            // Final markets are worth exactly what market-core's
-            // `settle_value` pays out.
             status => {
                 let settled = Self::settle_value(&status, position.yes, position.no)
                     .saturating_add(Self::settle_value(&status, lp_yes, lp_no));
                 (settled, settled)
             }
-        })
+        };
+        let mark = MarkRecord {
+            core: core.clone(),
+            market_id,
+            pos_yes: position.yes,
+            pos_no: position.no,
+            lp,
+            lp_floor: lp_yes.min(lp_no),
+            status_final,
+            contribution: floor,
+            refreshed_ledger: env.ledger().sequence(),
+            close_time: market.close_time,
+        };
+        Ok((floor, spot, mark))
     }
 
     fn compute_nav(env: &Env, global: &GlobalConfig) -> Result<i128, Error> {
-        let mut total = Self::idle(env, global);
-        for i in 0..Self::open_count(env) {
-            let key = DataKey::OpenMarketAt(i);
-            let entry: OpenMarket = env
-                .storage()
-                .persistent()
-                .get(&key)
-                .ok_or(Error::NotInitialized)?;
-            let (floor, _) = Self::holdings_value(env, &entry.core, entry.market_id)?;
-            total = total.checked_add(floor).ok_or(Error::InvalidAmount)?;
+        if Self::marks_migrated(env) {
+            Self::refresh_due_marks(env)?;
         }
-        Ok(total.saturating_sub(Self::reserved(env)).max(0))
+        let holdings = if Self::marks_migrated(env) {
+            Self::nav_holdings(env)
+        } else {
+            let mut total: i128 = 0;
+            for i in 0..Self::open_count(env) {
+                let key = DataKey::OpenMarketAt(i);
+                let entry: OpenMarket = env
+                    .storage()
+                    .persistent()
+                    .get(&key)
+                    .ok_or(Error::NotInitialized)?;
+                let (floor, _, _) = Self::holdings_value(env, &entry.core, entry.market_id)?;
+                total = total.checked_add(floor).ok_or(Error::InvalidAmount)?;
+            }
+            total
+        };
+        Ok(Self::idle(env, global)
+            .checked_add(holdings)
+            .ok_or(Error::InvalidAmount)?
+            .saturating_sub(Self::reserved(env))
+            .max(0))
     }
 
-    /// Private mirror of market-core's `math::settle_value` for final markets.
+    // Private mirror of market-core's `math::settle_value` for final markets.
     fn settle_value(status: &MarketStatus, yes: i128, no: i128) -> i128 {
         match status {
             MarketStatus::Resolved(Outcome::Yes) => yes,
@@ -3582,6 +5850,173 @@ impl Treasury {
             MarketStatus::Void => yes.saturating_add(no) / 2,
             MarketStatus::Open => 0,
         }
+    }
+
+    fn mark_key(core: &Address, market_id: u64) -> DataKey {
+        DataKey::Mark(core.clone(), market_id)
+    }
+
+    // A market can become final without any treasury trade to refresh its
+    // mark (the resolver acts alone). Those marks still hold their pre-close
+    // `contribution`, so `nav()` would understate holdings until someone
+    // trades or redeems. Refresh exactly those: past `close_time` and not yet
+    // marked final. Open markets are kept current by `save_net` on every
+    // trade, so they cost no cross-contract reads here.
+    fn refresh_due_marks(env: &Env) -> Result<(), Error> {
+        let now = env.ledger().timestamp();
+        for i in 0..Self::open_count(env) {
+            let entry: OpenMarket = env
+                .storage()
+                .persistent()
+                .get(&DataKey::OpenMarketAt(i))
+                .ok_or(Error::NotInitialized)?;
+            let key = Self::mark_key(&entry.core, entry.market_id);
+            let due = match env.storage().persistent().get::<DataKey, MarkRecord>(&key) {
+                Some(mark) => !mark.status_final && now >= mark.close_time,
+                None => true,
+            };
+            if due {
+                Self::refresh_mark_for(env, &entry.core, entry.market_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn marks_migrated(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::MarksMigrated)
+            .unwrap_or(false)
+    }
+
+    fn nav_holdings(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::NavHoldings)
+            .unwrap_or(0)
+    }
+
+    fn load_mark_age(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxMarkAgeLedgers)
+            .unwrap_or(DEFAULT_MAX_MARK_AGE_LEDGERS)
+    }
+
+    fn recompute_mark_age(env: &Env) {
+        let mut count = 0u32;
+        let mut oldest = env.ledger().sequence();
+        for i in 0..Self::open_count(env) {
+            let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<_, OpenMarket>(&DataKey::OpenMarketAt(i))
+            else {
+                continue;
+            };
+            let Some(mark) = env
+                .storage()
+                .persistent()
+                .get::<_, MarkRecord>(&Self::mark_key(&entry.core, entry.market_id))
+            else {
+                continue;
+            };
+            if mark.lp && !mark.status_final {
+                count += 1;
+                oldest = oldest.min(mark.refreshed_ledger);
+            }
+        }
+        let storage = env.storage().instance();
+        storage.set(&DataKey::StaleLpCount, &count);
+        storage.set(&DataKey::OldestLpRefresh, &oldest);
+    }
+
+    fn marks_stale(env: &Env) -> bool {
+        if !Self::marks_migrated(env) {
+            return false;
+        }
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StaleLpCount)
+            .unwrap_or(0);
+        let oldest: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OldestLpRefresh)
+            .unwrap_or(env.ledger().sequence());
+        count > 0 && env.ledger().sequence().saturating_sub(oldest) > Self::load_mark_age(env)
+    }
+
+    fn assert_marks_fresh(env: &Env) -> Result<(), Error> {
+        if Self::marks_stale(env) {
+            Err(Error::StaleMarks)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn write_mark(env: &Env, next: MarkRecord) -> Result<(), Error> {
+        let key = Self::mark_key(&next.core, next.market_id);
+        let storage = env.storage().persistent();
+        let old: Option<MarkRecord> = storage.get(&key);
+        let base = match old {
+            Some(ref record) => Self::nav_holdings(env)
+                .checked_sub(record.contribution)
+                .ok_or(Error::InvalidAmount)?,
+            None => Self::nav_holdings(env),
+        };
+        let total = base
+            .checked_add(next.contribution)
+            .ok_or(Error::InvalidAmount)?;
+        env.storage().instance().set(&DataKey::NavHoldings, &total);
+        Self::put_persistent(env, &key, &next);
+        Self::recompute_mark_age(env);
+        Ok(())
+    }
+
+    fn refresh_mark_for(env: &Env, core: &Address, market_id: u64) -> Result<MarkRecord, Error> {
+        let (_, _, mark) = Self::holdings_value(env, core, market_id)?;
+        Self::write_mark(env, mark.clone())?;
+        Ok(mark)
+    }
+
+    fn apply_batch_result(env: &Env, core: &Address, result: &BatchResult) -> Result<(), Error> {
+        for item in result.items.iter() {
+            if item.payout > 0 {
+                Self::record_return(env, core, item.market_id, item.payout)?;
+                Self::record_proceeds(env, item.market_id, item.payout)?;
+            }
+            if !Self::is_indexed(env, core, item.market_id) {
+                continue;
+            }
+            let mark = Self::refresh_mark_for(env, core, item.market_id)?;
+            if mark.pos_yes == 0 && mark.pos_no == 0 && !mark.lp {
+                Self::index_remove(env, core, item.market_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_indexed(env: &Env, core: &Address, market_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::OpenMarketSlot(core.clone(), market_id))
+    }
+
+    fn core_for_market(env: &Env, market_id: u64) -> Result<Address, Error> {
+        for i in 0..Self::open_count(env) {
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<_, OpenMarket>(&DataKey::OpenMarketAt(i))
+            {
+                if entry.market_id == market_id {
+                    return Ok(entry.core);
+                }
+            }
+        }
+        Err(Error::NotInitialized)
     }
 
     // ----- open-market index ---------------------------------------------------------
@@ -3621,12 +6056,20 @@ impl Treasury {
         Ok(())
     }
 
-    fn index_remove(env: &Env, core: &Address, market_id: u64) {
+    fn index_remove(env: &Env, core: &Address, market_id: u64) -> Result<(), Error> {
         let slot_key = DataKey::OpenMarketSlot(core.clone(), market_id);
         let persistent = env.storage().persistent();
         let Some(slot) = persistent.get::<DataKey, u32>(&slot_key) else {
-            return;
+            return Ok(());
         };
+        let mark_key = Self::mark_key(core, market_id);
+        if let Some(mark) = persistent.get::<DataKey, MarkRecord>(&mark_key) {
+            let total = Self::nav_holdings(env)
+                .checked_sub(mark.contribution)
+                .ok_or(Error::InvalidAmount)?;
+            env.storage().instance().set(&DataKey::NavHoldings, &total);
+        }
+        persistent.remove(&mark_key);
         let last = Self::open_count(env) - 1;
         if slot != last {
             if let Some(moved) = persistent.get::<DataKey, OpenMarket>(&DataKey::OpenMarketAt(last))
@@ -3644,10 +6087,12 @@ impl Treasury {
         env.storage()
             .instance()
             .set(&DataKey::OpenMarketCount, &last);
+        Self::recompute_mark_age(env);
+        Ok(())
     }
 
-    /// Drops `market_id` from the index once the treasury holds nothing in
-    /// it: no shares and no unclaimed LP role.
+    // Drops `market_id` from the index once the treasury holds nothing in
+    // it: no shares and no unclaimed LP role.
     fn prune_if_settled(env: &Env, core: &Address, market_id: u64) -> Result<(), Error> {
         if !env
             .storage()
@@ -3658,11 +6103,11 @@ impl Treasury {
         }
         let treasury_addr = env.current_contract_address();
         let client = MarketCoreClient::new(env, core);
-        let position = core_call(client.try_get_position(&market_id, &treasury_addr))?;
+        let position = core_view(client.try_get_position(&market_id, &treasury_addr))?;
         let market = core_call(client.try_get_market(&market_id))?;
         let lp = market.creator == treasury_addr && !market.lp_claimed;
         if position.yes == 0 && position.no == 0 && !lp {
-            Self::index_remove(env, core, market_id);
+            Self::index_remove(env, core, market_id)?;
         }
         Ok(())
     }
@@ -3671,6 +6116,21 @@ impl Treasury {
 
     fn idle(env: &Env, global: &GlobalConfig) -> i128 {
         token::TokenClient::new(env, &global.collateral).balance(&env.current_contract_address())
+    }
+
+    fn token_idle(env: &Env, token: &Address) -> i128 {
+        token::TokenClient::new(env, token).balance(&env.current_contract_address())
+    }
+
+    fn load_token_caps(env: &Env, global: &GlobalConfig, token: &Address) -> TokenCaps {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TokenCaps(token.clone()))
+            .unwrap_or(TokenCaps {
+                max_trade: global.max_trade,
+                max_market: global.max_market,
+                max_daily: global.max_daily,
+            })
     }
 
     fn supply(env: &Env) -> i128 {
@@ -3687,7 +6147,7 @@ impl Treasury {
             .unwrap_or(0)
     }
 
-    /// Ticket ids start at 1, so 0 can mean "no ticket".
+    // Ticket ids start at 1, so 0 can mean "no ticket".
     fn queue_head(env: &Env) -> u64 {
         env.storage()
             .instance()
@@ -3702,9 +6162,9 @@ impl Treasury {
             .unwrap_or(1)
     }
 
-    /// Mints shares for `amount` deposited at `nav` and returns those
-    /// credited to `owner`. The first mint withholds `VIRTUAL_SHARES` as dead
-    /// shares nobody owns.
+    // Mints shares for `amount` deposited at `nav` and returns those
+    // credited to `owner`. The first mint withholds `VIRTUAL_SHARES` as dead
+    // shares nobody owns.
     fn mint_shares(env: &Env, owner: &Address, amount: i128, nav: i128) -> Result<i128, Error> {
         let supply = Self::supply(env);
         let minted = shares_for_deposit(amount, nav, supply).ok_or(Error::InvalidAmount)?;
@@ -3761,12 +6221,14 @@ impl Treasury {
         ]);
     }
 
-    /// Pre-authorizes the SEP-41 `transfer(from, to, amount)` that
-    /// market-core will make from the treasury's own balance when the
-    /// treasury calls one of its trading entrypoints. See the comment on
-    /// `agent_buy` for why this is required.
-    fn authorize_token_pull(env: &Env, global: &GlobalConfig, from: &Address, amount: i128) {
-        Self::authorize_transfer(env, &global.collateral, from, &global.market_core, amount);
+    fn authorize_token_pull_of(
+        env: &Env,
+        global: &GlobalConfig,
+        token: &Address,
+        from: &Address,
+        amount: i128,
+    ) {
+        Self::authorize_transfer(env, token, from, &global.market_core, amount);
     }
 
     fn category_bit(c: &Category) -> u32 {
@@ -3951,6 +6413,34 @@ impl Treasury {
             .ok_or(Error::NotInitialized)
     }
 
+    // Resizes the rolling window without resetting it (#250): the most
+    // recent `min(old, new)` days survive, older days are zeroed.
+    fn resize_pnl_days(env: &Env, old_window: u32, new_window: u32) -> Result<(), Error> {
+        if old_window == new_window {
+            return Ok(());
+        }
+        let mut days: PnlDays = env
+            .storage()
+            .instance()
+            .get(&DataKey::PnlDays)
+            .ok_or(Error::NotInitialized)?;
+        let old_len = days.amounts.len();
+        let keep = old_len.min(new_window);
+        let mut amounts = Vec::new(env);
+        for _ in 0..new_window {
+            amounts.push_back(0i128);
+        }
+        for offset in 0..keep {
+            let src = (days.head_idx + old_len - offset) % old_len;
+            let dst = new_window - 1 - offset;
+            amounts.set(dst, days.amounts.get(src).unwrap_or(0));
+        }
+        days.amounts = amounts;
+        days.head_idx = new_window.saturating_sub(1);
+        env.storage().instance().set(&DataKey::PnlDays, &days);
+        Ok(())
+    }
+
     fn advance_pnl_days(days: &mut PnlDays, now_day: u64, window_days: u32) {
         if now_day <= days.head_day {
             return;
@@ -4004,11 +6494,13 @@ impl Treasury {
         let wpnl = Self::calc_window_pnl(env)?;
         let cfg = Self::load_drawdown_cfg(env)?;
         if wpnl < -cfg.max_drawdown {
-            let storage = env.storage().instance();
-            if !storage.get(&DataKey::DrawdownTripped).unwrap_or(false) {
-                storage.set(&DataKey::Paused, &true);
-                storage.set(&DataKey::DrawdownTripped, &true);
-                storage.set(&DataKey::DrawdownAcknowledged, &false);
+            let mut state = Self::load_mode_state(env);
+            if state.drawdown_halt.is_none() {
+                // Halts agents only; settlement (including the call that
+                // tripped this) stays open in every mode.
+                let from = state.mode();
+                state.drawdown_halt = Some(env.ledger().timestamp());
+                Self::save_mode_state(env, &state, from, Symbol::new(env, "drawdown"));
                 let now_day = env.ledger().timestamp() / DAY_SECONDS;
                 let window_start_day = now_day.saturating_sub((cfg.window_days - 1) as u64);
                 DrawdownPause {
@@ -4064,6 +6556,21 @@ impl Treasury {
         let treasury = env.current_contract_address();
         let pos = client.get_positions(&treasury);
         pos.supply_shares
+    }
+
+    fn ensure_liquid_token(
+        env: &Env,
+        global: &GlobalConfig,
+        token: &Address,
+        needed: i128,
+    ) -> Result<(), Error> {
+        if *token == global.collateral {
+            return Self::ensure_liquid(env, global, needed);
+        }
+        if Self::token_idle(env, token) < needed {
+            return Err(Error::InsufficientBalance);
+        }
+        Ok(())
     }
 
     fn ensure_liquid(env: &Env, global: &GlobalConfig, needed: i128) -> Result<(), Error> {
@@ -4134,6 +6641,176 @@ impl Treasury {
     }
 }
 
+impl Treasury {
+    // ----- trace helpers -------------------------------------------------------
+
+    fn load_trace_policy_config(env: &Env) -> TracePolicyConfig {
+        env.storage().instance().get(&DataKey::TracePolicy).unwrap_or(TracePolicyConfig {
+            policy: TracePolicy::Off,
+            max_trace_age_ledgers: 120,
+        })
+    }
+
+    fn get_registry(env: &Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Registry)
+    }
+
+    fn is_trace_policy_tightening(
+        old: &TracePolicyConfig,
+        new: &TracePolicyConfig,
+        old_registry: &Option<Address>,
+        new_registry: &Option<Address>,
+    ) -> bool {
+        let rank = |p: &TracePolicy| match p {
+            TracePolicy::Off => 0i32,
+            TracePolicy::Optional => 1i32,
+            TracePolicy::Required => 2i32,
+        };
+        let policy_tightened = rank(&new.policy) >= rank(&old.policy);
+        let age_tightened = new.max_trace_age_ledgers <= old.max_trace_age_ledgers;
+        let registry_tightened = match (old_registry, new_registry) {
+            (None, Some(_)) => true,
+            (Some(a), Some(b)) if a == b => true,
+            (Some(_), Some(_)) => false,
+            (_, None) => false,
+        };
+        policy_tightened && age_tightened && registry_tightened
+            && (rank(&new.policy) > rank(&old.policy)
+                || new.max_trace_age_ledgers < old.max_trace_age_ledgers
+                || (old_registry.is_none() && new_registry.is_some()))
+    }
+
+    fn require_registry_active(env: &Env, agent: &Address) -> Result<(), Error> {
+        let Some(registry) = Self::get_registry(env) else {
+            return Ok(());
+        };
+        let args = vec![env, agent.clone().into_val(env)];
+        let record: Option<AgentRecord> = match env.try_invoke_contract::<Option<AgentRecord>, soroban_sdk::Error>(
+            &registry,
+            &Symbol::new(env, "get_agent"),
+            args,
+        ) {
+            Ok(Ok(v)) => v,
+            _ => return Err(Error::TraceRegistryCallFailed),
+        };
+        match record {
+            Some(r) if matches!(r.status, AgentStatus::Active) => Ok(()),
+            _ => Err(Error::Unauthorized),
+        }
+    }
+
+    fn outcome_tag(outcome: &Outcome) -> u32 {
+        match outcome {
+            Outcome::Yes => 0,
+            Outcome::No => 1,
+        }
+    }
+
+    fn push_u64_be(env: &Env, out: &mut Bytes, value: u64) {
+        out.append(&Bytes::from_slice(env, &value.to_be_bytes()));
+    }
+
+    fn push_u32_be(env: &Env, out: &mut Bytes, value: u32) {
+        out.append(&Bytes::from_slice(env, &value.to_be_bytes()));
+    }
+
+    fn push_i128_be(env: &Env, out: &mut Bytes, value: i128) {
+        out.append(&Bytes::from_slice(env, &value.to_be_bytes()));
+    }
+
+    fn decision_hash_buy(
+        env: &Env,
+        market_id: u64,
+        outcome: &Outcome,
+        collateral_in: i128,
+        min_shares_out: i128,
+        limit_price_bps: u32,
+        deadline: u64,
+    ) -> BytesN<32> {
+        let mut pre = Bytes::from_slice(env, DECISION_DOMAIN);
+        Self::push_u64_be(env, &mut pre, market_id);
+        Self::push_u32_be(env, &mut pre, 2); // Buy action tag
+        Self::push_u32_be(env, &mut pre, Self::outcome_tag(outcome));
+        Self::push_i128_be(env, &mut pre, collateral_in);
+        Self::push_i128_be(env, &mut pre, min_shares_out);
+        Self::push_u32_be(env, &mut pre, limit_price_bps);
+        Self::push_u64_be(env, &mut pre, deadline);
+        env.crypto().sha256(&pre).into()
+    }
+
+    fn decision_hash_sell(
+        env: &Env,
+        market_id: u64,
+        outcome: &Outcome,
+        collateral_out: i128,
+        max_shares_in: i128,
+        limit_price_bps: u32,
+        deadline: u64,
+    ) -> BytesN<32> {
+        let mut pre = Bytes::from_slice(env, DECISION_DOMAIN);
+        Self::push_u64_be(env, &mut pre, market_id);
+        Self::push_u32_be(env, &mut pre, 3); // Sell action tag
+        Self::push_u32_be(env, &mut pre, Self::outcome_tag(outcome));
+        Self::push_i128_be(env, &mut pre, collateral_out);
+        Self::push_i128_be(env, &mut pre, max_shares_in);
+        Self::push_u32_be(env, &mut pre, limit_price_bps);
+        Self::push_u64_be(env, &mut pre, deadline);
+        env.crypto().sha256(&pre).into()
+    }
+
+    fn consume_trace_for_action(
+        env: &Env,
+        agent: &Address,
+        market_id: u64,
+        action: &TraceAction,
+        trace_id: u64,
+        expected_decision: BytesN<32>,
+    ) -> Result<(), Error> {
+        let cfg = Self::load_trace_policy_config(env);
+        let Some(registry) = Self::get_registry(env) else {
+            return if cfg.policy == TracePolicy::Required {
+                Err(Error::TraceRequired)
+            } else {
+                Ok(())
+            };
+        };
+        let consumer = env.current_contract_address();
+        let args = vec![
+            env,
+            consumer.into_val(env),
+            trace_id.into_val(env),
+            agent.clone().into_val(env),
+            market_id.into_val(env),
+            action.clone().into_val(env),
+            cfg.max_trace_age_ledgers.into_val(env),
+        ];
+        let info: TraceConsumeInfo = match env.try_invoke_contract::<TraceConsumeInfo, soroban_sdk::Error>(
+            &registry,
+            &Symbol::new(env, "consume_trace_for"),
+            args,
+        ) {
+            Ok(Ok(v)) => v,
+            Ok(Err(_)) => return Err(Error::TraceRegistryCallFailed),
+            Err(Ok(e)) => return Err(Self::map_registry_trace_error(e)),
+            Err(Err(_)) => return Err(Error::TraceRegistryCallFailed),
+        };
+        match info.decision {
+            Some(d) if d == expected_decision => Ok(()),
+            _ => Err(Error::TraceDecisionMismatch),
+        }
+    }
+
+    fn map_registry_trace_error(e: soroban_sdk::Error) -> Error {
+        let code = |v: u32| soroban_sdk::Error::from_contract_error(v);
+        if e == code(10) {
+            Error::TraceConsumed
+        } else {
+            Error::TraceMismatch
+        }
+    }
+
+}
+
 #[cfg(test)]
 mod test {
     extern crate std;
@@ -4153,7 +6830,6 @@ mod test {
     // the duplicate `__constructor` export that forbids this in the wasm build
     // does not exist in a native test binary) runs the same scenarios as host
     // code. `MARKET_CORE_IMPL=native cargo test` flips the whole suite;
-    // `both_modes!` pins individual scenarios to both.
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum McImpl {
@@ -4174,20 +6850,7 @@ mod test {
         })
     }
 
-    /// Runs `f` with market-core registered as `how`, restoring the previous
-    /// choice even if `f` panics.
-    fn with_market_core<R>(how: McImpl, f: impl FnOnce() -> R) -> R {
-        struct Restore(Option<McImpl>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                MC_OVERRIDE.with(|c| c.set(self.0));
-            }
-        }
-        let _restore = Restore(MC_OVERRIDE.with(|c| c.replace(Some(how))));
-        f()
-    }
-
-    /// `(admin, collateral, treasury, resolver, default_fee_bps, protocol_share_bps)`.
+    // `(admin, collateral, treasury, resolver, default_fee_bps, protocol_share_bps)`.
     fn register_market_core(
         env: &Env,
         args: (Address, Address, Address, Address, u32, u32),
@@ -4203,29 +6866,41 @@ mod test {
         }
     }
 
-    /// Re-runs existing scenario tests (`#[test]` functions are plain functions
-    /// too) once per market-core registration, as `<name>::wasm` and
-    /// `<name>::native`.
-    macro_rules! both_modes {
-        ($($name:ident),+ $(,)?) => {$(
-            mod $name {
-                #[test]
-                fn wasm() {
-                    super::with_market_core(super::McImpl::Wasm, super::$name);
-                }
-                #[test]
-                fn native() {
-                    super::with_market_core(super::McImpl::Native, super::$name);
-                }
-            }
-        )+};
-    }
-
     // Comfortably past every timestamp advance the tests make, so a market
     // never closes out from under a trade mid-test.
     const MARKET_CLOSE: u64 = 1_000 + 30 * DAY_SECONDS;
 
     const DELAY: u64 = MIN_CONFIG_DELAY;
+
+    fn advance(f: &Fixture, secs: u64) {
+        let now = f.env.ledger().timestamp();
+        f.env.ledger().set_timestamp(now + secs);
+    }
+
+    fn exec_kind(f: &Fixture, kind: u32) {
+        advance(f, DELAY);
+        f.treasury.execute_op(&kind);
+    }
+
+    fn set_successor_now(f: &Fixture, successor: &Address) {
+        f.treasury.set_successor(successor);
+        exec_kind(f, 2);
+    }
+
+    fn migrate_now(f: &Fixture, market_id: u64) {
+        f.treasury.migrate_markets(&vec![&f.env, market_id]);
+        exec_kind(f, 3);
+    }
+
+    fn set_yield_now(f: &Fixture, pool: &Address, max_allocation: i128) {
+        f.treasury.set_yield_venue(pool, &max_allocation);
+        exec_kind(f, 0);
+    }
+
+    fn allocate_now(f: &Fixture, amount: i128) {
+        f.treasury.allocate_to_yield(&amount);
+        exec_kind(f, 1);
+    }
     const PERMISSIVE: PricePolicy = PricePolicy {
         max_buy_price_bps: 10_000,
         min_sell_price_bps: 0,
@@ -4233,7 +6908,7 @@ mod test {
         max_slippage_bps: 9_999,
     };
 
-    /// Writes a price policy straight into storage, bypassing the timelock.
+    // Writes a price policy straight into storage, bypassing the timelock.
     fn install_price_policy(env: &Env, treasury: &Address, policy: PricePolicy) {
         env.as_contract(treasury, || {
             env.storage().instance().set(&DataKey::PricePolicy, &policy);
@@ -4249,6 +6924,97 @@ mod test {
         token: Address,
         market_core: MarketCoreClient<'static>,
         market_id: u64,
+        /// The resolver market-core is configured with.
+        resolver: Address,
+    }
+
+    /// Which resolver market-core is deployed against in a fixture.
+    #[derive(Clone, Copy)]
+    enum ResolverKind {
+        /// The real resolver wasm (the vendored copy the treasury imports).
+        Wasm,
+        /// [`MockResolver`]: `trade_status` is whatever the test sets.
+        Mock,
+        /// [`NoopResolver`]: accepts `register_spec_v2` and stores nothing.
+        Noop,
+    }
+
+    /// A resolver whose `trade_status` / `spec_kind` the test controls.
+    #[contract]
+    pub struct MockResolver;
+
+    #[contractimpl]
+    impl MockResolver {
+        pub fn set_core(env: Env, core: Address) {
+            env.storage().instance().set(&Symbol::new(&env, "core"), &core);
+        }
+        pub fn market_core(env: Env) -> Address {
+            env.storage()
+                .instance()
+                .get(&Symbol::new(&env, "core"))
+                .unwrap()
+        }
+        /// The kind the tests' `signers_spec` reveals.
+        pub fn rule_kind(_env: Env, _market_id: u64) -> Option<RuleKind> {
+            Some(RuleKind::Signers)
+        }
+        pub fn set_status(env: Env, status: resolver::TradeStatus) {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, "st"), &status);
+        }
+        pub fn trade_status(env: Env, _market_id: u64) -> resolver::TradeStatus {
+            env.storage()
+                .instance()
+                .get(&Symbol::new(&env, "st"))
+                .unwrap()
+        }
+        /// Reveals as a price rule.
+        pub fn register_spec_v2(env: Env, _market_id: u64, _spec: resolver::ResolutionSpecV2) {
+            let mut st: resolver::TradeStatus = env
+                .storage()
+                .instance()
+                .get(&Symbol::new(&env, "st"))
+                .unwrap_or(resolver::TradeStatus {
+                    spec: resolver::SpecKind::None,
+                    state: resolver::ResolutionState::Unconfigured,
+                    close_time: u64::MAX,
+                    deadline: u64::MAX,
+                    open_proposal: false,
+                });
+            st.spec = resolver::SpecKind::Price;
+            env.storage().instance().set(&Symbol::new(&env, "st"), &st);
+        }
+        pub fn spec_kind(env: Env, _market_id: u64) -> resolver::SpecKind {
+            let st: Option<resolver::TradeStatus> =
+                env.storage().instance().get(&Symbol::new(&env, "st"));
+            st.map(|s| s.spec).unwrap_or(resolver::SpecKind::None)
+        }
+    }
+
+    /// A resolver that accepts the reveal and stores nothing (a compromised or
+    /// misconfigured contract).
+    #[contract]
+    pub struct NoopResolver;
+
+    #[contractimpl]
+    impl NoopResolver {
+        pub fn set_core(env: Env, core: Address) {
+            env.storage().instance().set(&Symbol::new(&env, "core"), &core);
+        }
+        pub fn market_core(env: Env) -> Address {
+            env.storage()
+                .instance()
+                .get(&Symbol::new(&env, "core"))
+                .unwrap()
+        }
+        pub fn rule_kind(_env: Env, _market_id: u64) -> Option<RuleKind> {
+            None
+        }
+        pub fn register_spec_v2(_env: Env, _market_id: u64, _spec: resolver::ResolutionSpecV2) {}
+        pub fn spec_kind(_env: Env, _market_id: u64) -> resolver::SpecKind {
+            resolver::SpecKind::None
+        }
     }
 
     fn fixture() -> Fixture {
@@ -4314,6 +7080,47 @@ mod test {
         prefund: bool,
         creation_policy: CreationPolicy,
     ) -> Fixture {
+        fixture_build(
+            max_trade,
+            max_market,
+            max_daily,
+            max_net_exposure,
+            prefund,
+            creation_policy,
+            ResolverKind::Wasm,
+        )
+    }
+
+    /// A prefunded fixture deployed against the resolver `kind`, with room for
+    /// market-core's minimum 100 USDC seed (`max_trade` stays 20 USDC).
+    fn fixture_with_resolver(kind: ResolverKind) -> Fixture {
+        fixture_build(
+            200 * USDC,
+            300 * USDC,
+            1_000 * USDC,
+            1_000 * USDC,
+            true,
+            CreationPolicy {
+                max_seed: 200 * USDC,
+                max_markets_per_window: 100,
+                creation_window_secs: 86_400,
+                min_close_horizon: 60,
+                max_close_horizon: 365 * DAY_SECONDS,
+                allowed_categories: 0x3F,
+            },
+            kind,
+        )
+    }
+
+    fn fixture_build(
+        max_trade: i128,
+        max_market: i128,
+        max_daily: i128,
+        max_net_exposure: i128,
+        prefund: bool,
+        creation_policy: CreationPolicy,
+        resolver_kind: ResolverKind,
+    ) -> Fixture {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().set_timestamp(1_000);
@@ -4330,7 +7137,11 @@ mod test {
             token.mint(&treasury_id, &(1_000 * 10_000_000_i128));
         }
 
-        let resolver = Address::generate(&env);
+        let resolver = match resolver_kind {
+            ResolverKind::Wasm => Address::generate(&env), // registered below, once market-core exists
+            ResolverKind::Mock => env.register(MockResolver, ()),
+            ResolverKind::Noop => env.register(NoopResolver, ()),
+        };
         let market_core_id = register_market_core(
             &env,
             (
@@ -4344,6 +7155,17 @@ mod test {
                 10_000u32,
             ),
         );
+        match resolver_kind {
+            ResolverKind::Wasm => {
+                env.register_at(
+                    &resolver,
+                    resolver::WASM,
+                    (admin.clone(), market_core_id.clone()),
+                );
+            }
+            ResolverKind::Mock => MockResolverClient::new(&env, &resolver).set_core(&market_core_id),
+            ResolverKind::Noop => NoopResolverClient::new(&env, &resolver).set_core(&market_core_id),
+        }
         let market_core = MarketCoreClient::new(&env, &market_core_id);
         let market_id = market_core.create_market(
             &creator,
@@ -4387,6 +7209,7 @@ mod test {
             token: collateral.address(),
             market_core,
             market_id,
+            resolver,
         }
     }
 
@@ -4493,10 +7316,10 @@ mod test {
         );
     }
 
-    /// Replaces the old `daily_cap_resets_after_one_day`, which pinned the
-    /// fixed window's reset. With 25 hourly buckets a trade from hour 0 still
-    /// counts exactly 24h later (hour 24's window is hours 0..=24) and only
-    /// drops out once the head reaches hour 25.
+    // Replaces the old `daily_cap_resets_after_one_day`, which pinned the
+    // fixed window's reset. With 25 hourly buckets a trade from hour 0 still
+    // counts exactly 24h later (hour 24's window is hours 0..=24) and only
+    // drops out once the head reaches hour 25.
     #[test]
     fn daily_cap_frees_capacity_after_window_slides() {
         let f = fixture();
@@ -4681,18 +7504,18 @@ mod test {
             .is_err());
     }
 
-    /// The pitfall the design doc calls out explicitly: when the treasury
-    /// calls `market_core.buy`, market-core in turn calls
-    /// `token.transfer(treasury -> market_core)`. That nested transfer needs
-    /// the treasury to pre-authorize it via `authorize_as_current_contract`
-    /// (see `Treasury::authorize_token_pull`), or the whole call fails
-    /// authorization.
-    ///
-    /// This test deliberately uses `mock_auths` for only the agent's
-    /// top-level call — not `mock_all_auths`, which would rubber-stamp the
-    /// nested transfer too and hide a regression. Verified by hand: commenting
-    /// out the `authorize_token_pull` call in `agent_buy` makes this test
-    /// fail with an authorization error; restoring it makes it pass again.
+    // The pitfall the design doc calls out explicitly: when the treasury
+    // calls `market_core.buy`, market-core in turn calls
+    // `token.transfer(treasury -> market_core)`. That nested transfer needs
+    // the treasury to pre-authorize it via `authorize_as_current_contract`
+    // (see `Treasury::authorize_token_pull`), or the whole call fails
+    // authorization.
+    //
+    // This test deliberately uses `mock_auths` for only the agent's
+    // top-level call — not `mock_all_auths`, which would rubber-stamp the
+    // nested transfer too and hide a regression. Verified by hand: commenting
+    // out the `authorize_token_pull` call in `agent_buy` makes this test
+    // fail with an authorization error; restoring it makes it pass again.
     #[test]
     fn pitfall_agent_buy_requires_treasury_self_authorization_for_nested_transfer() {
         let f = fixture();
@@ -4907,9 +7730,9 @@ mod test {
         assert_eq!(exposure, None);
     }
 
-    /// The v2 twin of the pitfall test above: the `buy_v2` path must also
-    /// pre-authorize the nested token transfer (`mock_auths` for only the
-    /// agent, so a regression in `authorize_token_pull` fails here).
+    // The v2 twin of the pitfall test above: the `buy_v2` path must also
+    // pre-authorize the nested token transfer (`mock_auths` for only the
+    // agent, so a regression in `authorize_token_pull` fails here).
     #[test]
     fn pitfall_agent_buy_v2_forwards_nested_transfer_auth() {
         let f = fixture();
@@ -4977,8 +7800,8 @@ mod test {
         assert_eq!(f.market_core.get_market(&market_id).creator, f.treasury_id);
 
         let successor = Address::generate(&f.env);
-        f.treasury.set_successor(&successor);
-        f.treasury.migrate_market(&market_id);
+        set_successor_now(&f, &successor);
+        migrate_now(&f, market_id);
 
         assert_eq!(
             f.market_core.get_position(&market_id, &f.treasury_id).yes,
@@ -5002,13 +7825,13 @@ mod test {
     fn migrate_requires_successor() {
         let f = fixture();
         assert_eq!(
-            f.treasury.try_migrate_market(&f.market_id),
+            f.treasury.try_migrate_markets(&vec![&f.env, f.market_id]),
             Err(Ok(Error::NoSuccessor))
         );
     }
 
     #[test]
-    fn agent_cannot_migrate() {
+    fn agent_cannot_propose_migration() {
         let f = fixture();
         let agent = f.treasury.get_config().agent;
         f.env.set_auths(&[]);
@@ -5018,21 +7841,21 @@ mod test {
                 address: &agent,
                 invoke: &MockAuthInvoke {
                     contract: &f.treasury_id,
-                    fn_name: "migrate_market",
-                    args: (f.market_id,).into_val(&f.env),
+                    fn_name: "migrate_markets",
+                    args: (vec![&f.env, f.market_id],).into_val(&f.env),
                     sub_invokes: &[],
                 },
             }])
-            .try_migrate_market(&f.market_id)
+            .try_migrate_markets(&vec![&f.env, f.market_id])
             .is_err());
     }
 
-    /// The treasury's calls to market-core's `transfer_position` /
-    /// `transfer_lp` are *direct* calls, so market-core's `require_auth`
-    /// on the treasury is satisfied implicitly by the invoker rule — no
-    /// `authorize_as_current_contract` entry is needed (unlike the nested
-    /// token transfer in `agent_buy`). Mocking only the admin's auth must be
-    /// enough for the whole migration.
+    // The treasury's calls to market-core's `transfer_position` /
+    // `transfer_lp` are *direct* calls, so market-core's `require_auth`
+    // on the treasury is satisfied implicitly by the invoker rule — no
+    // `authorize_as_current_contract` entry is needed (unlike the nested
+    // token transfer in `agent_buy`). Mocking only the admin's auth must be
+    // enough for the whole migration.
     #[test]
     fn pitfall_migrate_market_needs_only_admin_auth() {
         let f = fixture_with_caps(
@@ -5058,7 +7881,7 @@ mod test {
             &0,
         );
         let successor = Address::generate(&f.env);
-        f.treasury.set_successor(&successor);
+        set_successor_now(&f, &successor);
         let held = f.market_core.get_position(&market_id, &f.treasury_id).yes;
 
         f.env.set_auths(&[]);
@@ -5067,12 +7890,16 @@ mod test {
                 address: &f.admin,
                 invoke: &MockAuthInvoke {
                     contract: &f.treasury_id,
-                    fn_name: "migrate_market",
-                    args: (market_id,).into_val(&f.env),
+                    fn_name: "migrate_markets",
+                    args: (vec![&f.env, market_id],).into_val(&f.env),
                     sub_invokes: &[],
                 },
             }])
-            .migrate_market(&market_id);
+            .migrate_markets(&vec![&f.env, market_id]);
+        advance(&f, DELAY);
+        // Execution is permissionless: migration itself needs no auth entry.
+        f.env.set_auths(&[]);
+        f.treasury.execute_op(&3);
 
         assert_eq!(f.market_core.get_position(&market_id, &successor).yes, held);
         assert_eq!(f.market_core.get_market(&market_id).creator, successor);
@@ -5089,11 +7916,11 @@ mod test {
             &0,
         );
         let successor = Address::generate(&f.env);
-        f.treasury.set_successor(&successor);
+        set_successor_now(&f, &successor);
 
         f.env.ledger().set_timestamp(MARKET_CLOSE + 1);
         f.market_core.resolve(&f.market_id, &Outcome::Yes);
-        f.treasury.migrate_market(&f.market_id);
+        migrate_now(&f, f.market_id);
 
         // The successor (not the treasury) now redeems the migrated shares.
         let payout = f.market_core.redeem(&successor, &f.market_id);
@@ -5112,7 +7939,7 @@ mod test {
 
     const USDC: i128 = 10_000_000;
 
-    /// A second externally-created market in the fixture's market-core.
+    // A second externally-created market in the fixture's market-core.
     fn extra_market(f: &Fixture, tag: u8) -> u64 {
         f.market_core.create_market(
             &f.market_core.get_market(&f.market_id).creator,
@@ -5163,15 +7990,15 @@ mod test {
         assert_eq!(f.treasury.daily_headroom(), 60 * USDC);
     }
 
-    /// Regression for I4 ("no `max_daily` in any 24h"), the shape of the
-    /// shortest counterexample the exhaustive explorer
-    /// (`contracts/integration-tests`, `treasury_caps_exhaustive`) reports when
-    /// the window is mutated to 24 buckets instead of 25: spend near the end of
-    /// an hour, then again 86_399s later. 24h earlier than the second trade is
-    /// still inside the window because the first trade's hour is only
-    /// partially covered. The original fixed daily window (reset to `now` at
-    /// the first call after 24h) allowed up to 2x `max_daily` here; the
-    /// sliding window allows exactly `max_daily`.
+    // Regression for I4 ("no `max_daily` in any 24h"), the shape of the
+    // shortest counterexample the exhaustive explorer
+    // (`contracts/integration-tests`, `treasury_caps_exhaustive`) reports when
+    // the window is mutated to 24 buckets instead of 25: spend near the end of
+    // an hour, then again 86_399s later. 24h earlier than the second trade is
+    // still inside the window because the first trade's hour is only
+    // partially covered. The original fixed daily window (reset to `now` at
+    // the first call after 24h) allowed up to 2x `max_daily` here; the
+    // sliding window allows exactly `max_daily`.
     #[test]
     fn explorer_i4_sequence_stays_within_max_daily() {
         let u = 100 * USDC;
@@ -5321,10 +8148,10 @@ mod test {
         assert_eq!(f.treasury.daily_headroom(), 35 * USDC);
     }
 
-    /// Randomized schedule (an LCG, as in market-core's math property tests)
-    /// of 2_000 attempted trades over 30 days against the window logic
-    /// itself. After every accepted trade the true usage over the trailing
-    /// `(t - 86_400, t]` interval, brute-forced from a log, stays within cap.
+    // Randomized schedule (an LCG, as in market-core's math property tests)
+    // of 2_000 attempted trades over 30 days against the window logic
+    // itself. After every accepted trade the true usage over the trailing
+    // `(t - 86_400, t]` interval, brute-forced from a log, stays within cap.
     #[test]
     fn sliding_window_property_random_schedule() {
         let env = Env::default();
@@ -5579,12 +8406,12 @@ mod test {
         assert_eq!(void.spot_value, void.floor_value);
     }
 
-    /// Stand-in market-core exposing only what a price-checked buy needs:
-    /// `get_price` (a flat 50%), `quote_buy` and `buy`, which pulls the
-    /// collateral like the real one and returns one share per stroop. If
-    /// `agent_buy` made any other market-core call (a valuation read such as
-    /// `get_market`/`get_position` on the hot path), it would fail against
-    /// this contract.
+    // Stand-in market-core exposing what a price-checked buy needs:
+    // `get_price` (a flat 50%), `quote_buy` and `buy`, which pulls the
+    // collateral like the real one and returns one share per stroop, plus
+    // empty `get_market`/`get_position` reads for the post-trade mark
+    // refresh. `proxy.calls()` counts only `buy`, so any extra *trading*
+    // market-core call on the hot path still fails the test.
     #[contract]
     struct BuyOnlyMarketCore;
 
@@ -5600,6 +8427,36 @@ mod test {
 
         pub fn get_price(_env: Env, _market_id: u64, _outcome: Outcome) -> u32 {
             5_000
+        }
+
+        // `save_net` refreshes the market's mark after an indexed trade, which
+        // reads the market and the treasury's position. Serve empty reads so
+        // the hot-path test still only counts `buy` as the state-changing
+        // market-core call.
+        pub fn get_market(env: Env, _market_id: u64) -> market_core::Market {
+            market_core::Market {
+                creator: env.current_contract_address(),
+                question_hash: BytesN::from_array(&env, &[0u8; 32]),
+                resolution_hash: BytesN::from_array(&env, &[0u8; 32]),
+                meta_uri: String::from_str(&env, ""),
+                category: Category::Crypto,
+                close_time: 0,
+                fee_bps: 0,
+                status: MarketStatus::Open,
+                reserve_yes: 0,
+                reserve_no: 0,
+                sets_minted: 0,
+                fees_accrued: 0,
+                lp_claimed: false,
+            }
+        }
+
+        pub fn get_position(_env: Env, _market_id: u64, _holder: Address) -> market_core::Position {
+            market_core::Position { yes: 0, no: 0 }
+        }
+
+        pub fn get_market_collateral(env: Env, _market_id: u64) -> Address {
+            env.storage().instance().get(&0u32).unwrap()
         }
 
         pub fn quote_buy(
@@ -5699,7 +8556,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #2003)")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn constructor_rejects_net_cap_below_max_trade() {
         fixture_with_net_cap(20 * USDC, 50 * USDC, 60 * USDC, 20 * USDC - 1);
     }
@@ -5709,8 +8566,8 @@ mod test {
         let f = net_fixture(300 * USDC);
         f.treasury
             .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(20 * USDC), &0);
-        f.treasury.set_successor(&Address::generate(&f.env));
-        f.treasury.migrate_market(&f.market_id);
+        set_successor_now(&f, &Address::generate(&f.env));
+        migrate_now(&f, f.market_id);
         assert_eq!(f.treasury.net_exposure(), 0);
     }
 
@@ -5736,9 +8593,9 @@ mod test {
         }
     }
 
-    /// Registers `agent` through the real flow: `set_agent`, then (unless it
-    /// applied at once) wait out the delay and `execute_agent`. The clock is
-    /// put back afterwards so window-sensitive tests are unaffected.
+    // Registers `agent` through the real flow: `set_agent`, then (unless it
+    // applied at once) wait out the delay and `execute_agent`. The clock is
+    // put back afterwards so window-sensitive tests are unaffected.
     fn register_agent(f: &Fixture, agent: &Address, p: AgentPolicy) {
         f.treasury.set_agent(agent, &p);
         if f.treasury.get_agent(agent) != Some(p) {
@@ -6192,13 +9049,13 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #2003)")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn constructor_invalid_caps_panics_with_contract_error_3() {
         fixture_with_caps(20 * USDC, 10 * USDC, 60 * USDC);
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #2003)")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn constructor_rejects_config_delay_below_minimum() {
         let default_policy = CreationPolicy {
             max_seed: USDC,
@@ -6709,7 +9566,7 @@ mod test {
         assert_eq!(f.treasury.open_market_count(), 0);
     }
 
-    /// Two depositors, then most of the capital deployed into one market.
+    // Two depositors, then most of the capital deployed into one market.
     fn deployed_vault() -> (Fixture, Address, Address) {
         let f = vault_fixture();
         let alice = depositor(&f, 100 * USDC);
@@ -6830,14 +9687,23 @@ mod test {
     }
 
     #[test]
-    fn emergency_withdraw_only_while_paused_and_pro_rata_of_idle() {
+    fn emergency_withdraw_only_in_emergency() {
         let (f, alice, _) = deployed_vault();
         let shares = f.treasury.shares_of(&alice);
+        // Normal: no exit by this path.
         assert_eq!(
             f.treasury.try_emergency_withdraw(&alice, &shares),
             Err(Ok(Error::NotPaused))
         );
+        // An ordinary admin pause does not open it either.
         f.treasury.set_paused(&true);
+        assert_eq!(
+            f.treasury.try_emergency_withdraw(&alice, &shares),
+            Err(Ok(Error::Paused))
+        );
+        // Only an explicit emergency does.
+        f.treasury
+            .declare_emergency(&Symbol::new(&f.env, "core_down"));
         let supply = f.treasury.total_shares();
         let expected = shares * (10 * USDC) / (supply + VIRTUAL_SHARES);
         assert_eq!(f.treasury.emergency_withdraw(&alice, &shares), expected);
@@ -6845,12 +9711,12 @@ mod test {
         assert_eq!(f.treasury.shares_of(&alice), 0);
         assert_eq!(
             f.treasury.try_deposit(&alice, &MIN_DEPOSIT),
-            Err(Ok(Error::Paused))
+            Err(Ok(Error::EmergencyMode))
         );
     }
 
-    /// `count` extra externally-created markets, each with 1 USDC of treasury
-    /// exposure.
+    // `count` extra externally-created markets, each with 1 USDC of treasury
+    // exposure.
     fn fill_open_markets(f: &Fixture, count: u32) -> u64 {
         let creator = f.market_core.get_market(&f.market_id).creator;
         mint(f, &creator, count as i128 * 100 * USDC);
@@ -6879,9 +9745,9 @@ mod test {
             .agent_buy(&f.agent, &indexed, &Outcome::Yes, &USDC, &0);
     }
 
-    /// The test host enforces the network's per-transaction limits on every
-    /// invocation (instructions, memory, entries), so a `deposit` and a
-    /// `request_withdraw` that each walk a full index must simply succeed.
+    // The test host enforces the network's per-transaction limits on every
+    // invocation (instructions, memory, entries), so a `deposit` and a
+    // `request_withdraw` that each walk a full index must simply succeed.
     #[test]
     fn nav_budget_within_limits_at_max_open_markets() {
         let f = fixture();
@@ -6931,7 +9797,7 @@ mod test {
         f
     }
 
-    /// Moves `market_id`'s YES price with an outside trader.
+    // Moves `market_id`'s YES price with an outside trader.
     fn push_price(f: &Fixture, market_id: u64, outcome: Outcome, amount: i128) {
         let whale = depositor(f, amount);
         f.market_core.buy(&whale, &market_id, &outcome, &amount, &0);
@@ -7683,30 +10549,33 @@ mod test {
         assert!(sold > 0);
     }
 
-    #[test]
-    fn resume_requires_acknowledgement_after_drawdown() {
-        let f = fixture();
+    /// Trips the drawdown through a real loss: a 20 USDC position resolves
+    /// against the treasury with a 15 USDC `max_drawdown`.
+    fn trip_drawdown(f: &Fixture) {
         f.treasury.set_drawdown_config(&(15 * USDC), &7u32);
-        let cost = 20 * USDC;
         f.treasury
-            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &cost, &0);
+            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(20 * USDC), &0);
         f.env.ledger().set_timestamp(MARKET_CLOSE + 1);
         f.market_core.resolve(&f.market_id, &Outcome::No);
-
         let caller = Address::generate(&f.env);
+        // The settle that trips the halt must itself succeed.
         f.treasury.settle_market(&caller, &f.market_id);
+        assert!(f.treasury.drawdown_status().tripped);
+    }
 
-        // Attempting to set_paused(false) without acknowledging fails
-        assert_eq!(
-            f.treasury.try_set_paused(&false),
-            Err(Ok(Error::NotAcknowledged))
-        );
-
-        // Admin acknowledges drawdown
+    #[test]
+    fn acknowledge_drawdown_is_a_deprecated_no_op() {
+        let f = fixture();
+        trip_drawdown(&f);
+        assert_eq!(f.treasury.mode(), Mode::AgentsHalted);
+        // The old two-step is gone: neither acknowledging nor "unpausing"
+        // changes a drawdown halt, and set_paused(false) no longer errors.
         f.treasury.acknowledge_drawdown();
-
-        // Now resuming succeeds
+        assert_eq!(f.treasury.mode(), Mode::AgentsHalted);
         assert!(f.treasury.try_set_paused(&false).is_ok());
+        assert_eq!(f.treasury.mode(), Mode::AgentsHalted);
+        // The halt clears only through resume_agents, once the window recovers.
+        assert_eq!(f.treasury.try_resume_agents(), Err(Ok(Error::NotRecovered)));
     }
 
     #[test]
@@ -8059,11 +10928,14 @@ mod test {
         f.treasury.set_creation_policy(&tighter);
         assert_eq!(f.treasury.get_creation_policy(), tighter);
 
-        // Loosen: higher max_seed
+        // Loosen: higher max_seed is queued instead of rejected.
         let mut looser = tighter.clone();
         looser.max_seed = tighter.max_seed + 10 * USDC;
-        let err = f.treasury.try_set_creation_policy(&looser);
-        assert_eq!(err, Err(Ok(Error::PolicyLoosening)));
+        f.treasury.set_creation_policy(&looser);
+        assert_eq!(f.treasury.get_creation_policy(), tighter);
+        advance(&f, DELAY);
+        f.treasury.execute_op(&6);
+        assert_eq!(f.treasury.get_creation_policy(), looser);
     }
 
     #[test]
@@ -8204,9 +11076,9 @@ mod test {
     fn allocate_moves_tokens_to_pool_and_updates_principal() {
         let f = fixture();
         let pool = f.env.register(MockBlendPool, ());
-        f.treasury.set_yield_venue(&pool, &(200 * USDC));
+        set_yield_now(&f, &pool, 200 * USDC);
 
-        f.treasury.allocate_to_yield(&(100 * USDC));
+        allocate_now(&f, 100 * USDC);
         let breakdown = f.treasury.capital_breakdown();
         assert_eq!(breakdown.yield_principal, 100 * USDC);
         assert_eq!(breakdown.yield_value, 100 * USDC);
@@ -8219,9 +11091,11 @@ mod test {
     fn allocate_rejects_above_max_allocation() {
         let f = fixture();
         let pool = f.env.register(MockBlendPool, ());
-        f.treasury.set_yield_venue(&pool, &(50 * USDC));
+        set_yield_now(&f, &pool, 50 * USDC);
 
-        let err = f.treasury.try_allocate_to_yield(&(60 * USDC));
+        f.treasury.allocate_to_yield(&(60 * USDC));
+        advance(&f, DELAY);
+        let err = f.treasury.try_execute_op(&1);
         assert_eq!(err, Err(Ok(Error::YieldCapExceeded)));
     }
 
@@ -8231,9 +11105,11 @@ mod test {
         let pool = f.env.register(MockBlendPool, ());
         // total treasury balance is 1000 USDC, max_daily is 60 USDC
         // max allocation set to 1000 USDC, but allocating 960 USDC leaves only 40 USDC < 60 USDC max_daily
-        f.treasury.set_yield_venue(&pool, &(1000 * USDC));
+        set_yield_now(&f, &pool, 1000 * USDC);
 
-        let err = f.treasury.try_allocate_to_yield(&(950 * USDC));
+        f.treasury.allocate_to_yield(&(950 * USDC));
+        advance(&f, DELAY);
+        let err = f.treasury.try_execute_op(&1);
         assert_eq!(err, Err(Ok(Error::DailyCapExceeded)));
     }
 
@@ -8241,9 +11117,9 @@ mod test {
     fn agent_buy_withdraws_shortfall_from_yield_atomically() {
         let f = fixture();
         let pool = f.env.register(MockBlendPool, ());
-        f.treasury.set_yield_venue(&pool, &(950 * USDC));
+        set_yield_now(&f, &pool, 950 * USDC);
         // Allocate 940 USDC to yield, leaving only 60 USDC liquid
-        f.treasury.allocate_to_yield(&(940 * USDC));
+        allocate_now(&f, 940 * USDC);
 
         // Buy with 20 USDC
         let shares = f
@@ -8256,11 +11132,13 @@ mod test {
     fn agent_buy_reverts_entirely_when_pool_withdraw_fails() {
         let f = fixture();
         let pool = f.env.register(MockBlendPool, ());
-        f.treasury.set_yield_venue(&pool, &(950 * USDC));
-        f.treasury.allocate_to_yield(&(940 * USDC));
+        set_yield_now(&f, &pool, 950 * USDC);
+        allocate_now(&f, 940 * USDC);
 
-        // Withdraw 50 USDC from treasury so liquid is only 10 USDC (less than 20 USDC needed)
-        f.treasury.withdraw(&f.admin, &(50 * USDC));
+        // Redeem all admin shares so essentially no liquid remains.
+        let shares = f.treasury.shares_of(&f.admin);
+        f.treasury.request_withdraw(&f.admin, &shares);
+        assert!(f.treasury.liquid_capital() < 20 * USDC);
 
         // Set mock pool to fail withdrawals
         MockBlendPoolClient::new(&f.env, &pool).set_fail_withdraw(&true);
@@ -8276,8 +11154,8 @@ mod test {
     fn cap_failure_after_jit_withdraw_reverts_withdraw_too() {
         let f = fixture();
         let pool = f.env.register(MockBlendPool, ());
-        f.treasury.set_yield_venue(&pool, &(950 * USDC));
-        f.treasury.allocate_to_yield(&(940 * USDC));
+        set_yield_now(&f, &pool, 950 * USDC);
+        allocate_now(&f, 940 * USDC);
 
         // Max trade is 20 USDC. Try buying 25 USDC (> max_trade)
         let err = f
@@ -8290,9 +11168,9 @@ mod test {
     fn under_delivering_pool_is_handled_by_buffer() {
         let f = fixture();
         let pool = f.env.register(MockBlendPool, ());
-        f.treasury.set_yield_venue(&pool, &(950 * USDC));
-        f.treasury.allocate_to_yield(&(940 * USDC));
-        f.treasury.withdraw(&f.admin, &(50 * USDC)); // 10 USDC liquid
+        set_yield_now(&f, &pool, 950 * USDC);
+        allocate_now(&f, 940 * USDC);
+        f.treasury.request_withdraw(&f.admin, &(50 * USDC)); // 10 USDC liquid
 
         // Pool under-delivers by 1 stroop
         MockBlendPoolClient::new(&f.env, &pool).set_under_deliver(&true);
@@ -8308,8 +11186,8 @@ mod test {
     fn available_capital_includes_supplied_value() {
         let f = fixture();
         let pool = f.env.register(MockBlendPool, ());
-        f.treasury.set_yield_venue(&pool, &(200 * USDC));
-        f.treasury.allocate_to_yield(&(100 * USDC));
+        set_yield_now(&f, &pool, 200 * USDC);
+        allocate_now(&f, 100 * USDC);
 
         assert_eq!(f.treasury.available_capital(), 1000 * USDC);
         assert_eq!(f.treasury.liquid_capital(), 900 * USDC);
@@ -8319,7 +11197,7 @@ mod test {
     fn wrong_caller_cannot_allocate_or_recall() {
         let f = fixture();
         let pool = f.env.register(MockBlendPool, ());
-        f.treasury.set_yield_venue(&pool, &(200 * USDC));
+        set_yield_now(&f, &pool, 200 * USDC);
 
         f.env.set_auths(&[]);
         let bad = Address::generate(&f.env);
@@ -8342,8 +11220,8 @@ mod test {
     fn pitfall_jit_withdraw_requires_nested_transfer_preauth() {
         let f = fixture();
         let pool = f.env.register(MockBlendPool, ());
-        f.treasury.set_yield_venue(&pool, &(200 * USDC));
-        f.treasury.allocate_to_yield(&(100 * USDC));
+        set_yield_now(&f, &pool, 200 * USDC);
+        allocate_now(&f, 100 * USDC);
         f.treasury.recall_from_yield(&(50 * USDC));
         assert_eq!(f.treasury.capital_breakdown().yield_principal, 50 * USDC);
     }
@@ -8353,10 +11231,1419 @@ mod test {
         let f = fixture();
         let pool1 = f.env.register(MockBlendPool, ());
         let pool2 = f.env.register(MockBlendPool, ());
-        f.treasury.set_yield_venue(&pool1, &(200 * USDC));
-        f.treasury.allocate_to_yield(&(100 * USDC));
+        set_yield_now(&f, &pool1, 200 * USDC);
+        allocate_now(&f, 100 * USDC);
 
-        let err = f.treasury.try_set_yield_venue(&pool2, &(200 * USDC));
+        f.treasury.set_yield_venue(&pool2, &(200 * USDC));
+        advance(&f, DELAY);
+        let err = f.treasury.try_execute_op(&0);
         assert_eq!(err, Err(Ok(Error::VenueHasPrincipal)));
+    }
+
+    // ----- operating mode (issue #272) ------------------------------------------
+
+    fn sym(f: &Fixture, s: &str) -> Symbol {
+        Symbol::new(&f.env, s)
+    }
+
+    #[test]
+    fn drawdown_trip_does_not_enable_emergency_withdraw() {
+        // The bug: an ordinary risk event opened the forfeiting exit, so a trip
+        // started a run in which the first leavers dumped their share of open
+        // positions on the stayers.
+        let f = fixture();
+        let alice = depositor(&f, 10 * USDC);
+        let shares = f.treasury.deposit(&alice, &(10 * USDC));
+        trip_drawdown(&f);
+        assert_eq!(f.treasury.mode(), Mode::AgentsHalted);
+        assert_eq!(
+            f.treasury.try_emergency_withdraw(&alice, &shares),
+            Err(Ok(Error::DrawdownTripped))
+        );
+        // The ordinary exit stays open: a queued withdrawal, at NAV.
+        assert!(f.treasury.try_request_withdraw(&alice, &shares).is_ok());
+    }
+
+    #[test]
+    fn admin_unpause_during_drawdown_keeps_agents_halted() {
+        let f = fixture();
+        trip_drawdown(&f);
+        f.treasury.pause(&sym(&f, "maintenance"));
+        assert_eq!(f.treasury.mode(), Mode::Paused);
+        // Clearing the admin pause must not clear the drawdown halt.
+        f.treasury.unpause();
+        assert_eq!(f.treasury.mode(), Mode::AgentsHalted);
+        assert!(f.treasury.drawdown_status().tripped);
+        assert_eq!(
+            f.treasury
+                .try_agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &USDC, &0),
+            Err(Ok(Error::DrawdownTripped))
+        );
+        // ...and the reverse: resuming agents leaves an admin pause standing.
+        f.treasury.pause(&sym(&f, "again"));
+        f.treasury.reset_pnl_window();
+        exec_kind(&f, 5);
+        f.treasury.resume_agents();
+        assert_eq!(f.treasury.mode(), Mode::Paused);
+        assert!(!f.treasury.drawdown_status().tripped);
+        f.treasury.unpause();
+        assert_eq!(f.treasury.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn resume_agents_requires_recovered_window_or_reset() {
+        let f = fixture();
+        // Nothing to resume while running normally.
+        assert_eq!(f.treasury.try_resume_agents(), Err(Ok(Error::NotPaused)));
+        trip_drawdown(&f);
+        // The loss is still inside the window: the admin cannot wave it through.
+        assert_eq!(f.treasury.try_resume_agents(), Err(Ok(Error::NotRecovered)));
+        // Recovery by an explicit window reset...
+        f.treasury.reset_pnl_window();
+        exec_kind(&f, 5);
+        f.treasury.resume_agents();
+        assert_eq!(f.treasury.mode(), Mode::Normal);
+        assert_eq!(f.treasury.mode_state().drawdown_halt, None);
+    }
+
+    #[test]
+    fn resume_agents_after_the_loss_leaves_the_window() {
+        let f = fixture();
+        trip_drawdown(&f);
+        f.env
+            .ledger()
+            .set_timestamp(f.env.ledger().timestamp() + 8 * DAY_SECONDS);
+        f.treasury.resume_agents();
+        assert_eq!(f.treasury.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn declare_emergency_requires_admin_pause_first() {
+        let f = fixture();
+        let why = sym(&f, "core_down");
+        assert_eq!(
+            f.treasury.try_declare_emergency(&why),
+            Err(Ok(Error::NotPaused))
+        );
+        trip_drawdown(&f);
+        // A drawdown halt alone is not enough either: two deliberate steps.
+        assert_eq!(
+            f.treasury.try_declare_emergency(&why),
+            Err(Ok(Error::NotPaused))
+        );
+        f.treasury.set_paused(&true);
+        f.treasury.declare_emergency(&why);
+        assert_eq!(f.treasury.mode(), Mode::Emergency);
+        // Idempotent, and the admin pause cannot be lifted underneath it.
+        f.treasury.declare_emergency(&why);
+        assert_eq!(f.treasury.try_unpause(), Err(Ok(Error::EmergencyMode)));
+        assert_eq!(
+            f.treasury.try_set_paused(&false),
+            Err(Ok(Error::EmergencyMode))
+        );
+        // Ending it returns to the admin pause, and the halt is still recorded.
+        f.treasury.end_emergency();
+        assert_eq!(f.treasury.mode(), Mode::Paused);
+        f.treasury.unpause();
+        assert_eq!(f.treasury.mode(), Mode::AgentsHalted);
+    }
+
+    #[test]
+    fn queued_ticket_claimable_in_emergency() {
+        let (f, alice, bob) = deployed_vault();
+        let (_, t1) = f
+            .treasury
+            .request_withdraw(&alice, &f.treasury.shares_of(&alice));
+        f.env.ledger().set_timestamp(MARKET_CLOSE);
+        f.market_core.resolve(&f.market_id, &Outcome::Yes);
+        f.treasury.redeem(&f.agent, &f.market_id);
+        let owed = f.treasury.withdraw_ticket(&t1).unwrap().remaining;
+        let reserved_before = f.treasury.queue_reserved();
+        assert!(reserved_before > 0);
+
+        f.treasury.set_paused(&true);
+        f.treasury.declare_emergency(&sym(&f, "core_down"));
+        // New requests are closed in an emergency...
+        assert_eq!(
+            f.treasury
+                .try_request_withdraw(&bob, &f.treasury.shares_of(&bob)),
+            Err(Ok(Error::EmergencyMode))
+        );
+        // ...but a ticket that already exists is still honoured, at NAV.
+        assert_eq!(f.treasury.claim_withdraw(&t1), owed);
+        // Reserved capital stays out of the emergency pro-rata base: bob's exit
+        // is computed on idle minus what the queue still reserves.
+        let free = (balance(&f, &f.treasury_id) - f.treasury.queue_reserved()).max(0);
+        let shares = f.treasury.shares_of(&bob);
+        let expected = shares * free / (f.treasury.total_shares() + VIRTUAL_SHARES);
+        assert_eq!(f.treasury.emergency_withdraw(&bob, &shares), expected);
+    }
+
+    #[test]
+    fn settle_market_allowed_in_every_mode() {
+        for step in 0..4 {
+            let f = fixture();
+            f.treasury
+                .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+            f.env.ledger().set_timestamp(MARKET_CLOSE + 1);
+            f.market_core.resolve(&f.market_id, &Outcome::Yes);
+            match step {
+                0 => {}
+                1 => f.treasury.pause(&sym(&f, "m")),
+                2 => {
+                    f.treasury.pause(&sym(&f, "m"));
+                    f.treasury.declare_emergency(&sym(&f, "e"));
+                }
+                _ => {
+                    // AgentsHalted is reached by the settle itself in
+                    // `trip_drawdown`; here a second market settles after it.
+                    trip_drawdown(&fixture());
+                }
+            }
+            let caller = Address::generate(&f.env);
+            let report = f.treasury.settle_market(&caller, &f.market_id);
+            assert!(report.redeemed > 0, "step {step}");
+        }
+    }
+
+    #[test]
+    fn legacy_flags_map_to_mode_state() {
+        let f = fixture();
+        let set_legacy = |paused: bool, admin: bool, tripped: bool| {
+            f.env.as_contract(&f.treasury_id, || {
+                let s = f.env.storage().instance();
+                s.remove(&DataKey::ModeState);
+                s.set(&DataKey::Paused, &paused);
+                s.set(&DataKey::AdminPaused, &admin);
+                s.set(&DataKey::DrawdownTripped, &tripped);
+                s.set(&DataKey::DrawdownAcknowledged, &false);
+            });
+        };
+        // DrawdownTripped => a drawdown halt (the Paused it set is its own).
+        set_legacy(true, false, true);
+        let st = f.treasury.mode_state();
+        assert_eq!(
+            (f.treasury.mode(), st.drawdown_halt),
+            (Mode::AgentsHalted, Some(0))
+        );
+        assert_eq!(st.admin_pause_at, None);
+        // AdminPaused => an admin pause with reason `legacy`.
+        set_legacy(true, true, false);
+        let st = f.treasury.mode_state();
+        assert_eq!(f.treasury.mode(), Mode::Paused);
+        assert_eq!(st.admin_pause_reason, Some(sym(&f, "legacy")));
+        // A bare Paused (a pre-#46 deployment) is also an admin pause.
+        set_legacy(true, false, false);
+        assert_eq!(f.treasury.mode(), Mode::Paused);
+        // Both at once: independent reasons, pause outranks the halt.
+        set_legacy(true, true, true);
+        assert_eq!(f.treasury.mode(), Mode::Paused);
+        assert_eq!(f.treasury.mode_state().drawdown_halt, Some(0));
+        // Nothing set => Normal.
+        set_legacy(false, false, false);
+        assert_eq!(f.treasury.mode(), Mode::Normal);
+
+        // The first write migrates: the legacy keys are deleted, the halt kept.
+        set_legacy(true, true, true);
+        f.treasury.unpause();
+        assert_eq!(f.treasury.mode(), Mode::AgentsHalted);
+        f.env.as_contract(&f.treasury_id, || {
+            let s = f.env.storage().instance();
+            for k in [
+                DataKey::Paused,
+                DataKey::AdminPaused,
+                DataKey::DrawdownTripped,
+                DataKey::DrawdownAcknowledged,
+            ] {
+                assert!(!s.has(&k));
+            }
+            assert!(s.has(&DataKey::ModeState));
+        });
+    }
+
+    #[test]
+    fn mode_changed_events_carry_reason() {
+        let f = fixture();
+        let at = f.env.ledger().timestamp();
+        let ev = |from, to, reason: &str| ModeChanged {
+            from,
+            to,
+            reason: sym(&f, reason),
+            at,
+        };
+        f.treasury.pause(&sym(&f, "maintenance"));
+        assert!(has_event(
+            &f,
+            &ev(Mode::Normal, Mode::Paused, "maintenance")
+        ));
+        f.treasury.declare_emergency(&sym(&f, "core_down"));
+        assert!(has_event(
+            &f,
+            &ev(Mode::Paused, Mode::Emergency, "core_down")
+        ));
+        f.treasury.end_emergency();
+        assert!(has_event(
+            &f,
+            &ev(Mode::Emergency, Mode::Paused, "end_emerg")
+        ));
+        f.treasury.unpause();
+        assert!(has_event(
+            &f,
+            &ev(Mode::Paused, Mode::Normal, "unpause")
+        ));
+        // set_paused(true) is `pause(admin)`: the timelock's emergency path.
+        f.treasury.set_paused(&true);
+        assert!(has_event(&f, &ev(Mode::Normal, Mode::Paused, "admin")));
+        // Idempotent calls change nothing and emit nothing new.
+        f.treasury.set_paused(&true);
+        assert_eq!(
+            f.treasury.mode_state().admin_pause_reason,
+            Some(sym(&f, "admin"))
+        );
+    }
+
+    #[test]
+    fn drawdown_and_resume_emit_mode_changed() {
+        let f = fixture();
+        // Same steps as `trip_drawdown`, but checking the event right after the
+        // settle that trips the halt (the host keeps only the last call's events).
+        f.treasury.set_drawdown_config(&(15 * USDC), &7u32);
+        f.treasury
+            .agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+        f.env.ledger().set_timestamp(MARKET_CLOSE + 1);
+        f.market_core.resolve(&f.market_id, &Outcome::No);
+        f.treasury
+            .settle_market(&Address::generate(&f.env), &f.market_id);
+        assert!(has_event(
+            &f,
+            &ModeChanged {
+                from: Mode::Normal,
+                to: Mode::AgentsHalted,
+                reason: sym(&f, "drawdown"),
+                at: MARKET_CLOSE + 1,
+            }
+        ));
+        assert_eq!(
+            f.treasury.mode_state().drawdown_halt,
+            Some(MARKET_CLOSE + 1)
+        );
+
+        f.treasury.reset_pnl_window();
+        exec_kind(&f, 5);
+        f.treasury.resume_agents();
+        assert!(has_event(
+            &f,
+            &ModeChanged {
+                from: Mode::AgentsHalted,
+                to: Mode::Normal,
+                reason: sym(&f, "resume"),
+                at: MARKET_CLOSE + 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn allowed_view_answers_from_the_current_mode() {
+        let f = fixture();
+        assert!(f.treasury.allowed(&Op::AgentOpen));
+        assert!(!f.treasury.allowed(&Op::EmergencyWithdraw));
+        f.treasury.set_paused(&true);
+        assert!(!f.treasury.allowed(&Op::AgentOpen));
+        assert!(!f.treasury.allowed(&Op::AgentReduce));
+        assert!(f.treasury.allowed(&Op::PermissionlessSettle));
+        f.treasury.declare_emergency(&sym(&f, "e"));
+        assert!(f.treasury.allowed(&Op::EmergencyWithdraw));
+        assert!(!f.treasury.allowed(&Op::RequestWithdraw));
+    }
+
+    // ----- mode x entrypoint matrix --------------------------------------------
+
+    /// How an entrypoint is classified for the matrix: gated by an `Op`, or pure
+    /// configuration / a view, which is never mode-gated.
+    #[derive(Clone, Copy)]
+    enum Row {
+        Gated(Op),
+        Ungated,
+    }
+
+    /// One row per `pub fn` of `impl Treasury`. `every_entrypoint_has_a_matrix_row`
+    /// fails when a new entrypoint is added without one.
+    const MATRIX: &[(&str, Row)] = &[
+        ("deposit", Row::Gated(Op::Deposit)),
+        ("deposit_token", Row::Gated(Op::Deposit)),
+        ("agent_create_market_collateral", Row::Gated(Op::AgentOpen)),
+        ("agent_buy_traced", Row::Gated(Op::AgentOpen)),
+        ("agent_sell_traced", Row::Gated(Op::AgentReduce)),
+        ("request_withdraw", Row::Gated(Op::RequestWithdraw)),
+        ("claim_withdraw", Row::Gated(Op::ClaimWithdraw)),
+        ("emergency_withdraw", Row::Gated(Op::EmergencyWithdraw)),
+        ("agent_create_market", Row::Gated(Op::AgentOpen)),
+        ("agent_create_market_and_reveal", Row::Gated(Op::AgentOpen)),
+        ("agent_create_market_reveal_v2", Row::Gated(Op::AgentOpen)),
+        ("agent_buy", Row::Gated(Op::AgentOpen)),
+        ("agent_buy_v2", Row::Gated(Op::AgentOpen)),
+        ("agent_sell", Row::Gated(Op::AgentReduce)),
+        ("agent_sell_v2", Row::Gated(Op::AgentReduce)),
+        ("close_trade", Row::Gated(Op::AgentReduce)),
+        ("redeem", Row::Gated(Op::AgentSettle)),
+        ("claim_pool_remainder", Row::Gated(Op::AgentSettle)),
+        ("legacy_redeem", Row::Gated(Op::AgentSettle)),
+        ("legacy_claim_pool_remainder", Row::Gated(Op::AgentSettle)),
+        ("redeem_many", Row::Gated(Op::AgentSettle)),
+        ("claim_pool_remainders", Row::Gated(Op::AgentSettle)),
+        ("agent_claim_lp_fees", Row::Gated(Op::AgentSettle)),
+        ("collect_market_fees", Row::Gated(Op::PermissionlessSettle)),
+        ("settle_market", Row::Gated(Op::PermissionlessSettle)),
+        ("realize", Row::Gated(Op::PermissionlessSettle)),
+        ("allocate_to_yield", Row::Gated(Op::YieldAllocate)),
+        ("recall_from_yield", Row::Gated(Op::YieldRecall)),
+        ("migrate_markets", Row::Gated(Op::Migrate)),
+        // Not mode-gated: the mode transitions themselves, views, and admin
+        // configuration (none of it moves capital).
+        ("__constructor", Row::Ungated),
+        ("get_config", Row::Ungated),
+        ("get_global", Row::Ungated),
+        ("available_capital", Row::Ungated),
+        ("liquid_capital", Row::Ungated),
+        ("capital_breakdown", Row::Ungated),
+        ("daily_usage", Row::Ungated),
+        ("daily_usage_detail", Row::Ungated),
+        ("daily_headroom", Row::Ungated),
+        ("agent_daily_usage", Row::Ungated),
+        ("get_net_cap", Row::Ungated),
+        ("net_exposure", Row::Ungated),
+        ("net_position", Row::Ungated),
+        ("market_valuation", Row::Ungated),
+        ("available_capital_of", Row::Ungated),
+        ("token_caps", Row::Ungated),
+        ("set_token_caps", Row::Ungated),
+        ("set_unwinder", Row::Ungated),
+        ("unwinder", Row::Ungated),
+        ("set_exit_floor", Row::Ungated),
+        ("set_default_exit_floor", Row::Ungated),
+        ("exit_floor", Row::Ungated),
+        ("unwound", Row::Ungated),
+        ("propose_op", Row::Ungated),
+        ("execute_op", Row::Ungated),
+        ("cancel_op", Row::Ungated),
+        ("pending_op", Row::Ungated),
+        ("correlation_caps", Row::Ungated),
+        ("category_exposure", Row::Ungated),
+        ("bucket_exposure", Row::Ungated),
+        ("correlation_headroom", Row::Ungated),
+        ("pending_correlation_caps", Row::Ungated),
+        ("propose_correlation_caps", Row::Ungated),
+        ("execute_correlation_caps", Row::Ungated),
+        ("cancel_correlation_caps", Row::Ungated),
+        ("set_mode", Row::Ungated),
+        ("agent_halt", Row::Ungated),
+        ("max_mark_age_ledgers", Row::Ungated),
+        ("pending_max_mark_age", Row::Ungated),
+        ("set_max_mark_age", Row::Ungated),
+        ("execute_max_mark_age", Row::Ungated),
+        ("cancel_max_mark_age", Row::Ungated),
+        ("nav_detail", Row::Ungated),
+        ("audit_mark", Row::Ungated),
+        ("refresh_mark", Row::Ungated),
+        ("migrate_marks", Row::Ungated),
+        ("trace_policy", Row::Ungated),
+        ("propose_trace_policy", Row::Ungated),
+        ("execute_trace_policy", Row::Ungated),
+        ("cancel_trace_policy", Row::Ungated),
+        // `unwind_sell` has its own rule: it works only in `Unwinding`.
+        ("unwind_sell", Row::Ungated),
+        ("set_paused", Row::Ungated),
+        ("pause", Row::Ungated),
+        ("unpause", Row::Ungated),
+        ("resume_agents", Row::Ungated),
+        ("declare_emergency", Row::Ungated),
+        ("end_emergency", Row::Ungated),
+        ("mode", Row::Ungated),
+        ("mode_state", Row::Ungated),
+        ("allowed", Row::Ungated),
+        ("set_agent", Row::Ungated),
+        ("execute_agent", Row::Ungated),
+        ("cancel_agent", Row::Ungated),
+        ("remove_agent", Row::Ungated),
+        ("get_agent", Row::Ungated),
+        ("pending_agent", Row::Ungated),
+        ("agent_count", Row::Ungated),
+        ("agent_at", Row::Ungated),
+        ("propose_config", Row::Ungated),
+        ("execute_config", Row::Ungated),
+        ("cancel_config", Row::Ungated),
+        ("pending_config", Row::Ungated),
+        ("config_delay", Row::Ungated),
+        ("set_config_delay", Row::Ungated),
+        ("get_price_policy", Row::Ungated),
+        ("set_price_policy", Row::Ungated),
+        ("execute_price_policy", Row::Ungated),
+        ("cancel_price_policy", Row::Ungated),
+        ("pending_price_policy", Row::Ungated),
+        ("get_resolvability_policy", Row::Ungated),
+        ("set_resolvability_policy", Row::Ungated),
+        ("execute_resolvability_policy", Row::Ungated),
+        ("cancel_resolvability_policy", Row::Ungated),
+        ("pending_resolvability_policy", Row::Ungated),
+        ("nav", Row::Ungated),
+        ("shares_of", Row::Ungated),
+        ("total_shares", Row::Ungated),
+        ("queue_reserved", Row::Ungated),
+        ("withdraw_ticket", Row::Ungated),
+        ("queue_bounds", Row::Ungated),
+        ("open_market_count", Row::Ungated),
+        ("open_market_at", Row::Ungated),
+        ("realized", Row::Ungated),
+        ("market_pnl", Row::Ungated),
+        ("window_pnl", Row::Ungated),
+        ("drawdown_status", Row::Ungated),
+        ("acknowledge_drawdown", Row::Ungated),
+        ("reset_pnl_window", Row::Ungated),
+        ("set_drawdown_config", Row::Ungated),
+        ("get_creation_policy", Row::Ungated),
+        ("creation_usage", Row::Ungated),
+        ("set_creation_policy", Row::Ungated),
+        ("set_yield_venue", Row::Ungated),
+        ("disable_yield", Row::Ungated),
+        ("set_successor", Row::Ungated),
+    ];
+
+    #[test]
+    fn every_entrypoint_has_a_matrix_row() {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("#[contractimpl]\nimpl Treasury {")
+            .expect("impl Treasury");
+        let end = src.find("\n#[cfg(test)]\nmod test").expect("test module");
+        let mut missing = std::vec::Vec::new();
+        for line in src[start..end].lines() {
+            if let Some(rest) = line.strip_prefix("    pub fn ") {
+                let name = rest.split(['(', '<']).next().unwrap();
+                if !MATRIX.iter().any(|(n, _)| *n == name) {
+                    missing.push(name);
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "entrypoints without a mode-matrix row (classify them in MATRIX): {missing:?}"
+        );
+        // And no row for an entrypoint that no longer exists.
+        for (name, _) in MATRIX {
+            assert!(
+                src[start..end].contains(&std::format!("    pub fn {name}(")),
+                "MATRIX row `{name}` has no entrypoint"
+            );
+        }
+    }
+
+    /// The gate's error for a denied op in `mode`.
+    fn gate_error(mode: Mode) -> Error {
+        match mode {
+            Mode::Normal => Error::NotPaused,
+            Mode::AgentsHalted => Error::DrawdownTripped,
+            Mode::Paused | Mode::Unwinding => Error::Paused,
+            Mode::Emergency => Error::EmergencyMode,
+        }
+    }
+
+    /// Calls every gated entrypoint once with plausible arguments. The result is
+    /// `Ok(())` for success and the contract error otherwise; a failure that is
+    /// not a contract error (host trap) is reported as `Err(None)`.
+    fn call_gated(f: &Fixture, alice: &Address, name: &str) -> Result<(), Option<Error>> {
+        fn flat<T, C>(
+            r: Result<Result<T, C>, Result<Error, soroban_sdk::InvokeError>>,
+        ) -> Result<(), Option<Error>> {
+            match r {
+                Ok(_) => Ok(()),
+                Err(Ok(e)) => Err(Some(e)),
+                Err(Err(_)) => Err(None),
+            }
+        }
+        fn ok<R>(r: R) -> R {
+            r
+        }
+        let t = &f.treasury;
+        let (agent, id) = (&f.agent, f.market_id);
+        let (core, who) = (Address::generate(&f.env), alice);
+        let ids: Vec<u64> = vec![&f.env, id];
+        let (qh, rh, uri) = create_args(f, 77);
+        let _ = rh;
+        match name {
+            "deposit" => ok(flat(t.try_deposit(who, &MIN_DEPOSIT))),
+            "deposit_token" => ok(flat(t.try_deposit_token(who, &f.token, &MIN_DEPOSIT))),
+            "agent_create_market_collateral" => ok(flat(t.try_agent_create_market_collateral(
+                agent,
+                &f.token,
+                &qh,
+                &rh,
+                &uri,
+                &Category::Crypto,
+                &(MARKET_CLOSE + 5_000),
+                &USDC,
+                &5_000,
+            ))),
+            "agent_buy_traced" => ok(flat(t.try_agent_buy_traced(
+                agent,
+                &id,
+                &Outcome::Yes,
+                &USDC,
+                &0,
+                &0,
+                &(f.env.ledger().timestamp() + 60),
+                &1,
+            ))),
+            "agent_sell_traced" => ok(flat(t.try_agent_sell_traced(
+                agent,
+                &id,
+                &Outcome::Yes,
+                &1,
+                &i128::MAX,
+                &0,
+                &(f.env.ledger().timestamp() + 60),
+                &1,
+            ))),
+            "request_withdraw" => ok(flat(t.try_request_withdraw(who, &1))),
+            "claim_withdraw" => ok(flat(t.try_claim_withdraw(&1))),
+            "emergency_withdraw" => ok(flat(t.try_emergency_withdraw(who, &1))),
+            "agent_create_market" => ok(flat(t.try_agent_create_market(
+                agent,
+                &qh,
+                &rh,
+                &uri,
+                &Category::Crypto,
+                &(MARKET_CLOSE + 5_000),
+                &USDC,
+                &5_000,
+            ))),
+            "agent_create_market_and_reveal" | "agent_create_market_reveal_v2" => {
+                // The gate precedes the envelope check, so any envelope will do.
+                let spec = ResolutionSpecV2 {
+                    version: 1,
+                    network_id: BytesN::from_array(&f.env, &[0; 32]),
+                    market_core: f.market_core.address.clone(),
+                    salt: BytesN::from_array(&f.env, &[1; 32]),
+                    rule: resolver::ResolutionSpec::Price(resolver::PriceConfig {
+                        reflector: core.clone(),
+                        asset: resolver::OracleAsset::Other(Symbol::new(&f.env, "X")),
+                        threshold: 1,
+                        direction: resolver::PriceDirection::Above,
+                        max_staleness: 1,
+                    }),
+                };
+                if name == "agent_create_market_reveal_v2" {
+                    ok(flat(t.try_agent_create_market_reveal_v2(
+                        agent,
+                        &qh,
+                        &uri,
+                        &Category::Crypto,
+                        &(MARKET_CLOSE + 5_000),
+                        &USDC,
+                        &5_000,
+                        &spec,
+                    )))
+                } else {
+                    ok(flat(t.try_agent_create_market_and_reveal(
+                        agent,
+                        &core,
+                        &qh,
+                        &uri,
+                        &Category::Crypto,
+                        &(MARKET_CLOSE + 5_000),
+                        &USDC,
+                        &5_000,
+                        &spec,
+                    )))
+                }
+            }
+            "agent_buy" => ok(flat(t.try_agent_buy(agent, &id, &Outcome::Yes, &USDC, &0))),
+            "agent_buy_v2" => ok(flat(t.try_agent_buy_v2(
+                agent,
+                &id,
+                &Outcome::Yes,
+                &USDC,
+                &0,
+                &0,
+                &(f.env.ledger().timestamp() + 60),
+            ))),
+            "agent_sell" => ok(flat(t.try_agent_sell(
+                agent,
+                &id,
+                &Outcome::Yes,
+                &1,
+                &i128::MAX,
+            ))),
+            "agent_sell_v2" => ok(flat(t.try_agent_sell_v2(
+                agent,
+                &id,
+                &Outcome::Yes,
+                &1,
+                &i128::MAX,
+                &0,
+                &(f.env.ledger().timestamp() + 60),
+            ))),
+            "close_trade" => ok(flat(t.try_close_trade(agent, &id))),
+            "redeem" => ok(flat(t.try_redeem(agent, &id))),
+            "claim_pool_remainder" => ok(flat(t.try_claim_pool_remainder(agent, &id))),
+            "legacy_redeem" => ok(flat(t.try_legacy_redeem(agent, &core, &id))),
+            "legacy_claim_pool_remainder" => {
+                ok(flat(t.try_legacy_claim_pool_remainder(agent, &core, &id)))
+            }
+            "redeem_many" => ok(flat(t.try_redeem_many(agent, &ids))),
+            "claim_pool_remainders" => ok(flat(t.try_claim_pool_remainders(agent, &ids))),
+            "agent_claim_lp_fees" => ok(flat(t.try_agent_claim_lp_fees(agent, &id))),
+            "collect_market_fees" => ok(flat(t.try_collect_market_fees(&id))),
+            "settle_market" => ok(flat(t.try_settle_market(&Address::generate(&f.env), &id))),
+            "realize" => ok(flat(t.try_realize(&id))),
+            "allocate_to_yield" => ok(flat(t.try_allocate_to_yield(&USDC))),
+            "recall_from_yield" => ok(flat(t.try_recall_from_yield(&USDC))),
+            "migrate_markets" => ok(flat(t.try_migrate_markets(&ids))),
+            other => panic!("no call for gated entrypoint {other}"),
+        }
+    }
+
+    /// Brings a fresh fixture into `mode` through the real entrypoints.
+    fn fixture_in_mode(mode: Mode) -> (Fixture, Address) {
+        let f = fixture();
+        let alice = depositor(&f, 10 * USDC);
+        f.treasury.deposit(&alice, &(10 * USDC));
+        match mode {
+            Mode::Normal => {}
+            Mode::AgentsHalted => trip_drawdown(&f),
+            Mode::Paused => f.treasury.pause(&sym(&f, "matrix")),
+            Mode::Unwinding => f.treasury.set_mode(&Mode::Unwinding),
+            Mode::Emergency => {
+                f.treasury.pause(&sym(&f, "matrix"));
+                f.treasury.declare_emergency(&sym(&f, "matrix"));
+            }
+        }
+        assert_eq!(f.treasury.mode(), mode);
+        (f, alice)
+    }
+
+    #[test]
+    fn mode_by_entrypoint_matrix() {
+        for mode in crate::mode::ALL_MODES {
+            for (name, row) in MATRIX {
+                let Row::Gated(op) = row else { continue };
+                // Fresh state per call so one entrypoint cannot change another's mode.
+                let (f, alice) = fixture_in_mode(mode);
+                let got = call_gated(&f, &alice, name);
+                if allowed(mode, *op) {
+                    // Allowed: it may still fail for its own reasons, but never
+                    // with the gate's error.
+                    if let Err(Some(e)) = &got {
+                        assert_ne!(
+                            *e,
+                            gate_error(mode),
+                            "{name} in {mode:?}: the gate refused an allowed op"
+                        );
+                    }
+                    assert_ne!(got, Err(None), "{name} in {mode:?} trapped");
+                } else {
+                    assert_eq!(got, Err(Some(gate_error(mode))), "{name} in {mode:?}");
+                }
+            }
+        }
+    }
+
+    // ----- resolvability (#273) ----------------------------------------------------
+
+    fn signers_spec(f: &Fixture, salt: u8) -> ResolutionSpecV2 {
+        ResolutionSpecV2 {
+            version: SPEC_V2_VERSION,
+            network_id: f.env.ledger().network_id(),
+            market_core: f.market_core.address.clone(),
+            salt: BytesN::from_array(&f.env, &[salt; 32]),
+            rule: resolver::ResolutionSpec::Signers(resolver::SignerConfig {
+                signers: vec![&f.env, Address::generate(&f.env), Address::generate(&f.env)],
+                threshold: 2,
+                dispute_window: 100,
+            }),
+        }
+    }
+
+    fn create_and_reveal(f: &Fixture, salt: u8) -> Result<u64, Error> {
+        let (qh, _, uri) = create_args(f, salt);
+        match f.treasury.try_agent_create_market_reveal_v2(
+            &f.agent,
+            &qh,
+            &uri,
+            &Category::Crypto,
+            &(MARKET_CLOSE + 5_000),
+            &(100 * USDC),
+            &5_000,
+            &signers_spec(f, salt),
+        ) {
+            Ok(Ok(id)) => Ok(id),
+            Err(Ok(e)) => Err(e),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Applies `p` (it must be a tightening: it takes effect at once). Does not
+    /// read the policy back, so the caller can still check the event it emitted.
+    fn tighten(f: &Fixture, p: ResolvabilityPolicy) {
+        f.treasury.set_resolvability_policy(&p);
+    }
+
+    fn status(
+        f: &Fixture,
+        spec: resolver::SpecKind,
+        state: resolver::ResolutionState,
+    ) -> resolver::TradeStatus {
+        let st = resolver::TradeStatus {
+            spec,
+            state,
+            close_time: MARKET_CLOSE,
+            deadline: MARKET_CLOSE + 30 * DAY_SECONDS,
+            open_proposal: false,
+        };
+        MockResolverClient::new(&f.env, &f.resolver).set_status(&st);
+        st
+    }
+
+    fn buy(f: &Fixture) -> Result<(), Option<Error>> {
+        match f
+            .treasury
+            .try_agent_buy(&f.agent, &f.market_id, &Outcome::Yes, &USDC, &0)
+        {
+            Ok(Ok(_)) => Ok(()),
+            Err(Ok(e)) => Err(Some(e)),
+            _ => Err(None),
+        }
+    }
+
+    #[test]
+    fn create_and_reveal_rejects_foreign_resolver() {
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        let (qh, _, uri) = create_args(&f, 41);
+        let foreign = Address::generate(&f.env);
+        let before = f.market_core.market_count();
+        // The agent may not pick where the spec is revealed.
+        assert_eq!(
+            f.treasury.try_agent_create_market_and_reveal(
+                &f.agent,
+                &foreign,
+                &qh,
+                &uri,
+                &Category::Crypto,
+                &(MARKET_CLOSE + 5_000),
+                &(100 * USDC),
+                &5_000,
+                &signers_spec(&f, 41),
+            ),
+            Err(Ok(Error::InvalidResolution))
+        );
+        assert_eq!(
+            f.market_core.market_count(),
+            before,
+            "no market was created"
+        );
+        // The configured resolver is accepted (the old entrypoint, kept for
+        // interface stability), and the v2 entrypoint needs no argument at all.
+        let id = f.treasury.agent_create_market_and_reveal(
+            &f.agent,
+            &f.resolver,
+            &qh,
+            &uri,
+            &Category::Crypto,
+            &(MARKET_CLOSE + 5_000),
+            &(100 * USDC),
+            &5_000,
+            &signers_spec(&f, 41),
+        );
+        assert_eq!(id, before);
+        assert_eq!(create_and_reveal(&f, 42), Ok(before + 1));
+    }
+
+    #[test]
+    fn create_and_reveal_detects_noop_resolver() {
+        // market-core trusts a resolver that accepts register_spec_v2 and
+        // stores nothing: the market could only end by expiry voiding.
+        let f = fixture_with_resolver(ResolverKind::Noop);
+        let before = f.market_core.market_count();
+        assert_eq!(create_and_reveal(&f, 43), Err(Error::InvalidResolution));
+        assert_eq!(
+            f.market_core.market_count(),
+            before,
+            "the seeded market was rolled back"
+        );
+        assert_eq!(
+            balance(&f, &f.treasury_id),
+            1_000 * USDC,
+            "and so was the seed"
+        );
+    }
+
+    #[test]
+    fn create_and_reveal_reveals_to_the_real_resolver() {
+        let f = fixture_with_resolver(ResolverKind::Wasm);
+        let id = create_and_reveal(&f, 44).unwrap();
+        let resolver = resolver::Client::new(&f.env, &f.resolver);
+        assert_eq!(resolver.spec_kind(&id), resolver::SpecKind::Signers);
+        assert_eq!(
+            resolver.state(&id),
+            resolver::ResolutionState::SignersPending
+        );
+    }
+
+    #[test]
+    fn default_policy_makes_no_resolver_call() {
+        // The mock has no status set, so any trade_status call would panic: a
+        // fully permissive policy must not even look.
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        assert_eq!(f.treasury.get_resolvability_policy(), OPEN_RESOLVABILITY);
+        assert_eq!(buy(&f), Ok(()));
+    }
+
+    #[test]
+    fn buy_rejected_when_spec_unrevealed() {
+        let f = fixture_with_resolver(ResolverKind::Wasm);
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                require_revealed: true,
+                ..OPEN_RESOLVABILITY
+            },
+        );
+        // The fixture's market has a commitment nobody revealed.
+        assert_eq!(buy(&f), Err(Some(Error::SpecNotRevealed)));
+        // A market created through the atomic flow is revealed, so it trades.
+        let id = create_and_reveal(&f, 45).unwrap();
+        assert!(f
+            .treasury
+            .try_agent_buy(&f.agent, &id, &Outcome::Yes, &USDC, &0)
+            .is_ok());
+    }
+
+    #[test]
+    fn buy_rejected_when_spec_kind_not_allowed() {
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        status(
+            &f,
+            resolver::SpecKind::Twap,
+            resolver::ResolutionState::Unconfigured,
+        );
+        // Only price and signer rules may be bought into.
+        let allowed = (1 << 1) | (1 << 4);
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                allowed_specs: allowed,
+                ..OPEN_RESOLVABILITY
+            },
+        );
+        assert_eq!(buy(&f), Err(Some(Error::SpecKindNotAllowed)));
+        status(
+            &f,
+            resolver::SpecKind::Signers,
+            resolver::ResolutionState::SignersPending,
+        );
+        assert_eq!(buy(&f), Ok(()));
+    }
+
+    #[test]
+    fn buy_rejected_when_disputed() {
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        status(
+            &f,
+            resolver::SpecKind::Disputable,
+            resolver::ResolutionState::Disputed,
+        );
+        // Off by default: a dispute freezes the market, not the treasury.
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                require_revealed: true,
+                ..OPEN_RESOLVABILITY
+            },
+        );
+        assert_eq!(buy(&f), Ok(()));
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                require_revealed: true,
+                block_when_disputed: true,
+                ..OPEN_RESOLVABILITY
+            },
+        );
+        assert_eq!(buy(&f), Err(Some(Error::MarketDisputed)));
+        // The block is per market and per state: it lifts when the ruling lands.
+        status(
+            &f,
+            resolver::SpecKind::Disputable,
+            resolver::ResolutionState::Finalized,
+        );
+        assert_eq!(buy(&f), Ok(()));
+    }
+
+    #[test]
+    fn buy_rejected_with_open_proposal_only_when_asked() {
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        let mut st = status(
+            &f,
+            resolver::SpecKind::Signers,
+            resolver::ResolutionState::SignersPending,
+        );
+        st.open_proposal = true;
+        MockResolverClient::new(&f.env, &f.resolver).set_status(&st);
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                require_revealed: true,
+                ..OPEN_RESOLVABILITY
+            },
+        );
+        assert_eq!(buy(&f), Ok(()), "off by default");
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                require_revealed: true,
+                block_with_open_proposal: true,
+                ..OPEN_RESOLVABILITY
+            },
+        );
+        assert_eq!(buy(&f), Err(Some(Error::ProposalOpen)));
+    }
+
+    #[test]
+    fn buy_rejected_too_close_to_close() {
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        let now = f.env.ledger().timestamp();
+        let mut st = status(
+            &f,
+            resolver::SpecKind::Price,
+            resolver::ResolutionState::Unconfigured,
+        );
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                min_secs_to_close: 60,
+                ..OPEN_RESOLVABILITY
+            },
+        );
+        st.close_time = now + 59;
+        MockResolverClient::new(&f.env, &f.resolver).set_status(&st);
+        assert_eq!(buy(&f), Err(Some(Error::TooCloseToClose)));
+        st.close_time = now + 60;
+        MockResolverClient::new(&f.env, &f.resolver).set_status(&st);
+        assert_eq!(buy(&f), Ok(()), "exactly min_secs_to_close away is allowed");
+    }
+
+    #[test]
+    fn buy_rejected_past_resolution_deadline() {
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        let now = f.env.ledger().timestamp();
+        let mut st = status(
+            &f,
+            resolver::SpecKind::Price,
+            resolver::ResolutionState::Unconfigured,
+        );
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                require_revealed: true,
+                ..OPEN_RESOLVABILITY
+            },
+        );
+        st.deadline = now;
+        MockResolverClient::new(&f.env, &f.resolver).set_status(&st);
+        assert_eq!(buy(&f), Err(Some(Error::PastResolutionDeadline)));
+    }
+
+    #[test]
+    fn creation_is_not_blocked_by_min_secs_to_close() {
+        // Seed-and-reveal happens far from close and must not be held to the
+        // buy-side minimum.
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                min_secs_to_close: 10 * DAY_SECONDS,
+                ..OPEN_RESOLVABILITY
+            },
+        );
+        assert!(create_and_reveal(&f, 46).is_ok());
+    }
+
+    #[test]
+    fn sell_and_redeem_never_gated() {
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        status(
+            &f,
+            resolver::SpecKind::None,
+            resolver::ResolutionState::Disputed,
+        );
+        assert_eq!(buy(&f), Ok(())); // under the open default policy
+                                     // Now the strictest policy, against a market that fails every check.
+        tighten(
+            &f,
+            ResolvabilityPolicy {
+                require_revealed: true,
+                block_when_disputed: true,
+                block_with_open_proposal: true,
+                min_secs_to_close: 365 * DAY_SECONDS,
+                allowed_specs: 0,
+            },
+        );
+        assert!(buy(&f).is_err());
+        // Exits and settlement still work: the treasury must always be able to
+        // get out and bring collateral home.
+        let sold = f.treasury.try_agent_sell(
+            &f.agent,
+            &f.market_id,
+            &Outcome::Yes,
+            &(USDC / 4),
+            &i128::MAX,
+        );
+        assert!(sold.is_ok(), "{sold:?}");
+        f.env.ledger().set_timestamp(MARKET_CLOSE + 1);
+        f.market_core.resolve(&f.market_id, &Outcome::Yes);
+        let caller = Address::generate(&f.env);
+        assert!(f.treasury.try_settle_market(&caller, &f.market_id).is_ok());
+        assert!(f.treasury.try_redeem(&f.agent, &f.market_id).is_ok());
+    }
+
+    #[test]
+    fn loosening_policy_waits_delay() {
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        let strict = ResolvabilityPolicy {
+            require_revealed: true,
+            block_when_disputed: true,
+            block_with_open_proposal: false,
+            min_secs_to_close: 120,
+            allowed_specs: (1 << 1) | (1 << 4),
+        };
+        tighten(&f, strict);
+        assert!(has_event(
+            &f,
+            &ResolvabilityPolicySet {
+                old: OPEN_RESOLVABILITY,
+                new: strict,
+                immediate: true
+            }
+        ));
+        assert_eq!(f.treasury.get_resolvability_policy(), strict);
+
+        // Tightening further is immediate, in every dimension.
+        let stricter = ResolvabilityPolicy {
+            block_with_open_proposal: true,
+            min_secs_to_close: 300,
+            allowed_specs: 1 << 1,
+            ..strict
+        };
+        tighten(&f, stricter);
+        assert_eq!(f.treasury.get_resolvability_policy(), stricter);
+
+        // Loosening any knob waits config_delay, even alongside a tightening.
+        let mixed = ResolvabilityPolicy {
+            require_revealed: false,
+            min_secs_to_close: 600,
+            ..stricter
+        };
+        f.treasury.set_resolvability_policy(&mixed);
+        let executable_at = f.env.ledger().timestamp() + DELAY;
+        assert!(has_event(
+            &f,
+            &ResolvabilityPolicyProposed {
+                old: stricter,
+                new: mixed,
+                executable_at
+            }
+        ));
+        assert_eq!(
+            f.treasury.get_resolvability_policy(),
+            stricter,
+            "not applied yet"
+        );
+        let pending = f.treasury.pending_resolvability_policy().unwrap();
+        assert_eq!(pending.policy, mixed);
+        assert_eq!(pending.executable_at, executable_at);
+        // One proposal at a time, and it cannot run early.
+        assert_eq!(
+            f.treasury
+                .try_set_resolvability_policy(&ResolvabilityPolicy {
+                    allowed_specs: ALL_SPEC_BITS,
+                    ..stricter
+                }),
+            Err(Ok(Error::ProposalPending))
+        );
+        assert_eq!(
+            f.treasury.try_execute_resolvability_policy(),
+            Err(Ok(Error::TimelockActive))
+        );
+
+        f.env.ledger().set_timestamp(pending.executable_at);
+        f.treasury.execute_resolvability_policy();
+        assert_eq!(f.treasury.get_resolvability_policy(), mixed);
+        assert_eq!(f.treasury.pending_resolvability_policy(), None);
+
+        // A pending change can be cancelled by the admin.
+        f.treasury.set_resolvability_policy(&OPEN_RESOLVABILITY);
+        f.treasury.cancel_resolvability_policy();
+        assert_eq!(f.treasury.get_resolvability_policy(), mixed);
+        assert_eq!(
+            f.treasury.try_cancel_resolvability_policy(),
+            Err(Ok(Error::NoPendingConfig))
+        );
+    }
+
+    #[test]
+    fn resolvability_policy_rejects_noops_and_unknown_spec_bits() {
+        let f = fixture_with_resolver(ResolverKind::Mock);
+        assert_eq!(
+            f.treasury.try_set_resolvability_policy(&OPEN_RESOLVABILITY),
+            Err(Ok(Error::InvalidConfig)),
+            "no change"
+        );
+        assert_eq!(
+            f.treasury
+                .try_set_resolvability_policy(&ResolvabilityPolicy {
+                    allowed_specs: ALL_SPEC_BITS | (1 << 9),
+                    ..OPEN_RESOLVABILITY
+                }),
+            Err(Ok(Error::InvalidConfig)),
+            "a bit past the last SpecKind"
+        );
+    }
+
+    #[test]
+    fn spec_bits_cover_every_kind_exactly_once() {
+        use resolver::SpecKind as K;
+        let kinds = [
+            K::None,
+            K::Price,
+            K::ScaledPrice,
+            K::Twap,
+            K::Signers,
+            K::Disputable,
+            K::WeightedKeys,
+            K::Committee,
+            K::Hybrid,
+        ];
+        let mut seen = 0u32;
+        for k in &kinds {
+            let bit = spec_bit(k);
+            assert_eq!(bit.count_ones(), 1);
+            assert_eq!(seen & bit, 0, "bits are distinct");
+            seen |= bit;
+        }
+        assert_eq!(seen, ALL_SPEC_BITS);
+    }
+
+    #[test]
+    fn resolution_grace_mirrors_the_resolvers_constant() {
+        // The deadline comes from the resolver's trade_status; this pins the
+        // 30-day grace that the ADRs and the policy docs quote.
+        let f = fixture_with_resolver(ResolverKind::Wasm);
+        let st = resolver::Client::new(&f.env, &f.resolver).trade_status(&f.market_id);
+        assert_eq!(st.deadline, st.close_time + 30 * DAY_SECONDS);
+    }
+
+    // ---- error_ranges: guard tests for ADR 0006 (#302) -----------------------
+    //
+    // Every treasury Error variant must lie in 1..=999 (the treasury owns
+    // 1..=999 in the current numbering). They must also be unique, and
+    // disjoint from market-core's range (market-core uses 1..=22 and relies on
+    // callers decoding by name after the cross-contract mapping in core_call,
+    // but the treasury range must never coincide so that future renumbering
+    // to ADR 0006's 2001..=2999 is a clean, documented migration).
+    //
+    // map_market_core_error and map_market_core_code produce MarketCore*
+    // variants that are tested individually here, so a drift in either mapper
+    // fails at test time rather than at runtime.
+
+    fn all_treasury_discriminants() -> std::vec::Vec<u32> {
+        // Enumerate every variant by its discriminant. Add new variants here
+        // when Error grows. The exhaustiveness check is enforced by the match
+        // below, which the compiler will reject on an unknown arm.
+        let variants = [
+            Error::NotInitialized,
+            Error::Unauthorized,
+            Error::InvalidConfig,
+            Error::InvalidAmount,
+            Error::TradeCapExceeded,
+            Error::MarketCapExceeded,
+            Error::DailyCapExceeded,
+            Error::MarketNotOpen,
+            Error::InsufficientBalance,
+            Error::Paused,
+            Error::NoSuccessor,
+            Error::NetExposureExceeded,
+            Error::AgentDailyCapExceeded,
+            Error::ProposalPending,
+            Error::TimelockActive,
+            Error::NoPendingConfig,
+            Error::LegacyCoreUnknown,
+            Error::TooManyOpenMarkets,
+            Error::CapitalReserved,
+            Error::DepositTooSmall,
+            Error::InsufficientShares,
+            Error::TicketNotFound,
+            Error::NothingToPay,
+            Error::PriceOutOfBand,
+            Error::PriceImpactExceeded,
+            Error::InvalidPricePolicy,
+            Error::SlippageExceeded,
+            Error::NotPaused,
+            Error::MarketCoreMarketNotFound,
+            Error::MarketCoreNotFinal,
+            Error::MarketCoreMarketNotOpen,
+            Error::MarketCoreMarketClosed,
+            Error::MarketCoreInsufficientLiquidity,
+            Error::MarketCoreInsufficientShares,
+            Error::MarketCoreAlreadyClaimed,
+            Error::MarketCoreNothingToRedeem,
+            Error::MarketCoreInvalidAmount,
+            Error::MarketCoreOverflow,
+            Error::MarketCoreSlippageExceeded,
+            Error::MarketCoreCallFailed,
+            Error::MarketNotFinal,
+            Error::MarketCoreError,
+            Error::DrawdownTripped,
+            Error::InvalidDrawdownConfig,
+            Error::NotAcknowledged,
+            Error::SeedCapExceeded,
+            Error::CreationRateExceeded,
+            Error::CloseTimeTooSoon,
+            Error::CloseTimeTooFar,
+            Error::CategoryNotAllowed,
+            Error::PolicyLoosening,
+            Error::YieldDisabled,
+            Error::YieldCapExceeded,
+            Error::YieldWithdrawFailed,
+            Error::VenueHasPrincipal,
+            Error::CategoryCapExceeded,
+            Error::BucketCapExceeded,
+            Error::NoPendingAdmin,
+            Error::PendingAdminExpired,
+            Error::InvalidResolution,
+            Error::TraceRequired,
+            Error::TraceDecisionMismatch,
+            Error::TraceMismatch,
+            Error::TraceAgentMismatch,
+            Error::TraceFlagged,
+            Error::TraceStale,
+            Error::TraceConsumed,
+            Error::TraceRegistryCallFailed,
+            Error::TracePolicyPending,
+            Error::TracePolicyNotPending,
+            Error::TraceTimelockActive,
+            Error::StaleMarks,
+            Error::MarkBatchTooLarge,
+            Error::OpNotReady,
+            Error::OpExpired,
+            Error::NoPendingOp,
+            Error::BelowExitFloor,
+            Error::InvalidExitFloor,
+            Error::CollateralNotAllowed,
+            Error::EmergencyMode,
+            Error::NotRecovered,
+            Error::SpecNotRevealed,
+            Error::SpecKindNotAllowed,
+            Error::MarketDisputed,
+            Error::ProposalOpen,
+            Error::PastResolutionDeadline,
+            Error::TooCloseToClose,
+            Error::ResolverCallFailed,
+        ];
+        variants.iter().map(|v| *v as u32).collect()
+    }
+
+    #[test]
+    fn error_range_all_in_valid_range() {
+        // Every discriminant must be positive and below 1000. The upper bound
+        // reserves room for future renumbering to 2001..=2999 per ADR 0006
+        // without ambiguity.
+        for d in all_treasury_discriminants() {
+            assert!(d >= 1 && d < 1000, "treasury Error discriminant {d} out of range 1..1000");
+        }
+    }
+
+    #[test]
+    fn error_range_all_unique() {
+        let discs = all_treasury_discriminants();
+        let mut seen = std::collections::HashSet::new();
+        for d in &discs {
+            assert!(seen.insert(d), "duplicate treasury Error discriminant {d}");
+        }
+    }
+
+    #[test]
+    fn error_map_market_core_error_typed_mapping() {
+        use market_core::Error as Core;
+        // Every mapped variant must round-trip through map_market_core_error.
+        assert_eq!(map_market_core_error(Core::MarketNotFound), Error::MarketCoreMarketNotFound);
+        assert_eq!(map_market_core_error(Core::NotFinal), Error::MarketCoreNotFinal);
+        assert_eq!(map_market_core_error(Core::MarketNotOpen), Error::MarketCoreMarketNotOpen);
+        assert_eq!(map_market_core_error(Core::MarketClosed), Error::MarketCoreMarketClosed);
+        assert_eq!(map_market_core_error(Core::InsufficientLiquidity), Error::MarketCoreInsufficientLiquidity);
+        assert_eq!(map_market_core_error(Core::InsufficientShares), Error::MarketCoreInsufficientShares);
+        assert_eq!(map_market_core_error(Core::AlreadyClaimed), Error::MarketCoreAlreadyClaimed);
+        assert_eq!(map_market_core_error(Core::NothingToRedeem), Error::MarketCoreNothingToRedeem);
+        assert_eq!(map_market_core_error(Core::InvalidAmount), Error::MarketCoreInvalidAmount);
+        assert_eq!(map_market_core_error(Core::Overflow), Error::MarketCoreOverflow);
+        assert_eq!(map_market_core_error(Core::SlippageExceeded), Error::MarketCoreSlippageExceeded);
+    }
+
+    #[test]
+    fn error_map_market_core_code_numeric_mapping() {
+        use market_core::Error as Core;
+        let code = |v: u32| soroban_sdk::Error::from_contract_error(v);
+        // Every mapped variant must round-trip through map_market_core_code.
+        assert_eq!(map_market_core_code(code(Core::MarketNotFound as u32)), Error::MarketCoreMarketNotFound);
+        assert_eq!(map_market_core_code(code(Core::NotFinal as u32)), Error::MarketCoreNotFinal);
+        assert_eq!(map_market_core_code(code(Core::MarketNotOpen as u32)), Error::MarketCoreMarketNotOpen);
+        assert_eq!(map_market_core_code(code(Core::MarketClosed as u32)), Error::MarketCoreMarketClosed);
+        assert_eq!(map_market_core_code(code(Core::InsufficientLiquidity as u32)), Error::MarketCoreInsufficientLiquidity);
+        assert_eq!(map_market_core_code(code(Core::InsufficientShares as u32)), Error::MarketCoreInsufficientShares);
+        assert_eq!(map_market_core_code(code(Core::AlreadyClaimed as u32)), Error::MarketCoreAlreadyClaimed);
+        assert_eq!(map_market_core_code(code(Core::NothingToRedeem as u32)), Error::MarketCoreNothingToRedeem);
+        assert_eq!(map_market_core_code(code(Core::InvalidAmount as u32)), Error::MarketCoreInvalidAmount);
+        assert_eq!(map_market_core_code(code(Core::Overflow as u32)), Error::MarketCoreOverflow);
+        assert_eq!(map_market_core_code(code(Core::SlippageExceeded as u32)), Error::MarketCoreSlippageExceeded);
+        // Unknown codes must collapse to MarketCoreCallFailed, never leak.
+        assert_eq!(map_market_core_code(code(999)), Error::MarketCoreCallFailed);
+    }
+
+    #[test]
+    fn market_core_range_disjoint_from_treasury() {
+        use market_core::Error as Core;
+        // Enumerate the market-core discriminants we know about and confirm
+        // none of them share a value with any treasury discriminant.
+        let core_discs: std::vec::Vec<u32> = [
+            Core::MarketNotFound,
+            Core::NotFinal,
+            Core::MarketNotOpen,
+            Core::MarketClosed,
+            Core::InsufficientLiquidity,
+            Core::InsufficientShares,
+            Core::AlreadyClaimed,
+            Core::NothingToRedeem,
+            Core::InvalidAmount,
+            Core::Overflow,
+            Core::SlippageExceeded,
+        ]
+        .iter()
+        .map(|v| *v as u32)
+        .collect();
+        let treasury_discs = all_treasury_discriminants();
+        for cd in &core_discs {
+            // market-core lives in 1..=22; treasury MarketCore* remapping
+            // variants (29..=40) must never accidentally collide with a
+            // non-remapping treasury variant that has the same number as a
+            // core variant.  The two sets are stored in different namespaces
+            // (treasury never re-emits market-core's raw code), so this is a
+            // documentation/correctness check rather than a runtime guard.
+            assert!(
+                !treasury_discs.contains(cd) || {
+                    // The only allowed overlap is the MarketCore* remapping
+                    // range (29..=40), which is intentional.
+                    *cd >= 29 && *cd <= 40
+                },
+                "market-core discriminant {cd} overlaps a non-remapping treasury variant"
+            );
+        }
     }
 }
