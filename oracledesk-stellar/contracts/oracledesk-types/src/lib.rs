@@ -199,48 +199,27 @@ pub struct ResolutionSpecV2 {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #292 — ResolutionSpecV3 / InvalidPolicy
+// Issue #292 — ResolutionSpecV3
 //
 // V1/V2 structs are frozen. The new envelope is strictly additive: it appends
-// an `Option<InvalidPolicy>` field and uses a different hash domain prefix
+// two flat Invalid-policy fields and uses a different hash domain prefix
 // ("oracledesk:resolution-spec-v3") so V3 preimages can never collide with V2.
+//
+// The policy is flattened rather than stored as `Option<InvalidPolicy>`:
+// soroban-sdk 27's `#[contracttype]` derive cannot encode an `Option` of a
+// contracttype struct (it conflicts with the derived `TryFrom`), so the test
+// build of this crate failed on develop.
 // ---------------------------------------------------------------------------
-
-/// Per-market Invalid-attestation policy committed in a V3 spec envelope.
-///
-/// When present, `threshold` is the minimum Invalid attestation count required
-/// to reach quorum — it **must** be strictly greater than the Yes/No threshold
-/// of the underlying rule (validated in `register_spec_v3`).
-///
-/// `allow_displacement`: when `false`, an Invalid quorum can never displace a
-/// pending Yes/No proposal (NoInvalidDisplacement holds).  When `true`, at most
-/// one displacement is permitted per market (tracked by `DataKey::InvalidDisplaced`).
-///
-/// **Preconditions** (enforced by `validate_invalid_policy`):
-/// - `threshold > base_threshold` and `threshold <= member_count`; if
-///   `threshold > member_count` the market can never void via signers.
-/// - For Committee resolution the threshold is re-checked at attest time
-///   against the membership epoch in force for the current quorum.
-/// - Price / WeightedKeys rules: policy is `InvalidConfig` (not yet supported
-///   here; a follow-up item adds weighted-key Invalid support).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InvalidPolicy {
-    /// Address count, committee members, or weight threshold for Invalid quorum.
-    pub threshold: u32,
-    /// Whether a quorum of Invalid attestations may displace a pending Yes/No
-    /// proposal.  At most one displacement is ever allowed per market.
-    pub allow_displacement: bool,
-}
 
 /// V3 commitment envelope.
 ///
 /// Commitment domain: `sha256("oracledesk:resolution-spec-v3" || XDR(ResolutionSpecV3))`.
 /// The domain prefix differs from V2 (`"oracledesk:resolution-spec"`) so a V3
-/// preimage with `invalid = None` cannot collide with the corresponding V2 hash.
+/// preimage with `invalid_threshold = 0` cannot collide with the corresponding V2 hash.
 ///
 /// Fields `version`, `network_id`, `market_core`, `salt` and `rule` carry
-/// identical semantics to [`ResolutionSpecV2`].  The only addition is `invalid`.
+/// identical semantics to [`ResolutionSpecV2`].  The additions are the two
+/// Invalid-policy fields below.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolutionSpecV3 {
@@ -251,9 +230,21 @@ pub struct ResolutionSpecV3 {
     pub market_core: Address,
     pub salt: BytesN<32>,
     pub rule: ResolutionSpec,
-    /// Optional Invalid-attestation policy.  `None` gives legacy V2 semantics:
-    /// Invalid uses the same threshold as Yes/No and displacement is unrestricted.
-    pub invalid: Option<InvalidPolicy>,
+    /// Minimum Invalid-attestation count (address count, committee members, or
+    /// weight threshold) for an Invalid quorum.  `0` means no Invalid policy:
+    /// legacy V2 semantics, where Invalid uses the Yes/No threshold and
+    /// displacement is unrestricted.  A real policy threshold is always at least
+    /// 1, so `0` is an unambiguous sentinel.
+    ///
+    /// When non-zero it must be strictly greater than the Yes/No threshold of
+    /// `rule` and at most the member count (enforced by `validate_invalid_policy`).
+    /// Price / WeightedKeys rules reject a non-zero value (`InvalidConfig`).
+    pub invalid_threshold: u32,
+    /// Only meaningful when `invalid_threshold > 0`; must be `false` otherwise.
+    /// When `false`, an Invalid quorum can never displace a pending Yes/No
+    /// proposal.  When `true`, at most one displacement is permitted per market
+    /// (tracked by `DataKey::InvalidDisplaced`).
+    pub invalid_allow_displacement: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -305,20 +296,21 @@ pub struct LegResult {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, xdr::ToXdr, Env};
+    use soroban_sdk::{testutils::Address as _, vec, xdr::ToXdr, Env};
 
-    /// `#[contracttype]` enums encode their case name as an `ScSymbol`, so the
-    /// XDR of the shared `Outcome` must stay `Yes`/`No`, never reordered.
+    /// Unit `#[contracttype]` enum variants encode as a one-element `Vec` holding
+    /// their case name as an `ScSymbol`, so the XDR of the shared `Outcome` must
+    /// stay `Yes`/`No`, never reordered.
     #[test]
     fn outcome_encodes_as_expected_symbols() {
         let env = Env::default();
         assert_eq!(
             Outcome::Yes.to_xdr(&env),
-            Symbol::new(&env, "Yes").to_xdr(&env)
+            vec![&env, Symbol::new(&env, "Yes")].to_xdr(&env)
         );
         assert_eq!(
             Outcome::No.to_xdr(&env),
-            Symbol::new(&env, "No").to_xdr(&env)
+            vec![&env, Symbol::new(&env, "No")].to_xdr(&env)
         );
     }
 
@@ -333,7 +325,10 @@ mod test {
             (Category::Culture, "Culture"),
             (Category::Other, "Other"),
         ] {
-            assert_eq!(value.to_xdr(&env), Symbol::new(&env, name).to_xdr(&env));
+            assert_eq!(
+                value.to_xdr(&env),
+                vec![&env, Symbol::new(&env, name)].to_xdr(&env)
+            );
         }
     }
 

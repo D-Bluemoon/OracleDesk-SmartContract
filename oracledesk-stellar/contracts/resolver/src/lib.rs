@@ -51,19 +51,30 @@ fn map_market_core_error(e: market_core::Error) -> Error {
 }
 
 /// Unwrap a cross-contract call result into the resolver's error type.
+///
+/// soroban-sdk 27 `try_*` clients return `Result<Result<T, ConversionError>,
+/// Result<ContractError, InvokeError>>`: a return-value conversion failure is
+/// the inner `Err`, and a contract error is the outer `Err(Ok(_))`.
 fn core_call<T>(
-    r: Result<Result<T, market_core::Error>, Result<soroban_sdk::Error, soroban_sdk::InvokeError>>,
+    r: Result<
+        Result<T, soroban_sdk::ConversionError>,
+        Result<market_core::Error, soroban_sdk::InvokeError>,
+    >,
 ) -> Result<T, Error> {
     match r {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(map_market_core_error(e)),
-        Err(_) => Err(Error::MarketCoreCallFailed),
+        Ok(Err(_)) => Err(Error::MarketCoreCallFailed),
+        Err(Ok(e)) => Err(map_market_core_error(e)),
+        Err(Err(_)) => Err(Error::MarketCoreCallFailed),
     }
 }
 
 /// Unwrap a reasoning-registry cross-contract call.
+///
+/// Same soroban-sdk 27 `try_*` shape as `core_call`; any failure is opaque to
+/// the caller, so the error payloads are not inspected.
 fn registry_call<T, E>(
-    r: Result<Result<T, E>, Result<soroban_sdk::Error, soroban_sdk::InvokeError>>,
+    r: Result<Result<T, soroban_sdk::ConversionError>, Result<E, soroban_sdk::InvokeError>>,
 ) -> Result<T, Error> {
     match r {
         Ok(Ok(v)) => Ok(v),
@@ -71,12 +82,12 @@ fn registry_call<T, E>(
     }
 }
 
-/// Convert the shared `Outcome` to the market-core imported `Outcome`.
+/// Convert the shared `Outcome` (Yes/No only) to the market-core imported
+/// `Outcome`. `Invalid` never reaches here: it is routed to `void_market`.
 fn to_core_outcome(o: &Outcome) -> market_core::Outcome {
     match o {
         Outcome::Yes => market_core::Outcome::Yes,
         Outcome::No => market_core::Outcome::No,
-        Outcome::Invalid => market_core::Outcome::Invalid,
     }
 }
 
@@ -3574,7 +3585,8 @@ impl Resolver {
                 // reads use the pinned epoch. The epoch bound check is already
                 // enforced by compute_pinned_epoch inside committee_snapshot.
                 if !env.storage().persistent().has(&DataKey::MarketEpoch(market_id)) {
-                    Self::pin_epoch_for_market(env, market_id, ref_spec, market.close_time)?;
+                    let close_time = Self::market_close_time(env, market_id)?;
+                    Self::pin_epoch_for_market(env, market_id, ref_spec, close_time)?;
                 }
                 // Re-read the pinned snapshot to be sure we use the stored pin.
                 let pinned = if let Some((cid, ep)) =
@@ -7253,7 +7265,7 @@ mod test {
 
         let new_members = Vec::from_array(&f.env, [members[1].clone(), members[2].clone()]);
         f.resolver
-            .propose_rotation(&0, &new_members, &2, &MIN_ROTATION_DELAY);
+            .propose_rotation(&0, &new_members, &2);
         f.env.ledger().set_timestamp(2_000 + MIN_ROTATION_DELAY + 1);
         f.resolver.execute_rotation(&0);
 
@@ -7270,12 +7282,12 @@ mod test {
         let new_member = Address::generate(&f.env);
         let new_members = Vec::from_array(&f.env, [new_member.clone(), members[2].clone()]);
         f.resolver
-            .propose_rotation(&0, &new_members, &2, &MIN_ROTATION_DELAY);
+            .propose_rotation(&0, &new_members, &2);
         f.env.ledger().set_timestamp(2_000 + MIN_ROTATION_DELAY + 1);
         f.resolver.execute_rotation(&0);
 
         f.env.ledger().set_timestamp(2_000);
-        f.resolver.pin_committee_epoch(&f.market_id).unwrap();
+        f.resolver.pin_committee_epoch(&f.market_id);
         let pin = f.resolver.market_committee_epoch(&f.market_id).unwrap();
         assert_eq!(pin.1, 1u32, "should pin to epoch 1 (in force at close)");
 
@@ -7290,8 +7302,8 @@ mod test {
     fn pin_committee_epoch_is_idempotent() {
         let (f, _members) = committee_market(3, 2, 1);
         f.env.ledger().set_timestamp(2_000);
-        let first = f.resolver.pin_committee_epoch(&f.market_id).unwrap();
-        let second = f.resolver.pin_committee_epoch(&f.market_id).unwrap();
+        let first = f.resolver.pin_committee_epoch(&f.market_id);
+        let second = f.resolver.pin_committee_epoch(&f.market_id);
         assert_eq!(first.1, second.1);
     }
 
@@ -7306,7 +7318,7 @@ mod test {
     #[test]
     fn committee_members_at_returns_snapshot() {
         let (f, _members) = committee_market(3, 2, 1);
-        let (returned_members, threshold) = f.resolver.committee_members_at(&0, &1).unwrap();
+        let (returned_members, threshold) = f.resolver.committee_members_at(&0, &1);
         assert_eq!(threshold, 2);
         assert_eq!(returned_members.len(), 3);
     }
@@ -7362,11 +7374,13 @@ mod test {
             .persistent()
             .remove(&DataKey::EpochStart(0, 1));
         f.env.ledger().set_timestamp(2_000);
-        let result = f.resolver.pin_committee_epoch(&f.market_id);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().1, 1u32);
+        let pinned = f.resolver.pin_committee_epoch(&f.market_id);
+        assert_eq!(pinned.1, 1u32);
     }
 }
+
+#[cfg(test)]
+fn bytes_to_vec(bytes: &Bytes) -> std::vec::Vec<u8> {
     let mut out = std::vec![0u8; bytes.len() as usize];
     bytes.copy_into_slice(&mut out);
     out
