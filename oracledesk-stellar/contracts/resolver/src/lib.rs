@@ -3580,7 +3580,8 @@ impl Resolver {
                 // reads use the pinned epoch. The epoch bound check is already
                 // enforced by compute_pinned_epoch inside committee_snapshot.
                 if !env.storage().persistent().has(&DataKey::MarketEpoch(market_id)) {
-                    Self::pin_epoch_for_market(env, market_id, ref_spec, market.close_time)?;
+                    let close_time = Self::market_close_time(env, market_id)?;
+                    Self::pin_epoch_for_market(env, market_id, ref_spec, close_time)?;
                 }
                 // Re-read the pinned snapshot to be sure we use the stored pin.
                 let pinned = if let Some((cid, ep)) =
@@ -7259,7 +7260,7 @@ mod test {
 
         let new_members = Vec::from_array(&f.env, [members[1].clone(), members[2].clone()]);
         f.resolver
-            .propose_rotation(&0, &new_members, &2, &MIN_ROTATION_DELAY);
+            .propose_rotation(&0, &new_members, &2);
         f.env.ledger().set_timestamp(2_000 + MIN_ROTATION_DELAY + 1);
         f.resolver.execute_rotation(&0);
 
@@ -7276,12 +7277,12 @@ mod test {
         let new_member = Address::generate(&f.env);
         let new_members = Vec::from_array(&f.env, [new_member.clone(), members[2].clone()]);
         f.resolver
-            .propose_rotation(&0, &new_members, &2, &MIN_ROTATION_DELAY);
+            .propose_rotation(&0, &new_members, &2);
         f.env.ledger().set_timestamp(2_000 + MIN_ROTATION_DELAY + 1);
         f.resolver.execute_rotation(&0);
 
         f.env.ledger().set_timestamp(2_000);
-        f.resolver.pin_committee_epoch(&f.market_id).unwrap();
+        f.resolver.pin_committee_epoch(&f.market_id);
         let pin = f.resolver.market_committee_epoch(&f.market_id).unwrap();
         assert_eq!(pin.1, 1u32, "should pin to epoch 1 (in force at close)");
 
@@ -7296,8 +7297,8 @@ mod test {
     fn pin_committee_epoch_is_idempotent() {
         let (f, _members) = committee_market(3, 2, 1);
         f.env.ledger().set_timestamp(2_000);
-        let first = f.resolver.pin_committee_epoch(&f.market_id).unwrap();
-        let second = f.resolver.pin_committee_epoch(&f.market_id).unwrap();
+        let first = f.resolver.pin_committee_epoch(&f.market_id);
+        let second = f.resolver.pin_committee_epoch(&f.market_id);
         assert_eq!(first.1, second.1);
     }
 
@@ -7312,7 +7313,7 @@ mod test {
     #[test]
     fn committee_members_at_returns_snapshot() {
         let (f, _members) = committee_market(3, 2, 1);
-        let (returned_members, threshold) = f.resolver.committee_members_at(&0, &1).unwrap();
+        let (returned_members, threshold) = f.resolver.committee_members_at(&0, &1);
         assert_eq!(threshold, 2);
         assert_eq!(returned_members.len(), 3);
     }
@@ -7368,9 +7369,8 @@ mod test {
             .persistent()
             .remove(&DataKey::EpochStart(0, 1));
         f.env.ledger().set_timestamp(2_000);
-        let result = f.resolver.pin_committee_epoch(&f.market_id);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().1, 1u32);
+        let pinned = f.resolver.pin_committee_epoch(&f.market_id);
+        assert_eq!(pinned.1, 1u32);
     }
 }
 
