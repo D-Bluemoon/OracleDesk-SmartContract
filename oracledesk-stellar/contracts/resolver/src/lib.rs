@@ -26,6 +26,60 @@ mod market_core {
 }
 use market_core::Client as MarketCoreClient;
 
+// ─── Cross-contract call helpers (#293 / ADR 0006) ───────────────────────────
+
+/// Base discriminant for resolver error codes (ADR 0006: 1001..=1999).
+pub const RESOLVER_ERROR_BASE: u32 = 1000;
+
+/// Map a market-core error to the resolver's cross-contract error range.
+fn map_market_core_error(e: market_core::Error) -> Error {
+    use market_core::Error as M;
+    match e {
+        M::MarketNotFound => Error::MarketCoreMarketNotFound,
+        M::NotFinal => Error::MarketCoreNotFinal,
+        M::MarketNotOpen => Error::MarketCoreMarketNotOpen,
+        M::MarketClosed => Error::MarketCoreMarketClosed,
+        M::InsufficientLiquidity => Error::MarketCoreInsufficientLiquidity,
+        M::InsufficientShares => Error::MarketCoreInsufficientShares,
+        M::AlreadyClaimed => Error::MarketCoreAlreadyClaimed,
+        M::NothingToRedeem => Error::MarketCoreNothingToRedeem,
+        M::InvalidAmount => Error::MarketCoreInvalidAmount,
+        M::Overflow => Error::MarketCoreOverflow,
+        M::SlippageExceeded => Error::MarketCoreSlippageExceeded,
+        _ => Error::MarketCoreCallFailed,
+    }
+}
+
+/// Unwrap a cross-contract call result into the resolver's error type.
+fn core_call<T>(
+    r: Result<Result<T, market_core::Error>, Result<soroban_sdk::Error, soroban_sdk::InvokeError>>,
+) -> Result<T, Error> {
+    match r {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(map_market_core_error(e)),
+        Err(_) => Err(Error::MarketCoreCallFailed),
+    }
+}
+
+/// Unwrap a reasoning-registry cross-contract call.
+fn registry_call<T, E>(
+    r: Result<Result<T, E>, Result<soroban_sdk::Error, soroban_sdk::InvokeError>>,
+) -> Result<T, Error> {
+    match r {
+        Ok(Ok(v)) => Ok(v),
+        _ => Err(Error::RegistryCallFailed),
+    }
+}
+
+/// Convert the shared `Outcome` to the market-core imported `Outcome`.
+fn to_core_outcome(o: &Outcome) -> market_core::Outcome {
+    match o {
+        Outcome::Yes => market_core::Outcome::Yes,
+        Outcome::No => market_core::Outcome::No,
+        Outcome::Invalid => market_core::Outcome::Invalid,
+    }
+}
+
 // The resolution-spec surface is XDR-consensus-critical (`resolution_hash =
 // sha256(spec.to_xdr())`), so its definitions now live in the shared
 // `oracledesk-types` crate rather than being duplicated per contract. Re-export
@@ -72,12 +126,8 @@ pub const MAX_COMMITTEE: u32 = 32;
 /// Minimum time-lock delay for proposing and executing committee rotations (1 day).
 pub const MIN_ROTATION_DELAY: u64 = 86_400;
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OracleAsset {
-    Stellar(Address),
-    Other(Symbol),
-}
+// #293: removed duplicate local OracleAsset — the shared type from oracledesk_types is re-exported
+// above (line 35). Keeping it here caused E0255 / orphan-impl errors.
 
 /// Grace period for revealing specs before guardian void is allowed (3 days).
 pub const REVEAL_GRACE_SECS: u64 = 3 * 86_400;
@@ -508,6 +558,20 @@ pub enum Error {
     NoPendingAdmin = 42,
     /// A proposed admin handover was not accepted within its `expires_at`.
     PendingAdminExpired = 43,
+    // ── Cross-contract error range (ADR 0006, 1001..=1999) ──────────────────
+    MarketCoreMarketNotFound      = 1044,
+    MarketCoreNotFinal            = 1045,
+    MarketCoreMarketNotOpen       = 1046,
+    MarketCoreMarketClosed        = 1047,
+    MarketCoreInsufficientLiquidity = 1048,
+    MarketCoreInsufficientShares  = 1049,
+    MarketCoreAlreadyClaimed      = 1050,
+    MarketCoreNothingToRedeem     = 1051,
+    MarketCoreInvalidAmount       = 1052,
+    MarketCoreOverflow            = 1053,
+    MarketCoreSlippageExceeded    = 1054,
+    MarketCoreCallFailed          = 1055,
+    RegistryCallFailed            = 1056,
 }
 
 #[contracttype]
