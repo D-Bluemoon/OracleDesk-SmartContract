@@ -51,19 +51,30 @@ fn map_market_core_error(e: market_core::Error) -> Error {
 }
 
 /// Unwrap a cross-contract call result into the resolver's error type.
+///
+/// soroban-sdk 27 `try_*` clients return `Result<Result<T, ConversionError>,
+/// Result<ContractError, InvokeError>>`: a return-value conversion failure is
+/// the inner `Err`, and a contract error is the outer `Err(Ok(_))`.
 fn core_call<T>(
-    r: Result<Result<T, market_core::Error>, Result<soroban_sdk::Error, soroban_sdk::InvokeError>>,
+    r: Result<
+        Result<T, soroban_sdk::ConversionError>,
+        Result<market_core::Error, soroban_sdk::InvokeError>,
+    >,
 ) -> Result<T, Error> {
     match r {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(map_market_core_error(e)),
-        Err(_) => Err(Error::MarketCoreCallFailed),
+        Ok(Err(_)) => Err(Error::MarketCoreCallFailed),
+        Err(Ok(e)) => Err(map_market_core_error(e)),
+        Err(Err(_)) => Err(Error::MarketCoreCallFailed),
     }
 }
 
 /// Unwrap a reasoning-registry cross-contract call.
+///
+/// Same soroban-sdk 27 `try_*` shape as `core_call`; any failure is opaque to
+/// the caller, so the error payloads are not inspected.
 fn registry_call<T, E>(
-    r: Result<Result<T, E>, Result<soroban_sdk::Error, soroban_sdk::InvokeError>>,
+    r: Result<Result<T, soroban_sdk::ConversionError>, Result<E, soroban_sdk::InvokeError>>,
 ) -> Result<T, Error> {
     match r {
         Ok(Ok(v)) => Ok(v),
@@ -71,12 +82,12 @@ fn registry_call<T, E>(
     }
 }
 
-/// Convert the shared `Outcome` to the market-core imported `Outcome`.
+/// Convert the shared `Outcome` (Yes/No only) to the market-core imported
+/// `Outcome`. `Invalid` never reaches here: it is routed to `void_market`.
 fn to_core_outcome(o: &Outcome) -> market_core::Outcome {
     match o {
         Outcome::Yes => market_core::Outcome::Yes,
         Outcome::No => market_core::Outcome::No,
-        Outcome::Invalid => market_core::Outcome::Invalid,
     }
 }
 
