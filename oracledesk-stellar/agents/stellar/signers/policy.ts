@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { Address, Operation, Transaction, TransactionBuilder, xdr } from "@stellar/stellar-sdk";
+import { Address, FeeBumpTransaction, Operation, Transaction, TransactionBuilder, xdr } from "@stellar/stellar-sdk";
 import type { SignerPolicy } from "./types.js";
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -20,26 +20,18 @@ export interface ValidatedInvocation {
   argsHash: string;
 }
 
-export function validateTransaction(
-  transactionXdr: string,
-  networkPassphrase: string,
-  policy: SignerPolicy,
-): ValidatedInvocation {
+function parseEnvelope(transactionXdr: string, networkPassphrase: string, policy: SignerPolicy) {
   if (networkPassphrase !== policy.networkPassphrase) {
     throw new Error("network passphrase does not match signer policy");
   }
-
-  let parsed: ReturnType<typeof TransactionBuilder.fromXDR>;
   try {
-    parsed = TransactionBuilder.fromXDR(transactionXdr, networkPassphrase);
+    return TransactionBuilder.fromXDR(transactionXdr, networkPassphrase);
   } catch {
     throw new Error("transaction XDR is invalid or unsupported");
   }
-  if (!(parsed instanceof Transaction)) {
-    throw new Error("fee-bump and non-classic transaction envelopes are unsupported");
-  }
+}
 
-  const tx = parsed;
+function validateInvocation(tx: Transaction, policy: SignerPolicy): ValidatedInvocation {
   if (!policy.allowedSourceAddresses.includes(tx.source)) {
     throw new Error("transaction source is not allowed by signer policy");
   }
@@ -93,6 +85,34 @@ export function validateTransaction(
     functionName,
     argsHash,
   };
+}
+
+export function validateTransaction(
+  transactionXdr: string,
+  networkPassphrase: string,
+  policy: SignerPolicy,
+): ValidatedInvocation {
+  const parsed = parseEnvelope(transactionXdr, networkPassphrase, policy);
+  if (!(parsed instanceof Transaction)) {
+    throw new Error("fee-bump and non-classic transaction envelopes are unsupported");
+  }
+  return validateInvocation(parsed, policy);
+}
+
+export function validateFeeBumpTransaction(
+  transactionXdr: string,
+  networkPassphrase: string,
+  policy: SignerPolicy,
+  expectedFeePayer: string,
+): ValidatedInvocation {
+  const parsed = parseEnvelope(transactionXdr, networkPassphrase, policy);
+  if (!(parsed instanceof FeeBumpTransaction)) {
+    throw new Error("expected a fee-bump transaction envelope");
+  }
+  if (parsed.feeSource !== expectedFeePayer) {
+    throw new Error("fee bump fee source is not the configured fee payer");
+  }
+  return validateInvocation(parsed.innerTransaction, policy);
 }
 
 export function assertSigningRequest(

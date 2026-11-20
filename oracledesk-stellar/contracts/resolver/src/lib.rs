@@ -338,6 +338,19 @@ pub struct Committee {
     pub rotation_delay: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuleKind {
+    Price,
+    Signers,
+    WeightedKeys,
+    SignersDisputable,
+    Committee,
+    Hybrid,
+    ScaledPrice,
+    Twap,
+}
+
 /// A proposed rotation of committee members/threshold waiting for its delay.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -961,6 +974,29 @@ impl Resolver {
 
     pub fn market_core(env: Env) -> Address {
         env.storage().instance().get(&DataKey::MarketCore).unwrap()
+    }
+
+    pub fn rule_kind(env: Env, market_id: u64) -> Option<RuleKind> {
+        let storage = env.storage().persistent();
+        if storage.has(&DataKey::Price(market_id)) {
+            Some(RuleKind::Price)
+        } else if storage.has(&DataKey::Signers(market_id)) {
+            Some(RuleKind::Signers)
+        } else if storage.has(&DataKey::WeightedKeys(market_id)) {
+            Some(RuleKind::WeightedKeys)
+        } else if storage.has(&DataKey::Disputable(market_id)) {
+            Some(RuleKind::SignersDisputable)
+        } else if storage.has(&DataKey::CommitteeSpec(market_id)) {
+            Some(RuleKind::Committee)
+        } else if storage.has(&DataKey::Hybrid(market_id)) {
+            Some(RuleKind::Hybrid)
+        } else if storage.has(&DataKey::PriceScaled(market_id)) {
+            Some(RuleKind::ScaledPrice)
+        } else if storage.has(&DataKey::PriceTwap(market_id)) {
+            Some(RuleKind::Twap)
+        } else {
+            None
+        }
     }
 
     pub fn admin(env: Env) -> Result<Address, Error> {
@@ -3068,14 +3104,14 @@ impl Resolver {
         commitment: &BytesN<32>,
     ) -> Result<(), Error> {
         Self::assert_unconfigured(env, market_id)?;
-        Self::validate_rule(rule)?;
+        Self::validate_rule(env, rule)?;
         let close_time = Self::assert_matches_commitment(env, market_id, commitment)?;
         Self::store_rule(env, market_id, rule);
         Self::bump_market_entries(env, market_id, close_time);
         Ok(())
     }
 
-    fn validate_rule(rule: &ResolutionSpec) -> Result<(), Error> {
+    fn validate_rule(env: &Env, rule: &ResolutionSpec) -> Result<(), Error> {
         let valid = match rule {
             ResolutionSpec::Price(cfg) => cfg.threshold >= 0 && cfg.max_staleness != 0,
             ResolutionSpec::Signers(cfg) => {
@@ -3086,7 +3122,16 @@ impl Resolver {
             }
             ResolutionSpec::WeightedKeys(cfg) => Self::weighted_config_is_valid(cfg),
             ResolutionSpec::SignersDisputable(cfg) => Self::disputable_config_is_valid(cfg),
-            ResolutionSpec::Committee(cfg) => cfg.dispute_window != 0,
+            ResolutionSpec::Committee(cfg) => {
+                if cfg.dispute_window == 0 {
+                    return Err(Error::InvalidConfig);
+                }
+                let committee = Self::load_committee(env, cfg.committee_id)?;
+                if committee.epoch < cfg.min_epoch {
+                    return Err(Error::RotationBoundExceeded);
+                }
+                true
+            }
             ResolutionSpec::Hybrid(cfg) => {
                 cfg.price.threshold >= 0
                     && cfg.price.max_staleness != 0

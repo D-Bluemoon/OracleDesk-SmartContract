@@ -14,6 +14,7 @@ import { toMarketState } from "../core/state/types.js";
 import type { MarketSignal, SignalSource } from "../core/strategy.js";
 import { LocalTraceStore } from "../core/trace.js";
 import type { AgentConfig, Tunables } from "../core/config.js";
+import { evaluateAgentRisk, type AgentRiskState, type AgentRiskEvaluation } from "../core/risk.js";
 import type { CapsView, SizingParams } from "../core/sizing.js";
 import { StellarAdapter, type Deployments } from "../stellar/adapter.js";
 import { BondBudget } from "../core/bond-budget.js";
@@ -25,7 +26,7 @@ import type { RuntimeOptions } from "./runtime.js";
 import { FileStateStore, MemoryStateStore, type StateStore } from "./state.js";
 import type { MakerDeps } from "./tasks/maker.js";
 import type { WatcherTaskDeps } from "./tasks/watcher.js";
-import { fixtureCandidates, type TraderCandidate, type TraderDeps } from "./tasks/trader.js";
+import { fixtureCandidates, type TraderCandidate, type TraderDeps, type TraderRiskCheck } from "./tasks/trader.js";
 
 /** Placeholder signal source until a real one is wired in (see docs/wave-issues).
  * Deterministic so dry-runs are reproducible. */
@@ -45,12 +46,16 @@ export const demoSignalSource: SignalSource = {
 };
 
 /** The adapter for a validated config. Only live mode is handed the secret. */
-export function buildAdapter(cfg: AgentConfig): StellarAdapter {
+export function buildAdapter(
+  cfg: AgentConfig,
+  sendGuard?: { check?: () => void | Promise<void> },
+): StellarAdapter {
   const common = {
     networkPassphrase: cfg.networkPassphrase,
     rpcUrl: cfg.rpcUrl,
     agentAddress: cfg.agentAddress,
     deployments: cfg.deployments,
+    beforeSend: () => sendGuard?.check?.(),
   };
   switch (cfg.mode) {
     case "live":
@@ -123,6 +128,64 @@ export function chainCandidates(
   };
 }
 
+export function traderRiskCheck(
+  adapter: Pick<StellarAdapter, "riskCaps" | "getAgent" | "marketExposure">,
+): TraderRiskCheck {
+  return async (input) => {
+    try {
+      const [caps, policy, exposure] = await Promise.all([
+        adapter.riskCaps(),
+        adapter.getAgent(),
+        adapter.marketExposure(input.marketId),
+      ]);
+      if (!policy) {
+        return { violations: [], unverifiable: ["treasury agent policy is unavailable"] };
+      }
+      const now = BigInt(Math.floor(Date.now() / 1_000));
+      const hour = now / 3_600n;
+      const emptyWindow = () => ({ headHour: hour, headIdx: 0, amounts: Array.from({ length: 25 }, () => 0n) });
+      const state: AgentRiskState = {
+        now,
+        global: {
+          maxTrade: caps.maxTrade,
+          maxMarket: caps.maxMarket,
+          maxDaily: caps.maxDaily,
+          maxNetExposure: caps.maxMarket * 128n,
+        },
+        agent: {
+          active: policy.active,
+          roles: policy.roles,
+          maxTrade: caps.maxTrade,
+          maxDaily: caps.maxDaily,
+        },
+        usage: { global: emptyWindow(), agent: emptyWindow() },
+        idleCapital: input.amount,
+        queueReservedCapital: 0n,
+        netExposure: 0n,
+        marketExposure: exposure,
+        marketNetPosition: { collateralIn: 0n, collateralOut: 0n },
+        yieldLiquidity: { enabled: false, available: 0n },
+        price: {
+          maxBuyPriceBps: 10_000n,
+          minSellPriceBps: 0n,
+          maxImpactBps: 10_000n,
+          maxSlippageBps: 10_000n,
+        },
+      };
+      return evaluateAgentRisk({
+        kind: "buy",
+        amount: input.amount,
+        priceBeforeBps: input.priceBeforeBps,
+        priceAfterBps: input.priceAfterBps,
+        quotedShares: input.quotedShares,
+        minSharesOut: input.minSharesOut,
+      }, state) satisfies AgentRiskEvaluation;
+    } catch (err) {
+      return { violations: [], unverifiable: [err instanceof Error ? err.message : String(err)] };
+    }
+  };
+}
+
 export function makerDeps(t: Tunables, adapter: StellarAdapter, deployments: Deployments): MakerDeps {
   const reader = stateReader(t.rpcUrl, deployments);
   return {
@@ -146,6 +209,7 @@ export function traderDeps(
   deployments: Deployments | undefined,
   nowSecs: () => number,
   dueDiligence?: TraderDeps["dueDiligence"],
+  riskCheck?: TraderDeps["riskCheck"],
 ): TraderDeps {
   return {
     adapter,
@@ -166,6 +230,7 @@ export function traderDeps(
     deadlineSecs: t.trading.deadlineSecs,
     nowSecs,
     dueDiligence,
+    riskCheck,
   };
 }
 

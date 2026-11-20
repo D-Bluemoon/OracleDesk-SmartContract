@@ -74,8 +74,13 @@ policies) timelocked, the flag is off by default; the script prints the
 this ADR. `scripts/wire-timelock.sh` moves an *existing* deployment to the
 timelock through the two-step admin transfer instead.
 
-Operators run admin actions as: `schedule` (proposer) → wait `delay_for` →
-`execute` (executor or anyone). Multisig signer weights enforce the
+Operators run admin actions through `scripts/governance/timelock-cli.ts` (see
+`docs/governance-cli.md`): `propose` encodes the call from the target contract's
+spec, simulates it as the timelock, checks the on-chain spec and auth tree, then
+`schedule`s it as the proposer; `status` tracks `eta`/`expires`; `execute` runs
+it after the delay (executor or anyone). The CLI writes reviewable proposal
+records under `governance/proposals/<network>/` and refuses non-unit returns,
+unsupported self-calls and spec drift. Multisig signer weights enforce the
 thresholds on each role's `require_auth`.
 
 ## Consequences

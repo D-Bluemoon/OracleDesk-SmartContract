@@ -1,7 +1,7 @@
 /**
  * The treasury's operating mode as an agent-side gate (#272). Opening new
  * exposure (creating markets, buying) is allowed only in `Normal`; in
- * `AgentsHalted`, `AdminPaused` and `Emergency` the contract would refuse it
+ * `AgentsHalted`, `Paused` and `Emergency` the contract would refuse it
  * (`DrawdownTripped`, `Paused`, `EmergencyMode`). Reading the mode once per tick
  * and skipping the work avoids discovering the halt through a failed simulation.
  *

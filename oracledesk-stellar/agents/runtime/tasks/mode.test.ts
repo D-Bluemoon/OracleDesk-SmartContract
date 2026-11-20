@@ -79,10 +79,10 @@ function trader(mode: TreasuryMode | undefined, buys: unknown[], modeReads: { n:
 test("openingsAllowed: only Normal allows opening positions, and the skip is logged with the mode", async () => {
   const lines: { event: string; fields?: Record<string, unknown> }[] = [];
   const ctx = { log: { info: (event: string, fields?: Record<string, unknown>) => lines.push({ event, fields }) } } as unknown as TaskContext;
-  for (const mode of ["Normal", "AgentsHalted", "AdminPaused", "Emergency"] as TreasuryMode[]) {
+  for (const mode of ["Normal", "AgentsHalted", "Paused", "Emergency"] as TreasuryMode[]) {
     assert.equal(await openingsAllowed({ treasuryMode: async () => mode }, ctx, "T"), mode === "Normal", mode);
   }
-  assert.deepEqual(lines.map((l) => [l.event, l.fields?.mode]), [["T_SKIP_MODE", "AgentsHalted"], ["T_SKIP_MODE", "AdminPaused"], ["T_SKIP_MODE", "Emergency"]]);
+  assert.deepEqual(lines.map((l) => [l.event, l.fields?.mode]), [["T_SKIP_MODE", "AgentsHalted"], ["T_SKIP_MODE", "Paused"], ["T_SKIP_MODE", "Emergency"]]);
 });
 
 test("openingsAllowed: an adapter that cannot read the mode is treated as Normal (the contract's gate stays the backstop)", async () => {
@@ -96,7 +96,7 @@ test("the trader reads the mode once per tick and buys only while Normal", async
   assert.equal(reads.n, 1, "one read per tick, not per market");
   assert.ok(normalBuys.length > 0);
 
-  for (const mode of ["AgentsHalted", "AdminPaused", "Emergency"] as TreasuryMode[]) {
+  for (const mode of ["AgentsHalted", "Paused", "Emergency"] as TreasuryMode[]) {
     const buys: unknown[] = [];
     const r = { n: 0 };
     const log = await once(trader(mode, buys, r));

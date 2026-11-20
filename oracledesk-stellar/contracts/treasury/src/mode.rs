@@ -1,7 +1,7 @@
 //! The treasury's operating mode (issue #272).
 //!
 //! Before this module the treasury tracked four booleans (`Paused`,
-//! `AdminPaused`, `DrawdownTripped`, `DrawdownAcknowledged`) and every
+//! `Paused`, `DrawdownTripped`, `DrawdownAcknowledged`) and every
 //! entrypoint read a different combination of them. The result was accidental:
 //! a drawdown trip (agents lost money) opened `emergency_withdraw`, the exit
 //! meant for "market-core is broken", and clearing one pause silently cleared
@@ -17,7 +17,7 @@
 use soroban_sdk::{contracttype, Symbol};
 
 /// What the treasury is doing right now, derived from [`ModeState`] with the
-/// priority `Emergency > AdminPaused > AgentsHalted > Normal`.
+/// priority `Emergency > Paused > AgentsHalted > Unwinding > Normal`.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -27,11 +27,15 @@ pub enum Mode {
     /// it. Depositors keep their normal exit (queued withdrawals at NAV).
     AgentsHalted,
     /// The admin paused the treasury: no deposits and no agent trading.
-    AdminPaused,
-    /// The admin declared an emergency (only from `AdminPaused`): the
+    Paused,
+    /// The admin declared an emergency (only from `Paused`): the
     /// in-kind/idle `emergency_withdraw` exit opens, and queueing new
     /// withdrawals closes.
     Emergency,
+    /// The admin chose an orderly wind-down (`set_mode(Unwinding)`, #150):
+    /// agents may not open or add exposure, but may sell (see `unwind_sell` and
+    /// the per-market exit floors), and everything else runs as in `Normal`.
+    Unwinding,
 }
 
 /// Why the treasury is not in `Normal`. Each reason is stored independently, so
@@ -50,6 +54,8 @@ pub struct ModeState {
     pub emergency_at: Option<u64>,
     /// The reason the admin gave. Set with `emergency_at`.
     pub emergency_reason: Option<Symbol>,
+    /// Ledger time the admin set `Unwinding`. Cleared by `set_mode(Normal)`.
+    pub unwinding_at: Option<u64>,
 }
 
 // The two (time, reason) pairs are flat fields rather than `Option<(u64,
@@ -64,17 +70,20 @@ impl ModeState {
             admin_pause_reason: None,
             emergency_at: None,
             emergency_reason: None,
+            unwinding_at: None,
         }
     }
 
-    /// The effective mode: `Emergency > AdminPaused > AgentsHalted > Normal`.
+    /// The effective mode: `Emergency > Paused > AgentsHalted > Unwinding > Normal`.
     pub fn mode(&self) -> Mode {
         if self.emergency_at.is_some() {
             Mode::Emergency
         } else if self.admin_pause_at.is_some() {
-            Mode::AdminPaused
+            Mode::Paused
         } else if self.drawdown_halt.is_some() {
             Mode::AgentsHalted
+        } else if self.unwinding_at.is_some() {
+            Mode::Unwinding
         } else {
             Mode::Normal
         }
@@ -110,8 +119,6 @@ pub enum Op {
     YieldAllocate,
     /// `recall_from_yield`.
     YieldRecall,
-    /// `withdraw` (the admin's direct withdrawal).
-    AdminWithdraw,
     /// `migrate_market`.
     Migrate,
 }
@@ -120,53 +127,61 @@ pub enum Op {
 /// `mode` inside each arm, so a new `Op` or `Mode` does not compile until every
 /// cell is decided.
 ///
-/// | Op | Normal | AgentsHalted | AdminPaused | Emergency |
-/// |---|---|---|---|---|
-/// | Deposit | yes | no | no | no |
-/// | RequestWithdraw | yes | yes | yes | no |
-/// | ClaimWithdraw | yes | yes | yes | yes |
-/// | EmergencyWithdraw | no | no | no | yes |
-/// | AgentOpen | yes | no | no | no |
-/// | AgentReduce | yes | yes | no | no |
-/// | AgentSettle | yes | yes | yes | yes |
-/// | PermissionlessSettle | yes | yes | yes | yes |
-/// | YieldAllocate | yes | no | no | no |
-/// | YieldRecall | yes | yes | yes | yes |
-/// | AdminWithdraw | yes | no | no | no |
-/// | Migrate | yes | no | no | yes |
+/// | Op | Normal | AgentsHalted | Paused | Emergency | Unwinding |
+/// |---|---|---|---|---|---|
+/// | Deposit | yes | no | no | no | yes |
+/// | RequestWithdraw | yes | yes | yes | no | yes |
+/// | ClaimWithdraw | yes | yes | yes | yes | yes |
+/// | EmergencyWithdraw | no | no | no | yes | no |
+/// | AgentOpen | yes | no | no | no | no |
+/// | AgentReduce | yes | yes | no | no | yes |
+/// | AgentSettle | yes | yes | yes | yes | yes |
+/// | PermissionlessSettle | yes | yes | yes | yes | yes |
+/// | YieldAllocate | yes | no | no | no | yes |
+/// | YieldRecall | yes | yes | yes | yes | yes |
+/// | Migrate | yes | no | no | yes | yes |
 pub const fn allowed(mode: Mode, op: Op) -> bool {
     match op {
-        Op::Deposit | Op::AgentOpen | Op::YieldAllocate | Op::AdminWithdraw => match mode {
+        Op::Deposit | Op::YieldAllocate => match mode {
+            Mode::Normal | Mode::Unwinding => true,
+            Mode::AgentsHalted | Mode::Paused | Mode::Emergency => false,
+        },
+        Op::AgentOpen => match mode {
             Mode::Normal => true,
-            Mode::AgentsHalted | Mode::AdminPaused | Mode::Emergency => false,
+            Mode::AgentsHalted | Mode::Paused | Mode::Emergency | Mode::Unwinding => false,
         },
         Op::RequestWithdraw => match mode {
-            Mode::Normal | Mode::AgentsHalted | Mode::AdminPaused => true,
+            Mode::Normal | Mode::AgentsHalted | Mode::Paused | Mode::Unwinding => true,
             Mode::Emergency => false,
         },
         Op::ClaimWithdraw | Op::AgentSettle | Op::PermissionlessSettle | Op::YieldRecall => {
             match mode {
-                Mode::Normal | Mode::AgentsHalted | Mode::AdminPaused | Mode::Emergency => true,
+                Mode::Normal
+                | Mode::AgentsHalted
+                | Mode::Paused
+                | Mode::Emergency
+                | Mode::Unwinding => true,
             }
         }
         Op::EmergencyWithdraw => match mode {
             Mode::Emergency => true,
-            Mode::Normal | Mode::AgentsHalted | Mode::AdminPaused => false,
+            Mode::Normal | Mode::AgentsHalted | Mode::Paused | Mode::Unwinding => false,
         },
         Op::AgentReduce => match mode {
-            Mode::Normal | Mode::AgentsHalted => true,
-            Mode::AdminPaused | Mode::Emergency => false,
+            Mode::Normal | Mode::AgentsHalted | Mode::Unwinding => true,
+            Mode::Paused | Mode::Emergency => false,
         },
         Op::Migrate => match mode {
-            Mode::Normal | Mode::Emergency => true,
-            Mode::AgentsHalted | Mode::AdminPaused => false,
+            Mode::Normal | Mode::Emergency | Mode::Unwinding => true,
+            Mode::AgentsHalted | Mode::Paused => false,
         },
     }
 }
 
 /// Every `Op`, in declaration order (used by the matrix test and `allowed`'s
 /// own exhaustiveness test).
-pub const ALL_OPS: [Op; 12] = [
+#[cfg(test)]
+pub const ALL_OPS: [Op; 11] = [
     Op::Deposit,
     Op::RequestWithdraw,
     Op::ClaimWithdraw,
@@ -177,16 +192,17 @@ pub const ALL_OPS: [Op; 12] = [
     Op::PermissionlessSettle,
     Op::YieldAllocate,
     Op::YieldRecall,
-    Op::AdminWithdraw,
     Op::Migrate,
 ];
 
 /// Every `Mode`, in priority order of declaration.
-pub const ALL_MODES: [Mode; 4] = [
+#[cfg(test)]
+pub const ALL_MODES: [Mode; 5] = [
     Mode::Normal,
     Mode::AgentsHalted,
-    Mode::AdminPaused,
+    Mode::Paused,
     Mode::Emergency,
+    Mode::Unwinding,
 ];
 
 #[cfg(test)]
@@ -197,20 +213,19 @@ mod tests {
     /// The table from the issue and ADR 0005, written out cell by cell
     /// independently of `allowed`'s `match`.
     ///
-    /// Columns: Normal, AgentsHalted, AdminPaused, Emergency.
-    const TABLE: [(Op, [bool; 4]); 12] = [
-        (Op::Deposit, [true, false, false, false]),
-        (Op::RequestWithdraw, [true, true, true, false]),
-        (Op::ClaimWithdraw, [true, true, true, true]),
-        (Op::EmergencyWithdraw, [false, false, false, true]),
-        (Op::AgentOpen, [true, false, false, false]),
-        (Op::AgentReduce, [true, true, false, false]),
-        (Op::AgentSettle, [true, true, true, true]),
-        (Op::PermissionlessSettle, [true, true, true, true]),
-        (Op::YieldAllocate, [true, false, false, false]),
-        (Op::YieldRecall, [true, true, true, true]),
-        (Op::AdminWithdraw, [true, false, false, false]),
-        (Op::Migrate, [true, false, false, true]),
+    /// Columns: Normal, AgentsHalted, Paused, Emergency, Unwinding.
+    const TABLE: [(Op, [bool; 5]); 11] = [
+        (Op::Deposit, [true, false, false, false, true]),
+        (Op::RequestWithdraw, [true, true, true, false, true]),
+        (Op::ClaimWithdraw, [true; 5]),
+        (Op::EmergencyWithdraw, [false, false, false, true, false]),
+        (Op::AgentOpen, [true, false, false, false, false]),
+        (Op::AgentReduce, [true, true, false, false, true]),
+        (Op::AgentSettle, [true; 5]),
+        (Op::PermissionlessSettle, [true; 5]),
+        (Op::YieldAllocate, [true, false, false, false, true]),
+        (Op::YieldRecall, [true; 5]),
+        (Op::Migrate, [true, false, false, true, true]),
     ];
 
     #[test]
@@ -267,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_is_derived_with_priority_emergency_pause_halt_normal() {
+    fn mode_is_derived_with_priority_emergency_pause_halt_unwinding_normal() {
         let env = Env::default();
         let why = Symbol::new(&env, "why");
         let mut s = ModeState::normal();
@@ -276,18 +291,21 @@ mod tests {
         assert_eq!(s.mode(), Mode::AgentsHalted);
         s.admin_pause_at = Some(20);
         s.admin_pause_reason = Some(why.clone());
-        assert_eq!(s.mode(), Mode::AdminPaused, "pause outranks a halt");
+        assert_eq!(s.mode(), Mode::Paused, "pause outranks a halt");
         s.emergency_at = Some(30);
         s.emergency_reason = Some(why);
         assert_eq!(s.mode(), Mode::Emergency, "emergency outranks a pause");
         // Reasons are independent: dropping the outer ones reveals the inner.
         s.emergency_at = None;
         s.emergency_reason = None;
-        assert_eq!(s.mode(), Mode::AdminPaused);
+        assert_eq!(s.mode(), Mode::Paused);
         s.admin_pause_at = None;
         s.admin_pause_reason = None;
         assert_eq!(s.mode(), Mode::AgentsHalted);
         s.drawdown_halt = None;
+        s.unwinding_at = Some(40);
+        assert_eq!(s.mode(), Mode::Unwinding);
+        s.unwinding_at = None;
         assert_eq!(s.mode(), Mode::Normal);
     }
 }

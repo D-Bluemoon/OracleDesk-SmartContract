@@ -14,11 +14,12 @@
 #
 #   ./scripts/sync-vendored-wasm.sh            # market_core -> resolver + treasury,
 #                                              # reasoning_registry -> resolver
-#   ./scripts/sync-vendored-wasm.sh resolver   # resolver -> treasury (#273). Run it
+#   ./scripts/sync-vendored-wasm.sh resolver   # resolver -> treasury + router (#273). Run it
 #                                              # only after resolver.wasm was built
 #                                              # against the already-synced
 #                                              # market_core / reasoning_registry,
 #                                              # then rebuild the treasury.
+#   ./scripts/sync-vendored-wasm.sh treasury   # treasury -> router, after that rebuild.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -35,11 +36,12 @@ else
   exit 1
 fi
 
-if [ "${1:-}" = "resolver" ]; then
-  needed="resolver"
-else
-  needed="market_core reasoning_registry"
-fi
+case "${1:-}" in
+  resolver) needed="resolver" ;;
+  treasury) needed="treasury" ;;
+  "") needed="market_core reasoning_registry" ;;
+  *) echo "usage: $0 [resolver|treasury]" >&2; exit 1 ;;
+esac
 for f in $needed; do
   if [ ! -f "$WASM_DIR/$f.wasm" ]; then
     echo "error: $WASM_DIR/$f.wasm is missing — run 'stellar contract build' first" >&2
@@ -54,10 +56,19 @@ sync() { # <built wasm> <vendored wasm>
   echo "synced $vendored -> $(cat "$vendored.sha256")"
 }
 
-if [ "${1:-}" = "resolver" ]; then
-  sync "$WASM_DIR/resolver.wasm" contracts/treasury/resolver.wasm
-else
-  sync "$WASM_DIR/market_core.wasm" contracts/resolver/market_core.wasm
-  sync "$WASM_DIR/market_core.wasm" contracts/treasury/market_core.wasm
-  sync "$WASM_DIR/reasoning_registry.wasm" contracts/resolver/reasoning_registry.wasm
-fi
+case "${1:-}" in
+  resolver)
+    sync "$WASM_DIR/resolver.wasm" contracts/treasury/resolver.wasm
+    sync "$WASM_DIR/resolver.wasm" contracts/router/resolver.wasm
+    ;;
+  treasury)
+    sync "$WASM_DIR/treasury.wasm" contracts/router/treasury.wasm
+    ;;
+  *)
+    sync "$WASM_DIR/market_core.wasm" contracts/resolver/market_core.wasm
+    sync "$WASM_DIR/market_core.wasm" contracts/treasury/market_core.wasm
+    sync "$WASM_DIR/reasoning_registry.wasm" contracts/resolver/reasoning_registry.wasm
+    sync "$WASM_DIR/market_core.wasm" contracts/router/market_core.wasm
+    sync "$WASM_DIR/reasoning_registry.wasm" contracts/router/reasoning_registry.wasm
+    ;;
+esac

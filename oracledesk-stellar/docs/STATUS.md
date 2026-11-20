@@ -431,21 +431,27 @@ markers in the files themselves:
   (`--salt`), and `scripts/migrate-market-core-wiring.sh` upgrades a
   pre-handshake deployment.
 - **Multi-step flows are atomic through the router** (ADR 0009):
-  `create_and_reveal_{signers,price}`, `reveal_spec`, and
-  `buy_and_publish_trace`, so a market cannot exist without its rule and a
-  trade cannot drop its reasoning trace.
+  `create_and_reveal_{signers,price}`, `reveal_spec`,
+  `trade_and_publish_trace` and `agent_trade_and_publish_trace`, so a market
+  cannot exist without its rule and a trade cannot drop its reasoning trace.
+  Trades use `buy_v2`/`sell_v2` bounds, a typed `TraceAction`, and optional
+  chaining/signature; the treasury path verifies the supplied treasury is
+  wired to the configured market-core. `buy_and_publish_trace` is a deprecated
+  wrapper with a breaking `action: string` → `TraceAction` change (bindings
+  0.2.0). The router's vendored wasm is pinned, but its registry wasm is stale
+  (pre-#53), so dynamic publish calls need a current deployed registry.
 - **Residual admin blast radius.** The treasury's config, price policy and
   agent registry are timelocked (loosening waits `config_delay`, tightening
   is immediate), which bounds what a compromised admin can unlock for the
   *agents*; it does not cover `set_paused`, `set_successor` +
-  `migrate_market` (which moves positions out of the vault), or any other
+  `migrate_markets` (which moves positions out of the vault), or any other
   contract's admin. Under the deferred timelock default (above) that
   exposure is still live on testnet.
 - **Treasury vault NAV is conservative, not mark-to-market.** Directional
   exposure in open markets counts as zero, so deposits are slightly cheap
   and withdrawals slightly expensive while positions are open; positions
   opened before a lazy migration from the pre-vault layout, or received by
-  a successor treasury via `migrate_market`, are not in the open-market
+  a successor treasury via `migrate_markets`, are not in the open-market
   index and count as zero until redeemed. See
   `docs/adr/0005-treasury-vault.md` for the residual risks (LP floor moved by
   rebalancing trades, fees swept just after a deposit).
@@ -504,8 +510,8 @@ runtime target.
 ## Treasury operating modes (#272)
 
 The treasury's four pause/drawdown booleans are replaced by an explicit state
-machine (`ModeState`, derived `Mode`: `Normal`, `AgentsHalted`, `AdminPaused`,
-`Emergency`) and one gate table (`mode::allowed`), documented cell by cell in
+machine (`ModeState`, derived `Mode`: `Normal`, `AgentsHalted`, `Paused`,
+`Emergency`, plus the admin-set `Unwinding` from #150) and one gate table (`mode::allowed`), documented cell by cell in
 [ADR 0005](adr/0005-treasury-vault.md). What changed for operators:
 
 - A drawdown halt no longer opens `emergency_withdraw`. That exit needs an
@@ -516,6 +522,19 @@ machine (`ModeState`, derived `Mode`: `Normal`, `AgentsHalted`, `AdminPaused`,
   unpause, and requires the window PnL to have recovered.
 - `close_trade` is refused while admin-paused (it is an agent reduction).
 - New events: `ModeChanged`. New views: `mode`, `mode_state`, `allowed`. New
-  errors: `EmergencyMode` (64), `NotRecovered` (65).
+  errors: `EmergencyMode` (83), `NotRecovered` (84). `set_mode` and
+  `set_paused` stay as compatibility entrypoints over the same state.
 - The mode x entrypoint matrix is an in-crate test (`mode_by_entrypoint_matrix`)
   that fails when a new entrypoint has no row.
+
+## Contributor addendum: declarative testnet deployer (#128)
+
+Added `scripts/deployer/` and `deployments/testnet.manifest.json` providing
+declarative `plan`, `apply`, `verify`, and `migrate-record` workflows against
+live Stellar testnet state, with atomic v2 record checkpointing (preserving all
+v1 top-level keys for `loadDeployments()`, `seed-market.sh`, and `demo.sh`),
+drift and testnet-reset detection, archived-instance restoration, and a hard
+testnet passphrase interlock. `scripts/deploy-testnet.sh` delegates testnet
+runs to the deployer while keeping `NETWORK=local` intact for local E2E runs.
+Verified locally via `scripts/deployer` unit tests (`plan.test.ts` and
+`record.test.ts`). Live testnet apply was not re-run in this session.
