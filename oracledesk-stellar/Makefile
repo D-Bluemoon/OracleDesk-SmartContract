@@ -21,10 +21,15 @@ build:
 	stellar contract build
 	./scripts/sync-vendored-wasm.sh
 	stellar contract build
+	./scripts/sync-vendored-wasm.sh resolver
+	stellar contract build --package treasury
+	./scripts/sync-vendored-wasm.sh treasury
+	stellar contract build --package router
 	cp target/wasm32v1-none/release/market_core.wasm contracts/integration-tests/wasm/
 	cp target/wasm32v1-none/release/resolver.wasm contracts/integration-tests/wasm/
 	cp target/wasm32v1-none/release/treasury.wasm contracts/integration-tests/wasm/
 	cp target/wasm32v1-none/release/reasoning_registry.wasm contracts/integration-tests/wasm/
+	cp target/wasm32v1-none/release/timelock.wasm contracts/integration-tests/wasm/
 
 # Proves the contract build is bit-for-bit reproducible and that the vendored
 # wasm matches a clean build (issue #58). Slow: it compiles the workspace
@@ -35,12 +40,15 @@ verify-wasm:
 # Same check, but only against the current target dir (no clean rebuild).
 check-wasm:
 	./scripts/sync-vendored-wasm.sh
+	./scripts/sync-vendored-wasm.sh resolver
+	./scripts/sync-vendored-wasm.sh treasury
 	git diff --exit-code -- \
 		contracts/resolver/market_core.wasm contracts/treasury/market_core.wasm \
-		contracts/resolver/reasoning_registry.wasm \
+		contracts/resolver/reasoning_registry.wasm contracts/treasury/resolver.wasm \
 		contracts/resolver/market_core.wasm.sha256 \
 		contracts/treasury/market_core.wasm.sha256 \
-		contracts/resolver/reasoning_registry.wasm.sha256
+		contracts/resolver/reasoning_registry.wasm.sha256 \
+		contracts/treasury/resolver.wasm.sha256
 
 test: build
 	cargo test --workspace

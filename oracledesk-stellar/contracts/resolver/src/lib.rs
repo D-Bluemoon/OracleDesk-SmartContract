@@ -165,6 +165,42 @@ impl ResolutionState {
     }
 }
 
+/// Which kind of resolution rule a market has *revealed*, as read by
+/// [`Resolver::spec_kind`]. `ResolutionState` cannot tell "revealed" from "not
+/// revealed": a revealed price or signer market still reads `Unconfigured`
+/// until it is finalized, disputed or reset, so the kind is derived from which
+/// spec entry exists (#273).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpecKind {
+    /// No spec has been revealed for this market.
+    None,
+    Price,
+    ScaledPrice,
+    Twap,
+    Signers,
+    Disputable,
+    WeightedKeys,
+    Committee,
+    /// A hybrid price-then-signers market, before and after its fallback opens.
+    Hybrid,
+}
+
+/// Everything the treasury's pre-trade resolvability check needs, in one
+/// cross-contract call (#273).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TradeStatus {
+    pub spec: SpecKind,
+    pub state: ResolutionState,
+    /// market-core `close_time`.
+    pub close_time: u64,
+    /// `close_time + RESOLUTION_GRACE_SECS`: when `expire_market` becomes callable.
+    pub deadline: u64,
+    /// A signer proposal is pending (its dispute window may be open).
+    pub open_proposal: bool,
+}
+
 /// Which resolution path a market was on when it expired.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2381,6 +2417,55 @@ impl Resolver {
     pub fn state(env: Env, market_id: u64) -> ResolutionState {
         Self::resolution_state(&env, market_id)
     }
+
+    /// Which kind of rule `market_id` has revealed (`SpecKind::None` before any
+    /// reveal). Existence checks only (`has`), so the read footprint stays
+    /// minimal; a missing or archived entry reads as `None`, it never panics.
+    /// Needed because `state()` stays `Unconfigured` for a revealed price or
+    /// signer market (#273).
+    pub fn spec_kind(env: Env, market_id: u64) -> SpecKind {
+        let storage = env.storage().persistent();
+        if storage.has(&DataKey::Price(market_id)) {
+            SpecKind::Price
+        } else if storage.has(&DataKey::PriceScaled(market_id)) {
+            SpecKind::ScaledPrice
+        } else if storage.has(&DataKey::PriceTwap(market_id)) {
+            SpecKind::Twap
+        } else if storage.has(&DataKey::Signers(market_id)) {
+            SpecKind::Signers
+        } else if storage.has(&DataKey::Disputable(market_id)) {
+            SpecKind::Disputable
+        } else if storage.has(&DataKey::WeightedKeys(market_id)) {
+            SpecKind::WeightedKeys
+        } else if storage.has(&DataKey::CommitteeSpec(market_id)) {
+            SpecKind::Committee
+        } else if storage.has(&DataKey::Hybrid(market_id)) {
+            SpecKind::Hybrid
+        } else {
+            SpecKind::None
+        }
+    }
+
+    /// The spec kind, resolution state, deadline and proposal flag in one read:
+    /// one cross-contract call from the treasury instead of four. Reads
+    /// market-core's `close_time` once. A pure view: it does not extend any TTL
+    /// (so a simulation stays read-only), unlike `instance_get`.
+    pub fn trade_status(env: Env, market_id: u64) -> Result<TradeStatus, Error> {
+        let market_core: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::MarketCore)
+            .ok_or(Error::NotInitialized)?;
+        let market =
+            core_call(MarketCoreClient::new(&env, &market_core).try_get_market(&market_id))?;
+        Ok(TradeStatus {
+            spec: Self::spec_kind(env.clone(), market_id),
+            state: Self::resolution_state(&env, market_id),
+            close_time: market.close_time,
+            deadline: Self::deadline(&market),
+            open_proposal: Self::has_proposal(&env, market_id),
+        })
+    }
 }
 
 impl Resolver {
@@ -3061,7 +3146,7 @@ impl Resolver {
 
     fn store_rule(env: &Env, market_id: u64, rule: &ResolutionSpec) {
         let storage = env.storage().persistent();
-        let (_key, state) = match rule {
+        let (key, state) = match rule {
             ResolutionSpec::Price(cfg) => {
                 let key = DataKey::Price(market_id);
                 storage.set(&key, cfg);
@@ -4018,7 +4103,7 @@ mod test {
         assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -4047,7 +4132,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -4340,7 +4425,7 @@ mod test {
         f.resolver.expire_market(&f.market_id);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
         assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
     }
@@ -4582,7 +4667,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -5063,7 +5148,7 @@ mod test {
         open(&d);
         let treasury = d.f.market_core.get_config().treasury;
         d.f.resolver.settle_dispute(&d.f.market_id, &Verdict::No);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(status(&d), MarketStatus::Resolved(market_core::Outcome::No));
         assert_eq!(
             d.f.resolver.state(&d.f.market_id),
             ResolutionState::Finalized
@@ -5085,7 +5170,10 @@ mod test {
         let d = dispute_fixture(false);
         open(&d);
         d.f.resolver.settle_dispute(&d.f.market_id, &Verdict::Yes);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            status(&d),
+            MarketStatus::Resolved(market_core::Outcome::Yes)
+        );
         d.f.resolver.claim_dispute_bond(&d.f.market_id);
         assert_escrow(&d, 0);
         assert_eq!(balance(&d, &d.disputer), 2 * BOND);
@@ -5145,7 +5233,10 @@ mod test {
         assert_eq!(status(&d), MarketStatus::Open);
         d.f.resolver
             .escalation_attest(&d.f.market_id, &d.members[2], &Verdict::Yes);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            status(&d),
+            MarketStatus::Resolved(market_core::Outcome::Yes)
+        );
         d.f.resolver.claim_dispute_bond(&d.f.market_id);
         assert_eq!(balance(&d, &d.disputer), 2 * BOND);
         assert_escrow(&d, 0);
@@ -5298,7 +5389,7 @@ mod test {
                 },
             }])
             .settle_dispute(&d.f.market_id, &Verdict::No);
-        assert_eq!(status(&d), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(status(&d), MarketStatus::Resolved(market_core::Outcome::No));
     }
 
     #[test]
@@ -5470,7 +5561,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -5653,7 +5744,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -5772,7 +5863,7 @@ mod test {
         );
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::No)
+            MarketStatus::Resolved(market_core::Outcome::No)
         );
     }
 
@@ -6011,7 +6102,7 @@ mod test {
         assert!(last_price_resolution(&f).from_snapshot);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -6174,7 +6265,7 @@ mod test {
         f.resolver.expire_market(&f.market_id);
         assert_eq!(
             f.market_core.get_market(&f.market_id).status,
-            MarketStatus::Resolved(Outcome::Yes)
+            MarketStatus::Resolved(market_core::Outcome::Yes)
         );
     }
 
@@ -6329,7 +6420,10 @@ mod test {
             f.resolver.finalize_signers(&f.market_id),
             AttestedOutcome::Yes
         );
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            market_status(&f),
+            MarketStatus::Resolved(market_core::Outcome::Yes)
+        );
         assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
         // FinalImpliesClosed + AtMostOnceFinal: nothing can change it again.
         assert_eq!(
@@ -6338,7 +6432,10 @@ mod test {
             Err(Ok(Error::AlreadyFinalized))
         );
         assert!(f.resolver.try_finalize_signers(&f.market_id).is_err());
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            market_status(&f),
+            MarketStatus::Resolved(market_core::Outcome::Yes)
+        );
     }
 
     /// resolver.cfg happy path in price mode: RegisterPrice, Tick, ResolvePrice.
@@ -6358,7 +6455,10 @@ mod test {
         f.env.ledger().set_timestamp(2_000);
         assert_eq!(f.resolver.resolve_price(&f.market_id), Outcome::Yes);
         assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            market_status(&f),
+            MarketStatus::Resolved(market_core::Outcome::Yes)
+        );
         assert_eq!(
             f.resolver.try_resolve_price(&f.market_id),
             Err(Ok(Error::AlreadyFinalized))
@@ -6459,7 +6559,10 @@ mod test {
             f.resolver.finalize_signers(&f.market_id),
             AttestedOutcome::Yes
         );
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::Yes));
+        assert_eq!(
+            market_status(&f),
+            MarketStatus::Resolved(market_core::Outcome::Yes)
+        );
     }
 
     /// resolver.cfg (NoResolveBeforeClose): the guardian cannot void before
@@ -6552,9 +6655,13 @@ mod test {
         f.market_core.accept_resolver();
 
         f.env.ledger().set_timestamp(2_000);
-        f.market_core.resolve(&f.market_id, &Outcome::No);
+        f.market_core
+            .resolve(&f.market_id, &market_core::Outcome::No);
 
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(
+            market_status(&f),
+            MarketStatus::Resolved(market_core::Outcome::No)
+        );
         // This resolver saw none of it: no votes, still "pending", and it
         // can no longer move the market (market-core rejects it as resolver).
         assert_eq!(
@@ -6570,7 +6677,10 @@ mod test {
         attest_both(&f, AttestedOutcome::Yes);
         f.env.ledger().set_timestamp(2_100);
         assert!(f.resolver.try_finalize_signers(&f.market_id).is_err());
-        assert_eq!(market_status(&f), MarketStatus::Resolved(Outcome::No));
+        assert_eq!(
+            market_status(&f),
+            MarketStatus::Resolved(market_core::Outcome::No)
+        );
     }
 
     /// Everything observable about market-core through a resolver scenario,
@@ -6584,25 +6694,31 @@ mod test {
         let mut t = std::vec::Vec::new();
         t.push(format!(
             "price {}",
-            f.market_core.get_price(&id, &Outcome::Yes)
+            f.market_core.get_price(&id, &market_core::Outcome::Yes)
         ));
         t.push(format!(
             "quote {}",
-            f.market_core.quote_buy(&id, &Outcome::Yes, &(10 * one))
+            f.market_core
+                .quote_buy(&id, &market_core::Outcome::Yes, &(10 * one))
         ));
         t.push(format!(
             "buy {}",
             f.market_core
-                .buy(&creator, &id, &Outcome::Yes, &(10 * one), &0)
+                .buy(&creator, &id, &market_core::Outcome::Yes, &(10 * one), &0)
         ));
         t.push(format!(
             "price {}",
-            f.market_core.get_price(&id, &Outcome::Yes)
+            f.market_core.get_price(&id, &market_core::Outcome::Yes)
         ));
         t.push(format!(
             "sell {}",
-            f.market_core
-                .sell(&creator, &id, &Outcome::Yes, &(3 * one), &(100 * one))
+            f.market_core.sell(
+                &creator,
+                &id,
+                &market_core::Outcome::Yes,
+                &(3 * one),
+                &(100 * one)
+            )
         ));
         t.push(format!(
             "pos {:?}",
@@ -6652,6 +6768,160 @@ mod test {
         model_trace_expire_blocked_by_valid_proposal,
         model_trace_admin_bypass_resolves_without_threshold,
     );
+
+    // ----- spec_kind / trade_status (#273) ----------------------------------
+
+    #[test]
+    fn spec_kind_none_before_reveal() {
+        // A market whose spec is committed to but not yet revealed.
+        let f = fixture(|env, _r, a, b| ResolutionSpec::Signers(signer_spec(env, a, b)));
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::None);
+        // An id that does not exist is also None, never a panic.
+        assert_eq!(f.resolver.spec_kind(&9_999), SpecKind::None);
+        let t = f.resolver.trade_status(&f.market_id);
+        assert_eq!(t.spec, SpecKind::None);
+        assert_eq!(t.state, ResolutionState::Unconfigured);
+        assert!(!t.open_proposal);
+        assert_eq!(t.close_time, 2_000);
+        assert_eq!(t.deadline, 2_000 + RESOLUTION_GRACE_SECS);
+    }
+
+    #[test]
+    fn trade_status_of_an_unknown_market_is_an_error_not_a_panic() {
+        let f = signer_fixture();
+        assert!(f.resolver.try_trade_status(&9_999).is_err());
+    }
+
+    #[test]
+    fn spec_kind_for_each_register_path() {
+        // Signers: state() moves to SignersPending on reveal.
+        let f = fixture(|env, _r, a, b| ResolutionSpec::Signers(signer_spec(env, a, b)));
+        let ResolutionSpec::Signers(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::None);
+        f.resolver.register_signer_spec(&f.market_id, &spec);
+        assert_eq!(
+            f.resolver.state(&f.market_id),
+            ResolutionState::SignersPending
+        );
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::Signers);
+
+        // Price: state() stays Unconfigured after the reveal, which is exactly
+        // why spec_kind exists.
+        let f = fixture(|env, r, _a, _b| ResolutionSpec::Price(price_spec(env, r)));
+        let ResolutionSpec::Price(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::None);
+        f.resolver.register_price_spec(&f.market_id, &spec);
+        assert_eq!(
+            f.resolver.state(&f.market_id),
+            ResolutionState::Unconfigured
+        );
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::Price);
+
+        // Disputable.
+        let d = dispute_fixture(false);
+        assert_eq!(d.f.resolver.spec_kind(&d.f.market_id), SpecKind::Disputable);
+
+        // Weighted keys.
+        let w = weighted_fixture();
+        assert_eq!(w.resolver.spec_kind(&w.market_id), SpecKind::WeightedKeys);
+    }
+
+    #[test]
+    fn spec_kind_for_scaled_and_twap_paths() {
+        let (f, cfg) = scaled_fixture_at(2_000, |env, reflector, _a, _b| ScaledPriceConfig {
+            reflector: reflector.clone(),
+            asset: OracleAsset::Other(Symbol::new(env, "XLM")),
+            threshold: 2_000,
+            threshold_decimals: 7,
+            direction: PriceDirection::Above,
+            max_staleness: 10,
+        });
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::None);
+        f.resolver.register_scaled_price_spec(&f.market_id, &cfg);
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::ScaledPrice);
+
+        let (f, cfg) = twap_fixture(|env, reflector, _a, _b| {
+            twap_price_spec(env, reflector, 2_000, PriceDirection::Above, 30, 2, 10)
+        });
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::None);
+        f.resolver.register_twap_spec(&f.market_id, &cfg);
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::Twap);
+    }
+
+    #[test]
+    fn spec_kind_for_hybrid_and_committee_paths() {
+        // Hybrid, revealed through the V2 envelope. The kind survives the
+        // fallback opening (the Hybrid entry is never removed).
+        let salt = [5u8; 32];
+        let f = v2_fixture(salt, |env, r, a, b| {
+            ResolutionSpec::Hybrid(HybridConfig {
+                price: price_spec(env, r),
+                fallback: signer_spec(env, a, b),
+                fallback_after: 100,
+            })
+        });
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::None);
+        f.resolver
+            .register_spec_v2(&f.market_id, &envelope(&f, salt));
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::Hybrid);
+        assert_eq!(
+            f.resolver.state(&f.market_id),
+            ResolutionState::HybridPricePending
+        );
+        assert_eq!(
+            f.resolver.trade_status(&f.market_id).state,
+            ResolutionState::HybridPricePending
+        );
+
+        // Committee: the market commits to a reusable committee registry entry.
+        let salt = [6u8; 32];
+        let f = v2_fixture(salt, |_env, _r, _a, _b| {
+            ResolutionSpec::Committee(CommitteeRef {
+                committee_id: 0,
+                min_epoch: 0,
+                max_rotation_delta: 1,
+                dispute_window: 100,
+            })
+        });
+        let members: Vec<Address> = Vec::from_array(
+            &f.env,
+            [
+                Address::generate(&f.env),
+                Address::generate(&f.env),
+                Address::generate(&f.env),
+            ],
+        );
+        let id = f
+            .resolver
+            .create_committee(&f.admin, &members, &2, &MIN_ROTATION_DELAY);
+        assert_eq!(id, 0, "the fixture committed to the first committee id");
+        f.resolver
+            .register_spec_v2(&f.market_id, &envelope(&f, salt));
+        assert_eq!(f.resolver.spec_kind(&f.market_id), SpecKind::Committee);
+    }
+
+    #[test]
+    fn trade_status_reports_open_proposal_and_dispute() {
+        let d = dispute_fixture(false);
+        // dispute_fixture leaves a pending proposal (signers attested at 2_000).
+        let t = d.f.resolver.trade_status(&d.f.market_id);
+        assert_eq!(t.spec, SpecKind::Disputable);
+        assert_eq!(t.state, ResolutionState::SignersPending);
+        assert!(t.open_proposal);
+        // A dispute moves the state to Disputed; the proposal stays pending.
+        open(&d);
+        let t = d.f.resolver.trade_status(&d.f.market_id);
+        assert_eq!(t.state, ResolutionState::Disputed);
+        assert!(t.open_proposal);
+        // After the ruling the market is final.
+        d.f.resolver.settle_dispute(&d.f.market_id, &Verdict::Yes);
+        let t = d.f.resolver.trade_status(&d.f.market_id);
+        assert_eq!(t.state, ResolutionState::Finalized);
+    }
 }
 
 #[cfg(test)]
